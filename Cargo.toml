@@ -1,0 +1,16 @@
+[package]
+name = "QuiverDB"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+byteorder = "1.5"
+crc32fast = "1"
+twox-hash = "1"
+fs2 = "0.4"
+
+[lib]
+name = "QuiverDB"
+path = "src/lib.rs"
