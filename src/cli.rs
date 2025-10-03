@@ -6,6 +6,7 @@ use std::path::PathBuf;
 mod admin;
 mod rh;
 mod db_cli;
+mod cdc; // NEW: CDC (wal-tail)
 
 use crate::util::parse_u8_byte;
 
@@ -171,6 +172,15 @@ pub enum Cmd {
         #[arg(long)]
         path: PathBuf,
     },
+
+    // CDC / WAL tooling
+    WalTail {
+        #[arg(long)]
+        path: PathBuf,
+        /// Follow new records (like tail -f)
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -197,5 +207,8 @@ pub fn run() -> Result<()> {
         Cmd::DbGet { path, key } => db_cli::cmd_db_get(path, key),
         Cmd::DbDel { path, key } => db_cli::cmd_db_del(path, key),
         Cmd::DbStats { path } => db_cli::cmd_db_stats(path),
+
+        // ------- CDC -------
+        Cmd::WalTail { path, follow } => cdc::cmd_wal_tail(path, follow),
     }
 }
