@@ -6,7 +6,10 @@ use std::path::PathBuf;
 mod admin;
 mod rh;
 mod db_cli;
-mod cdc; // NEW: CDC (wal-tail)
+// CDC (wal-tail/ship/apply) — делаем публичным, чтобы использовать в интеграционных тестах
+pub mod cdc;
+
+pub use cdc::wal_apply_from_stream; // удобный реэкспорт для тестов и внешнего кода
 
 use crate::util::parse_u8_byte;
 
@@ -181,6 +184,18 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         follow: bool,
     },
+    WalShip {
+        #[arg(long)]
+        path: PathBuf,
+        /// Follow new records (send continuously)
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+    },
+    WalApply {
+        /// Target DB path to apply incoming WAL stream from stdin
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -210,5 +225,7 @@ pub fn run() -> Result<()> {
 
         // ------- CDC -------
         Cmd::WalTail { path, follow } => cdc::cmd_wal_tail(path, follow),
+        Cmd::WalShip { path, follow } => cdc::cmd_wal_ship(path, follow),
+        Cmd::WalApply { path } => cdc::cmd_wal_apply(path),
     }
 }
