@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 // Подмодули с реализацией команд
-mod admin;
+pub mod admin;   // публичный, чтобы тесты могли вызывать admin::* напрямую
 mod rh;
 mod db_cli;
 // CDC (wal-tail/ship/apply) — публичный, чтобы использовать в интеграционных тестах
@@ -222,6 +222,16 @@ pub enum Cmd {
         #[arg(long)]
         path: PathBuf,
     },
+
+    // v0.9: repair (free orphan overflow pages)
+    Repair {
+        #[arg(long)]
+        path: PathBuf,
+    },
+
+    // v0.9: metrics (snapshot / reset)
+    Metrics,
+    MetricsReset,
 }
 
 pub fn run() -> Result<()> {
@@ -261,5 +271,12 @@ pub fn run() -> Result<()> {
 
         // ------- v0.8: check -------
         Cmd::Check { path } => admin::cmd_check(path),
+
+        // ------- v0.9: repair -------
+        Cmd::Repair { path } => admin::cmd_repair(path),
+
+        // ------- v0.9: metrics -------
+        Cmd::Metrics => admin::cmd_metrics(),
+        Cmd::MetricsReset => admin::cmd_metrics_reset(),
     }
 }

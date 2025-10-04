@@ -302,3 +302,120 @@ pub fn cmd_check(path: PathBuf) -> Result<()> {
 
     Ok(())
 }
+
+/// v0.9: Repair — освободить сиротские overflow-страницы (best-effort).
+/// - Требует exclusive-lock.
+/// - Делает wal_replay_if_any перед сканом.
+/// - Строго маркирует достижимые overflow из каталога; всё остальное, что является overflow и не в free-list — освобождается.
+pub fn cmd_repair(path: PathBuf) -> Result<()> {
+    let _lock = acquire_exclusive_lock(&path)?;
+    let guard = DirtyGuard::begin(&path)?;
+    wal_replay_if_any(&path)?;
+
+    // Каталог обязателен для консервативного ремонта.
+    let dir = Directory::open(&path)
+        .map_err(|e| anyhow!("repair requires valid directory: {e}"))?;
+
+    let mut pager = Pager::open(&path)?;
+    let ps = pager.meta.page_size as usize;
+    let pages = pager.meta.next_page_id;
+    let free_set = read_free_set(&path)?;
+
+    // Соберём "достижимые" overflow через плейсхолдеры из всех цепочек каталога.
+    let mut marked: HashSet<u64> = HashSet::new();
+
+    for b in 0..dir.bucket_count {
+        let mut pid = dir.head(b)?;
+        while pid != NO_PAGE {
+            let mut buf = vec![0u8; ps];
+            if pager.read_page(pid, &mut buf).is_err() {
+                break; // консервативно
+            }
+            if !rh_page_is_kv(&buf) {
+                break;
+            }
+            if let Ok(items) = crate::page_rh::rh_kv_list(&buf) {
+                for (_k, v) in items {
+                    if v.len() == 18 && v[0] == 0xFF {
+                        let head_pid = LittleEndian::read_u64(&v[10..18]);
+                        let mut cur = head_pid;
+                        while cur != NO_PAGE && !marked.contains(&cur) {
+                            let mut obuf = vec![0u8; ps];
+                            if pager.read_page(cur, &mut obuf).is_err() {
+                                break;
+                            }
+                            if let Ok(h) = ovf_header_read(&obuf) {
+                                marked.insert(cur);
+                                cur = h.next_page_id;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let h = rh_header_read(&buf)?;
+            pid = h.next_page_id;
+        }
+    }
+
+    // Соберём все overflow-страницы
+    let mut all_ovf: Vec<u64> = Vec::new();
+    for pid in 0..pages {
+        let mut buf = vec![0u8; ps];
+        if pager.read_page(pid, &mut buf).is_ok() {
+            if ovf_header_read(&buf).is_ok() {
+                all_ovf.push(pid);
+            }
+        }
+    }
+
+    // Орфаны: overflow, которые не достижимы и не в free-list.
+    let orphans: Vec<u64> = all_ovf
+        .into_iter()
+        .filter(|pid| !marked.contains(pid) && !free_set.contains(pid))
+        .collect();
+
+    let mut freed = 0usize;
+    for pid in orphans {
+        pager.free_page(pid)?;
+        freed += 1;
+    }
+
+    println!("Repair: freed {} orphan overflow page(s)", freed);
+    guard.finish()?;
+    Ok(())
+}
+
+// ---------- v0.9: Metrics (snapshot/reset) ----------
+
+pub fn cmd_metrics() -> Result<()> {
+    let m = crate::metrics::snapshot();
+    let cache_total = m.page_cache_hits + m.page_cache_misses;
+    let cache_hit_ratio = if cache_total > 0 {
+        (m.page_cache_hits as f64) / (cache_total as f64)
+    } else {
+        0.0
+    };
+
+    println!("Metrics snapshot:");
+    println!("  wal_appends_total       = {}", m.wal_appends_total);
+    println!("  wal_bytes_written       = {}", m.wal_bytes_written);
+    println!("  wal_fsync_calls         = {}", m.wal_fsync_calls);
+    println!("  wal_avg_batch_pages     = {:.2}", m.avg_wal_batch_pages());
+    println!("  wal_truncations         = {}", m.wal_truncations);
+    println!("  page_cache_hits         = {}", m.page_cache_hits);
+    println!("  page_cache_misses       = {}", m.page_cache_misses);
+    println!("  page_cache_hit_ratio    = {:.2}%", cache_hit_ratio * 100.0);
+    println!("  rh_page_compactions     = {}", m.rh_page_compactions);
+    println!("  overflow_chains_created = {}", m.overflow_chains_created);
+    println!("  overflow_chains_freed   = {}", m.overflow_chains_freed);
+    println!("  sweep_orphan_runs       = {}", m.sweep_orphan_runs);
+    Ok(())
+}
+
+pub fn cmd_metrics_reset() -> Result<()> {
+    crate::metrics::reset();
+    println!("Metrics: reset to zero");
+    Ok(())
+}
