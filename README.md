@@ -1,4 +1,13 @@
 # QuiverDB
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/artemonad/QuiverDB)](https://github.com/artemonad/QuiverDB/releases)
+[![Docs](https://img.shields.io/badge/docs-API%20%2F%20Format%20%2F%20CDC-informational)](docs/)
+[![GitHub stars](https://img.shields.io/github/stars/artemonad/QuiverDB?style=social)](https://github.com/artemonad/QuiverDB/stargazers)
+
+embedded Rust key–value database
+Robin Hood hashing
+write-ahead log (WAL)
+CDC / replication
 
 An embedded key–value database with in-page Robin Hood indexing, a write-ahead log (WAL), a directory (bucket heads), and overflow chains for large values. It targets single-writer, multi-reader scenarios with crash safety, compact on-disk formats, and simple operations.
 
