@@ -1,3 +1,5 @@
+// src/cli.rs
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -214,6 +216,12 @@ pub enum Cmd {
         #[arg(long)]
         path: PathBuf,
     },
+
+    // v0.8: check (CRC scan, overflow reachability)
+    Check {
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -250,5 +258,8 @@ pub fn run() -> Result<()> {
         Cmd::WalTail { path, follow } => cdc::cmd_wal_tail(path, follow),
         Cmd::WalShip { path, follow } => cdc::cmd_wal_ship(path, follow),
         Cmd::WalApply { path } => cdc::cmd_wal_apply(path),
+
+        // ------- v0.8: check -------
+        Cmd::Check { path } => admin::cmd_check(path),
     }
 }
