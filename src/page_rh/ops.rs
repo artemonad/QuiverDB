@@ -9,7 +9,7 @@ use crate::hash::HashKind;
 use crate::metrics::record_rh_compaction;
 use byteorder::{ByteOrder, LittleEndian}; // <-- ДОБАВЛЕНО
 
-use super::header::{rh_header_read, rh_header_write, rh_page_init, RhPageHeader};
+use super::header::{rh_header_read, rh_header_write, rh_page_init};
 use super::table::{
     desired_capacity, distance_for_index, free_end_for_cap, hval_and_fp, is_empty, read_record,
     read_slot, rebuild_table, table_bytes, write_slot,

@@ -4,13 +4,14 @@ version = 4
 
 [[package]]
 name = "QuiverDB"
-version = "0.6.0-alpha.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "byteorder",
  "clap",
  "crc32fast",
  "fs2",
+ "oorandom",
  "twox-hash",
 ]
 
@@ -181,6 +182,12 @@ name = "once_cell_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
+
+[[package]]
+name = "oorandom"
+version = "11.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "ppv-lite86"

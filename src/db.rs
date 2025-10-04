@@ -1,51 +1,43 @@
-use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE};
+use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE, FREE_FILE, FREE_HDR_SIZE, FREE_MAGIC};
 use crate::dir::Directory;
-use crate::lock::{acquire_exclusive_lock, LockGuard}; // locking
-use crate::meta::set_clean_shutdown; // clean shutdown flag
+use crate::lock::{acquire_exclusive_lock, LockGuard};
+use crate::meta::set_clean_shutdown;
 use crate::page_rh::{
     rh_compact_inplace, rh_header_read, rh_header_write, rh_kv_delete_inplace, rh_kv_insert,
     rh_kv_lookup, rh_page_init, rh_page_is_kv, rh_should_compact, RH_SLOT_SIZE,
 };
 use crate::pager::Pager;
+use crate::page_ovf::{
+    ovf_free_chain, ovf_make_placeholder, ovf_parse_placeholder, ovf_read_chain, ovf_write_chain,
+    ovf_header_read,
+};
+use crate::free::FreeList;
 use crate::wal::{wal_replay_if_any, Wal, WalGroupCfg};
 use anyhow::{anyhow, Result};
+use byteorder::{ByteOrder, LittleEndian};
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 
 pub struct Db {
     pub root: std::path::PathBuf,
     pub pager: Pager,
     pub dir: Directory,
-    // Держим эксклюзивную блокировку на время жизни Db.
-    // Это защищает от одновременной записи из нескольких процессов.
-    _lock: LockGuard, // переименовано для подавления предупреждения о неиспользовании
+    _lock: LockGuard,
 }
 
 impl Db {
-    /// Открыть БД с эксклюзивной блокировкой (single-writer).
-    /// Выполняет WAL replay при необходимости и помечает запуск как "нечистый"
-    /// до момента закрытия (Drop).
-    /// Включает group-commit для WAL, если задано окружение P1_WAL_COALESCE_MS (мс, по умолчанию 3).
     pub fn open(root: &std::path::Path) -> Result<Self> {
-        // 1) Блокируемся эксклюзивно
         let lock = acquire_exclusive_lock(root)?;
-
-        // 1.1) Настроим group-commit для WAL (best-effort).
         let coalesce_ms = std::env::var("P1_WAL_COALESCE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3);
         Wal::set_group_config(root, WalGroupCfg { coalesce_ms })?;
-
-        // 2) Реплей WAL (сам wal.rs решает, нужен ли реплей, исходя из clean_shutdown)
         wal_replay_if_any(root)?;
-
-        // 3) Открываем подсистемы
         let pager = Pager::open(root)?;
         let dir = Directory::open(root)?;
-
-        // 4) Помечаем запуск как "нечистый" — если процесс умрёт,
-        //    при следующем старте будет реплей.
         set_clean_shutdown(root, false)?;
-
         Ok(Self {
             root: root.to_path_buf(),
             pager,
@@ -55,73 +47,139 @@ impl Db {
     }
 
     pub fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        // Проверим, что запись вообще может поместиться в пустую v2 страницу.
-        // Берём минимальный один слот таблицы.
-        let rec_sz = 4 + key.len() + val.len();
         let ps = self.pager.meta.page_size as usize;
-        if rec_sz + RH_SLOT_SIZE + PAGE_HDR_V2_SIZE > ps {
-            return Err(anyhow!(
-                "record too large: key={} value={} for page_size {}",
-                key.len(),
-                val.len(),
-                ps
-            ));
+        let ovf_threshold = std::env::var("P1_OVF_THRESHOLD_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(ps / 4);
+
+        if key.len() > u16::MAX as usize {
+            return Err(anyhow!("key too large for u16 length: {} bytes", key.len()));
         }
 
+        let rec_sz_inline = 4 + key.len() + val.len();
+        let rec_fits_inline = rec_sz_inline + RH_SLOT_SIZE + PAGE_HDR_V2_SIZE <= ps;
+        let need_overflow = val.len() > ovf_threshold || !rec_fits_inline;
+
         let bucket = self.dir.bucket_of_key(key);
-        let mut head = self.dir.head(bucket)?;
+        let head = self.dir.head(bucket)?;
+
         if head == NO_PAGE {
-            // создаём первую страницу в бакете (всегда v2), предпочтительно из free-list
             let new_pid = self.pager.allocate_one_page()?;
             let mut buf = vec![0u8; ps];
             rh_page_init(&mut buf, new_pid)?;
-            let ok = rh_kv_insert(&mut buf, self.dir.hash_kind, key, val)?;
-            if !ok {
-                return Err(anyhow!("unexpected: empty v2 page cannot fit record"));
+
+            if need_overflow {
+                let ovf_head = ovf_write_chain(&mut self.pager, val)?;
+                let placeholder = ovf_make_placeholder(val.len() as u64, ovf_head);
+                let ok = rh_kv_insert(&mut buf, self.dir.hash_kind, key, &placeholder)?;
+                if !ok {
+                    ovf_free_chain(&self.pager, ovf_head)?;
+                    return Err(anyhow!("empty page cannot fit overflow placeholder"));
+                }
+            } else {
+                let ok = rh_kv_insert(&mut buf, self.dir.hash_kind, key, val)?;
+                if !ok {
+                    return Err(anyhow!("empty page cannot fit inline record"));
+                }
             }
+
             self.pager.commit_page(new_pid, &mut buf)?;
             self.dir.set_head(bucket, new_pid)?;
             return Ok(());
         }
 
-        // Ищем место в цепочке v2-страниц, по пути вычищаем пустые страницы
+        self.put_in_chain(bucket, head, key, val, need_overflow)
+    }
+
+    fn put_in_chain(
+        &mut self,
+        bucket: u32,
+        head: u64,
+        key: &[u8],
+        val: &[u8],
+        need_overflow: bool,
+    ) -> Result<()> {
+        let ps = self.pager.meta.page_size as usize;
+
+        // Создаём overflow один раз перед обходом и переиспользуем.
+        let (new_value_bytes, new_ovf_head_opt) = if need_overflow {
+            let ovf_head = ovf_write_chain(&mut self.pager, val)?;
+            (
+                ovf_make_placeholder(val.len() as u64, ovf_head).to_vec(),
+                Some(ovf_head),
+            )
+        } else {
+            (val.to_vec(), None)
+        };
+
         let mut prev: u64 = NO_PAGE;
         let mut pid: u64 = head;
-        let mut tail_pid: u64 = NO_PAGE;
+
+        macro_rules! cleanup_on_error {
+            () => {
+                if let Some(h) = new_ovf_head_opt {
+                    ovf_free_chain(&self.pager, h)?;
+                }
+            };
+        }
 
         loop {
             let mut buf = vec![0u8; ps];
-            self.pager.read_page(pid, &mut buf)?;
+            if let Err(e) = self.pager.read_page(pid, &mut buf) {
+                cleanup_on_error!();
+                return Err(e);
+            }
             if !rh_page_is_kv(&buf) {
+                cleanup_on_error!();
                 return Err(anyhow!("page {} is not KV-RH (v2) page", pid));
             }
 
-            // 1) Пытаемся вставить сразу
-            if rh_kv_insert(&mut buf, self.dir.hash_kind, key, val)? {
+            let existing_val = rh_kv_lookup(&buf, self.dir.hash_kind, key)?;
+            let old_ovf_head = existing_val.and_then(|v| ovf_parse_placeholder(&v).map(|(_, h)| h));
+
+            // Попытка in-place вставки/обновления
+            if rh_kv_insert(&mut buf, self.dir.hash_kind, key, &new_value_bytes)? {
                 self.pager.commit_page(pid, &mut buf)?;
+
+                // Освободим старую overflow-цепочку (если была и отличается от новой)
+                if let Some(old_h) = old_ovf_head {
+                    if let Some(new_h) = new_ovf_head_opt {
+                        if new_h != old_h {
+                            ovf_free_chain(&self.pager, old_h)?;
+                        }
+                    } else {
+                        ovf_free_chain(&self.pager, old_h)?;
+                    }
+                }
                 return Ok(());
             }
 
-            // 2) Оппортунистическая компакция по порогам и повторная попытка
+            // Компактификация и повтор
             if rh_should_compact(&buf)? {
                 rh_compact_inplace(&mut buf, self.dir.hash_kind)?;
-                if rh_kv_insert(&mut buf, self.dir.hash_kind, key, val)? {
+                if rh_kv_insert(&mut buf, self.dir.hash_kind, key, &new_value_bytes)? {
                     self.pager.commit_page(pid, &mut buf)?;
+                    if let Some(old_h) = old_ovf_head {
+                        if let Some(new_h) = new_ovf_head_opt {
+                            if new_h != old_h {
+                                ovf_free_chain(&self.pager, old_h)?;
+                            }
+                        } else {
+                            ovf_free_chain(&self.pager, old_h)?;
+                        }
+                    }
                     return Ok(());
                 }
             }
 
-            // 3) Проверим, не пустая ли страница — и если пустая, вырежем её из цепочки
+            // Удаление пустых страниц из цепочки
             let h = rh_header_read(&buf)?;
             if h.used_slots == 0 {
-                // unlink pid -> h.next_page_id
                 let next = h.next_page_id;
                 if prev == NO_PAGE {
-                    // срезаем head
                     self.dir.set_head(bucket, next)?;
-                    head = next;
                 } else {
-                    // обновим next у prev и закоммитим
                     let mut pbuf = vec![0u8; ps];
                     self.pager.read_page(prev, &mut pbuf)?;
                     let mut ph = rh_header_read(&pbuf)?;
@@ -129,48 +187,50 @@ impl Db {
                     rh_header_write(&mut pbuf, &ph)?;
                     self.pager.commit_page(prev, &mut pbuf)?;
                 }
-                // страницу — в free-list (после unlink)
-                let _ = self.pager.free_page(pid);
-                // продолжаем с next, prev остаётся прежним
+                self.pager.free_page(pid)?;
                 if next == NO_PAGE {
-                    tail_pid = prev; // цепочка закончилась на prev
                     break;
                 }
                 pid = next;
                 continue;
             }
 
-            // 4) Переходим дальше по цепочке
+            // КРИТИЧЕСКИЙ ФИКС: корректно запомнить хвост
             if h.next_page_id == NO_PAGE {
-                tail_pid = pid;
+                // pid — это фактический хвост
+                prev = pid;
                 break;
             }
             prev = pid;
             pid = h.next_page_id;
         }
 
-        // Добавляем новую v2 страницу в конец цепочки (предпочтительно из free-list)
+        // Не нашли места — создаём новую страницу и вставляем запись
         let new_pid = self.pager.allocate_one_page()?;
         let mut newb = vec![0u8; ps];
         rh_page_init(&mut newb, new_pid)?;
-        let ok = rh_kv_insert(&mut newb, self.dir.hash_kind, key, val)?;
-        if !ok {
-            return Err(anyhow!("unexpected: empty v2 page cannot fit record"));
+
+        if !rh_kv_insert(&mut newb, self.dir.hash_kind, key, &new_value_bytes)? {
+            // Откат новой цепочки (если была)
+            if let Some((_, ovf_head)) = ovf_parse_placeholder(&new_value_bytes) {
+                ovf_free_chain(&self.pager, ovf_head)?;
+            }
+            return Err(anyhow!("empty v2 page cannot fit record"));
         }
         self.pager.commit_page(new_pid, &mut newb)?;
 
-        // Обновим next у хвоста (tail_pid может быть NO_PAGE, если цепочка полностью очистилась)
-        if tail_pid == NO_PAGE {
-            // цепочка стала пустой — новый pid становится head
+        // Пришивка к цепочке: prev — это реальный хвост или NO_PAGE, если цепочка стала пустой
+        if prev == NO_PAGE {
             self.dir.set_head(bucket, new_pid)?;
         } else {
             let mut tailb = vec![0u8; ps];
-            self.pager.read_page(tail_pid, &mut tailb)?;
+            self.pager.read_page(prev, &mut tailb)?;
             let mut th = rh_header_read(&tailb)?;
             th.next_page_id = new_pid;
             rh_header_write(&mut tailb, &th)?;
-            self.pager.commit_page(tail_pid, &mut tailb)?;
+            self.pager.commit_page(prev, &mut tailb)?;
         }
+
         Ok(())
     }
 
@@ -181,7 +241,7 @@ impl Db {
             return Ok(None);
         }
         let ps = self.pager.meta.page_size as usize;
-        let mut found: Option<Vec<u8>> = None;
+
         while pid != NO_PAGE {
             let mut buf = vec![0u8; ps];
             self.pager.read_page(pid, &mut buf)?;
@@ -189,60 +249,57 @@ impl Db {
                 return Err(anyhow!("page {} is not KV-RH (v2) page", pid));
             }
             if let Some(v) = rh_kv_lookup(&buf, self.dir.hash_kind, key)? {
-                found = Some(v);
+                if let Some((total_len, head_pid)) = ovf_parse_placeholder(&v) {
+                    let full = ovf_read_chain(&self.pager, head_pid, Some(total_len as usize))?;
+                    return Ok(Some(full));
+                } else {
+                    return Ok(Some(v));
+                }
             }
             let h = rh_header_read(&buf)?;
             pid = h.next_page_id;
         }
-        Ok(found)
+        Ok(None)
     }
 
     pub fn del(&mut self, key: &[u8]) -> Result<bool> {
         let bucket = self.dir.bucket_of_key(key);
-        let mut head = self.dir.head(bucket)?;
+        let head = self.dir.head(bucket)?;
         if head == NO_PAGE {
             return Ok(false);
         }
-
         let ps = self.pager.meta.page_size as usize;
         let mut existed_any = false;
 
-        // prev -> pid -> next обход с очисткой пустых страниц (unlink + free)
         let mut prev: u64 = NO_PAGE;
         let mut pid: u64 = head;
 
         while pid != NO_PAGE {
-            // загрузим страницу
             let mut buf = vec![0u8; ps];
             self.pager.read_page(pid, &mut buf)?;
             if !rh_page_is_kv(&buf) {
                 return Err(anyhow!("page {} is not KV-RH (v2) page", pid));
             }
 
-            // попытка удаления
-            let mut modified = false;
-            if rh_kv_delete_inplace(&mut buf, self.dir.hash_kind, key)? {
+            let ovf_to_free = rh_kv_lookup(&buf, self.dir.hash_kind, key)?
+                .and_then(|v| ovf_parse_placeholder(&v).map(|(_, h)| h));
+
+            let deleted = rh_kv_delete_inplace(&mut buf, self.dir.hash_kind, key)?;
+            if deleted {
                 existed_any = true;
-                modified = true;
-            }
-
-            if modified {
-                // зафиксируем изменения страницы (LSN, CRC, WAL)
                 self.pager.commit_page(pid, &mut buf)?;
+                if let Some(ovf_head) = ovf_to_free {
+                    ovf_free_chain(&self.pager, ovf_head)?;
+                }
             }
 
-            // проверим, не стала ли страница пустой (или уже была пустой)
             let h = rh_header_read(&buf)?;
             let next = h.next_page_id;
 
             if h.used_slots == 0 {
-                // unlink этой страницы из цепочки
                 if prev == NO_PAGE {
-                    // удаляем head
                     self.dir.set_head(bucket, next)?;
-                    head = next;
                 } else {
-                    // обновим next у prev и закоммитим
                     let mut pbuf = vec![0u8; ps];
                     self.pager.read_page(prev, &mut pbuf)?;
                     let mut ph = rh_header_read(&pbuf)?;
@@ -250,21 +307,119 @@ impl Db {
                     rh_header_write(&mut pbuf, &ph)?;
                     self.pager.commit_page(prev, &mut pbuf)?;
                 }
-
-                // отправим текущую страницу в free-list (после unlink)
-                let _ = self.pager.free_page(pid);
-
-                // не двигаем prev, переходим к next
-                pid = next;
-                continue;
+                self.pager.free_page(pid)?;
+            } else {
+                prev = pid;
             }
 
-            // страница не пустая — двигаем prev и pid
-            prev = pid;
             pid = next;
         }
 
+        self.sweep_orphan_overflow()?;
+
         Ok(existed_any)
+    }
+
+    fn sweep_orphan_overflow(&self) -> Result<()> {
+        let ps = self.pager.meta.page_size as usize;
+        let pages_alloc = self.pager.meta.next_page_id;
+        let free_set = self.read_free_set()?;
+
+        let mut heads: Vec<u64> = Vec::new();
+        for pid in 0..pages_alloc {
+            if free_set.contains(&pid) {
+                continue;
+            }
+            let mut buf = vec![0u8; ps];
+            if self.pager.read_page(pid, &mut buf).is_err() {
+                continue;
+            }
+            if !rh_page_is_kv(&buf) {
+                continue;
+            }
+            if let Ok(items) = crate::page_rh::rh_kv_list(&buf) {
+                for (_k, v) in items {
+                    if let Some((_, head_pid)) = ovf_parse_placeholder(&v) {
+                        heads.push(head_pid);
+                    }
+                }
+            }
+        }
+
+        if heads.is_empty() {
+            for pid in 0..pages_alloc {
+                if free_set.contains(&pid) {
+                    continue;
+                }
+                let mut buf = vec![0u8; ps];
+                if self.pager.read_page(pid, &mut buf).is_ok() {
+                    if ovf_header_read(&buf).is_ok() {
+                        self.pager.free_page(pid)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let mut marked: HashSet<u64> = HashSet::new();
+        for head_pid in heads {
+            let mut cur = head_pid;
+            while cur != NO_PAGE {
+                if marked.contains(&cur) {
+                    break;
+                }
+                let mut buf = vec![0u8; ps];
+                if self.pager.read_page(cur, &mut buf).is_err() {
+                    break;
+                }
+                if let Ok(h) = ovf_header_read(&buf) {
+                    marked.insert(cur);
+                    cur = h.next_page_id;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        for pid in 0..pages_alloc {
+            if free_set.contains(&pid) {
+                continue;
+            }
+            let mut buf = vec![0u8; ps];
+            if self.pager.read_page(pid, &mut buf).is_ok() {
+                if ovf_header_read(&buf).is_ok() && !marked.contains(&pid) {
+                    self.pager.free_page(pid)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_free_set(&self) -> Result<HashSet<u64>> {
+        let mut set = HashSet::new();
+        let path = self.root.join(FREE_FILE);
+        if !path.exists() {
+            return Ok(set);
+        }
+        let mut f = OpenOptions::new().read(true).open(&path)?;
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic)?;
+        if &magic != FREE_MAGIC {
+            return Ok(set);
+        }
+        let mut hdr = vec![0u8; FREE_HDR_SIZE - 8];
+        f.read_exact(&mut hdr)?;
+        let len = f.metadata()?.len();
+        let mut pos = FREE_HDR_SIZE as u64;
+        while pos + 8 <= len {
+            let mut buf8 = [0u8; 8];
+            f.seek(SeekFrom::Start(pos))?;
+            f.read_exact(&mut buf8)?;
+            let pid = LittleEndian::read_u64(&buf8);
+            set.insert(pid);
+            pos += 8;
+        }
+        Ok(set)
     }
 
     pub fn print_stats(&self) -> Result<()> {
@@ -303,6 +458,26 @@ impl Db {
             0.0
         };
 
+        let free_set = self.read_free_set()?;
+        let mut ovf_pages = 0u64;
+        let mut ovf_bytes = 0u64;
+        for pid in 0..pages {
+            if free_set.contains(&pid) {
+                continue;
+            }
+            let mut buf = vec![0u8; ps as usize];
+            if self.pager.read_page(pid, &mut buf).is_ok() {
+                if let Ok(h) = ovf_header_read(&buf) {
+                    ovf_pages += 1;
+                    ovf_bytes += h.chunk_len as u64;
+                }
+            }
+        }
+        let free_pages = match FreeList::open(&self.root) {
+            Ok(fl) => fl.count().unwrap_or(0),
+            Err(_) => 0,
+        };
+
         println!("DB stats:");
         println!("  page_size        = {}", ps);
         println!("  pages_allocated  = {}", pages);
@@ -316,8 +491,10 @@ impl Db {
         } else {
             println!("  chain_len min/avg/max = n/a");
         }
+        println!("  overflow_pages    = {}", ovf_pages);
+        println!("  overflow_bytes    = {}", ovf_bytes);
+        println!("  free_pages        = {}", free_pages);
 
-        // ----- Metrics snapshot -----
         let m = crate::metrics::snapshot();
         let cache_total = m.page_cache_hits + m.page_cache_misses;
         let cache_hit_ratio = if cache_total > 0 {
@@ -330,10 +507,7 @@ impl Db {
         println!("  wal_appends_total       = {}", m.wal_appends_total);
         println!("  wal_bytes_written       = {}", m.wal_bytes_written);
         println!("  wal_fsync_calls         = {}", m.wal_fsync_calls);
-        println!(
-            "  wal_avg_batch_pages     = {:.2}",
-            m.avg_wal_batch_pages()
-        );
+        println!("  wal_avg_batch_pages     = {:.2}", m.avg_wal_batch_pages());
         println!("  wal_truncations         = {}", m.wal_truncations);
         println!("  page_cache_hits         = {}", m.page_cache_hits);
         println!("  page_cache_misses       = {}", m.page_cache_misses);
@@ -346,8 +520,7 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        // По возможности пометим «чистое завершение»
+        let _ = self.sweep_orphan_overflow();
         let _ = set_clean_shutdown(&self.root, true);
-        // LockGuard освободит файловую блокировку автоматически.
     }
 }

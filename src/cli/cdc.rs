@@ -14,6 +14,28 @@ use crate::consts::{
 use crate::meta::set_last_lsn;
 use crate::pager::Pager;
 use crate::page_rh::rh_header_read;
+use crate::page_ovf::ovf_header_read;
+
+/// Вытянуть LSN из v2-страницы (RH или Overflow). None, если буфер не v2/не распознан.
+fn v2_page_lsn(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 8 {
+        return None;
+    }
+    if &buf[..4] != PAGE_MAGIC {
+        return None;
+    }
+    let ver = LittleEndian::read_u16(&buf[4..6]);
+    if ver < 2 {
+        return None;
+    }
+    if let Ok(h) = rh_header_read(buf) {
+        Some(h.lsn)
+    } else if let Ok(h) = ovf_header_read(buf) {
+        Some(h.lsn)
+    } else {
+        None
+    }
+}
 
 /// Печать WAL-кадров как JSONL. Если follow=true — «подписка» на новые записи.
 pub fn cmd_wal_tail(path: PathBuf, follow: bool) -> Result<()> {
@@ -236,6 +258,7 @@ pub fn cmd_wal_ship(path: PathBuf, follow: bool) -> Result<()> {
 /// Устойчива к:
 /// - повторной отправке 16-байтового заголовка WAL в середине потока (после truncate),
 /// - частичному хвосту потока (недочитанный заголовок/пейлоад) — трактуется как нормальный EOF.
+/// Делает LSN-гейтинг для v2-страниц (RH и Overflow).
 pub fn wal_apply_from_stream<R: Read>(path: &Path, mut inp: R) -> Result<()> {
     let mut pager = Pager::open(path)?;
 
@@ -325,26 +348,15 @@ pub fn wal_apply_from_stream<R: Read>(path: &Path, mut inp: R) -> Result<()> {
                 // Убедимся, что страница физически доступна
                 pager.ensure_allocated(page_id)?;
 
-                // LSN-гейтинг для v2
+                // LSN-гейтинг для v2 (RH или Overflow)
                 let mut apply = true;
-                if payload.len() >= 8 && &payload[..4] == PAGE_MAGIC {
-                    let ver = LittleEndian::read_u16(&payload[4..6]);
-                    if ver >= 2 {
-                        // Попробуем прочитать текущую страницу (CRC внутри read_page)
-                        let mut cur = vec![0u8; pager.meta.page_size as usize];
-                        if page_id < pager.meta.next_page_id {
-                            if pager.read_page(page_id, &mut cur).is_ok() {
-                                if &cur[..4] == PAGE_MAGIC {
-                                    let cur_ver = LittleEndian::read_u16(&cur[4..6]);
-                                    if cur_ver >= 2 {
-                                        if let (Ok(h_cur), Ok(h_new)) =
-                                            (rh_header_read(&cur), rh_header_read(&payload))
-                                        {
-                                            if h_cur.lsn >= h_new.lsn {
-                                                apply = false;
-                                            }
-                                        }
-                                    }
+                if let Some(new_lsn) = v2_page_lsn(&payload) {
+                    let mut cur = vec![0u8; pager.meta.page_size as usize];
+                    if page_id < pager.meta.next_page_id {
+                        if pager.read_page(page_id, &mut cur).is_ok() {
+                            if let Some(cur_lsn) = v2_page_lsn(&cur) {
+                                if cur_lsn >= new_lsn {
+                                    apply = false;
                                 }
                             }
                         }

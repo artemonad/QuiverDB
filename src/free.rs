@@ -1,28 +1,26 @@
 //! Free-list of pages (v0.6).
 //!
-//! Отдельный файл <root>/free с форматом:
+//! Файл <root>/free:
 //! Header (24 B):
 //!   [magic8="P1FREE01"][ver u32=1][count u32][reserved u64]
 //! Tail:
 //!   последовательность u64 page_id (LE), по одному на запись.
 //!
-//! Инварианты/устойчивость к сбоям:
+//! Устойчивость:
 //! - Источник истины для количества — длина файла: (len - FREE_HDR_SIZE) / 8.
-//!   Поле count в header поддерживается best-effort (обновляется после успешной операции),
+//!   Поле count поддерживается best-effort (обновляется после успешной операции),
 //!   но не используется при чтении.
-//! - push: append page_id -> sync -> обновить count -> sync.
-//!   Если упали до обновления count — он занижен, но данные есть.
-//! - pop: читаем последний u64 -> truncate(-8) -> sync -> обновить count -> sync.
-//!   Если упали до обновления count — он завышен, но при следующем чтении count
-//!
 
 use anyhow::{anyhow, Context, Result};
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::consts::{FREE_FILE, FREE_HDR_SIZE, FREE_MAGIC};
+
+// Внутренние смещения полей в заголовке
+const OFF_COUNT: u64 = 12;    // u32
 
 const FREE_VER_1: u32 = 1;
 
@@ -110,7 +108,7 @@ impl FreeList {
         f.sync_all()?;
 
         // update header.count best-effort
-        self.update_header_count(&mut f)?;
+        update_header_count(&mut f)?;
 
         Ok(())
     }
@@ -144,7 +142,7 @@ impl FreeList {
         f.sync_all()?;
 
         // update header.count best-effort
-        self.update_header_count(&mut f)?;
+        update_header_count(&mut f)?;
 
         Ok(Some(pid))
     }
@@ -153,21 +151,21 @@ impl FreeList {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
 
-    fn update_header_count(&self, f: &mut std::fs::File) -> Result<()> {
-        // count = (len - hdr)/8, saturate to u32 for header
-        let len = f.metadata()?.len();
-        let cnt = if len >= FREE_HDR_SIZE as u64 {
-            ((len - FREE_HDR_SIZE as u64) / 8) as u64
-        } else {
-            0
-        };
-        let cnt_u32 = cnt.min(u32::MAX as u64) as u32;
+/// Обновить поле count в заголовке (best-effort).
+fn update_header_count(f: &mut std::fs::File) -> Result<()> {
+    let len = f.metadata()?.len();
+    let cnt = if len >= FREE_HDR_SIZE as u64 {
+        ((len - FREE_HDR_SIZE as u64) / 8) as u64
+    } else {
+        0
+    };
+    let cnt_u32 = cnt.min(u32::MAX as u64) as u32;
 
-        // write header.count at offset 8..12
-        f.seek(SeekFrom::Start(8))?;
-        f.write_u32::<LittleEndian>(cnt_u32)?;
-        f.sync_all()?;
-        Ok(())
-    }
+    // Пишем строго в поле count (offset = 12), не затирая version!
+    f.seek(SeekFrom::Start(OFF_COUNT))?;
+    f.write_u32::<LittleEndian>(cnt_u32)?;
+    f.sync_all()?;
+    Ok(())
 }

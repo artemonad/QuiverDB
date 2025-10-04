@@ -210,7 +210,7 @@ impl Wal {
         };
 
         {
-            let mut f = self.inner.file.lock().unwrap();
+            let f = self.inner.file.lock().unwrap();
             f.sync_all()?;
         }
 

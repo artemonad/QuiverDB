@@ -174,7 +174,7 @@ fn apply_stops_gracefully_on_partial_payload_tail() -> Result<()> {
 
     // Проверим состояние страницы: должны видеть k1 и k2, а k3 — нет (так как кадр обрезан)
     let meta_f = read_meta(&follower)?;
-    let mut pager_f = Pager::open(&follower)?;
+    let pager_f = Pager::open(&follower)?;
     let ps = pager_f.meta.page_size as usize;
     let mut page = vec![0u8; ps];
 
@@ -217,7 +217,7 @@ fn apply_stops_gracefully_on_partial_header_tail() -> Result<()> {
 
     // Проверка: k1 и k2 есть, k3 нет
     let meta_f = read_meta(&follower)?;
-    let mut pager_f = Pager::open(&follower)?;
+    let pager_f = Pager::open(&follower)?;
     let ps = pager_f.meta.page_size as usize;
     let mut page = vec![0u8; ps];
 

@@ -4,20 +4,45 @@ use crate::consts::{
 };
 use crate::meta::{read_meta, set_last_lsn};
 use crate::pager::Pager;
+use crate::page_ovf::ovf_header_read;
 use crate::page_rh::rh_header_read;
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use crc32fast::Hasher as Crc32;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 // Нужен для инициализации пустого WAL (хедер) при первом старте.
 use super::writer::write_wal_file_header;
 
+/// Попробовать вытащить LSN из v2-страницы (RH или Overflow).
+/// Возвращает Some(lsn), если распознали v2-страницу, иначе None.
+fn v2_page_lsn(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 8 {
+        return None;
+    }
+    if &buf[..4] != PAGE_MAGIC {
+        return None;
+    }
+    let ver = LittleEndian::read_u16(&buf[4..6]);
+    if ver < 2 {
+        return None;
+    }
+    // Сначала пробуем RH, затем Overflow.
+    if let Ok(h) = rh_header_read(buf) {
+        return Some(h.lsn);
+    }
+    if let Ok(h) = ovf_header_read(buf) {
+        return Some(h.lsn);
+    }
+    None
+}
+
 /// Реплей WAL только если meta.clean_shutdown == false.
 /// При clean_shutdown == true WAL просто усечётся до заголовка (быстрый старт).
 /// Дополнительно: для v2-страниц применяем запись только при wal_lsn > page_lsn.
+/// Поддерживаются v2-типы: RH и Overflow.
 pub fn wal_replay_if_any(root: &Path) -> Result<()> {
     let wal_path = root.join(WAL_FILE);
     if !wal_path.exists() {
@@ -29,7 +54,7 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
         .open(&wal_path)
         .with_context(|| format!("open wal {}", wal_path.display()))?;
 
-    // Заголовок есть?
+    // Заголовок есть? Если нет — инициализируем.
     if f.metadata()?.len() < WAL_HDR_SIZE as u64 {
         write_wal_file_header(&mut f)?;
         f.sync_all()?;
@@ -42,10 +67,9 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
         return Err(anyhow!("bad WAL magic in {}", wal_path.display()));
     }
 
-    // Если завершение было чистым — реплей не нужен.
+    // Быстрый выход при чистом завершении: truncate до заголовка.
     let meta = read_meta(root)?;
     if meta.clean_shutdown {
-        // Поддержим быстрый старт и компактный WAL
         let len = f.metadata()?.len();
         if len > WAL_HDR_SIZE as u64 {
             f.set_len(WAL_HDR_SIZE as u64)?;
@@ -74,6 +98,7 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
             LittleEndian::read_u32(&hdr[WAL_REC_OFF_CRC32..WAL_REC_OFF_CRC32 + 4]);
         let rec_total = WAL_REC_HDR_SIZE as u64 + payload_len as u64;
         if pos + rec_total > len {
+            // хвост неполон — выходим
             break;
         }
         let mut payload = vec![0u8; payload_len];
@@ -85,6 +110,7 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
         hasher.update(&payload);
         let crc_actual = hasher.finalize();
         if crc_actual != crc_expected {
+            // возможно, запись ещё дописывается — выходим
             break;
         }
 
@@ -105,25 +131,13 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
                 let mut apply = true;
 
                 // Гейтинг для v2-страниц: сравним LSN текущей страницы и новой.
-                if payload.len() >= 8 && &payload[..4] == PAGE_MAGIC {
-                    let ver = LittleEndian::read_u16(&payload[4..6]);
-                    if ver >= 2 {
-                        // Прочитаем текущую страницу, если она есть и корректна (CRC check внутри read_page).
-                        let mut cur = vec![0u8; pager.meta.page_size as usize];
-                        if page_id < pager.meta.next_page_id {
-                            if pager.read_page(page_id, &mut cur).is_ok() {
-                                if &cur[..4] == PAGE_MAGIC {
-                                    let cur_ver = LittleEndian::read_u16(&cur[4..6]);
-                                    if cur_ver >= 2 {
-                                        if let (Ok(h_cur), Ok(h_new)) =
-                                            (rh_header_read(&cur), rh_header_read(&payload))
-                                        {
-                                            // Применяем только если новая запись «свежее».
-                                            if h_cur.lsn >= h_new.lsn {
-                                                apply = false;
-                                            }
-                                        }
-                                    }
+                if let Some(new_lsn) = v2_page_lsn(&payload) {
+                    let mut cur = vec![0u8; pager.meta.page_size as usize];
+                    if page_id < pager.meta.next_page_id {
+                        if pager.read_page(page_id, &mut cur).is_ok() {
+                            if let Some(cur_lsn) = v2_page_lsn(&cur) {
+                                if cur_lsn >= new_lsn {
+                                    apply = false;
                                 }
                             }
                         }
@@ -136,7 +150,7 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
                 }
             }
             _ => {
-                // Unknown record type: stop replay to avoid misinterpreting tail
+                // Unknown record type: останавливаем реплей, чтобы не читать «мусор» как данные.
                 break;
             }
         }
@@ -147,11 +161,11 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
         println!("WAL replay: applied {} record(s)", applied);
     }
 
-    // Truncate WAL to header after successful scan.
+    // Truncate WAL to header после успешного прохода.
     f.set_len(WAL_HDR_SIZE as u64)?;
     f.sync_all()?;
 
-    // Update last_lsn in meta (best-effort).
+    // Update last_lsn в meta (best-effort).
     if max_lsn > 0 {
         let _ = set_last_lsn(root, max_lsn);
     }

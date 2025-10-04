@@ -10,6 +10,7 @@ pub mod hash;
 pub mod lock;      // file locking
 pub mod meta;
 pub mod page_rh;   // v2: Robin Hood in-page index
+pub mod page_ovf; // v2: overflow pages
 pub mod pager;
 pub mod util;
 pub mod wal;

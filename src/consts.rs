@@ -12,9 +12,11 @@ pub const SEGMENT_SIZE: u64 = 32 * 1024 * 1024;
 // -------- Flags (reserved for future features) --------
 pub const FLAG_TDE_ENABLED: u32 = 0x1;
 
-// -------- Pages (v2: Robin Hood) --------
+// -------- Pages (v2: Robin Hood + Overflow) --------
 pub const PAGE_MAGIC: &[u8; 4] = b"P1PG";
 pub const PAGE_TYPE_KV_RH: u16 = 2;
+// Новый тип страницы под overflow-данные (v2-страница, общий 64-байтовый заголовок).
+pub const PAGE_TYPE_OVERFLOW: u16 = 3;
 pub const PAGE_HDR_V2_SIZE: usize = 64; // [MAGIC4][ver u16=2][type u16][pad4][page_id u64][data_start u16][table_slots u16][used_slots u16][flags u16][next_page_id u64][lsn u64][seed u64][crc32 u32]
 
 pub const NO_PAGE: u64 = u64::MAX;

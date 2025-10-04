@@ -1,6 +1,6 @@
 [package]
 name = "QuiverDB"
-version = "0.6.0-alpha.1"
+version = "0.6.0"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,9 @@ byteorder = "1.5"
 crc32fast = "1"
 twox-hash = "1"
 fs2 = "0.4"
+
+[dev-dependencies]
+oorandom = "11"
 
 [lib]
 name = "QuiverDB"

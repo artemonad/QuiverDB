@@ -1,8 +1,9 @@
-use crate::consts::{DATA_SEG_EXT, DATA_SEG_PREFIX, PAGE_MAGIC, SEGMENT_SIZE};
+use crate::consts::{DATA_SEG_EXT, DATA_SEG_PREFIX, PAGE_MAGIC, SEGMENT_SIZE, PAGE_TYPE_KV_RH, PAGE_TYPE_OVERFLOW};
 use crate::free::FreeList;
 use crate::meta::{read_meta, write_meta_overwrite, MetaHeader};
 use crate::metrics::{record_cache_hit, record_cache_miss};
 use crate::page_rh::{rh_header_read, rh_header_write, rh_page_update_crc, rh_page_verify_crc};
+use crate::page_ovf::{ovf_header_read, ovf_header_write};
 use crate::util::{read_at, write_at};
 use crate::wal::Wal;
 use anyhow::{anyhow, Context, Result};
@@ -201,7 +202,7 @@ impl Pager {
     /// Запись через WAL с LSN:
     /// Порядок:
     /// 1) Присваиваем новый LSN (meta.last_lsn + 1).
-    /// 2) Если это v2-страница — вписываем LSN в заголовок.
+    /// 2) Если это v2-страница — вписываем LSN в заголовок (RH/Overflow).
     /// 3) Обновляем CRC (v2).
     /// 4) append + fsync WAL (с коалессированием).
     /// 5) Пишем страницу в сегмент.
@@ -219,16 +220,33 @@ impl Pager {
         // Новый LSN для записи
         let lsn = self.meta.last_lsn.wrapping_add(1);
 
-        // Если это наша страница — для v2 впишем LSN, затем посчитаем CRC.
+        // Если это наша страница — для v2 впишем LSN в заголовок, затем посчитаем CRC.
         if buf.len() >= 8 && &buf[..4] == PAGE_MAGIC {
             let ver = LittleEndian::read_u16(&buf[4..6]);
 
             // v2: впишем lsn в заголовок, чтобы payload в WAL уже содержал актуальный lsn.
             if ver >= 2 {
-                let mut h = rh_header_read(buf)?;
-                h.lsn = lsn;
-                rh_header_write(buf, &h)?;
-                rh_page_update_crc(buf)?;
+                let ptype = LittleEndian::read_u16(&buf[6..8]);
+                match ptype {
+                    t if t == PAGE_TYPE_KV_RH => {
+                        let mut h = rh_header_read(buf)?;
+                        h.lsn = lsn;
+                        rh_header_write(buf, &h)?;
+                        rh_page_update_crc(buf)?;
+                    }
+                    t if t == PAGE_TYPE_OVERFLOW => {
+                        let mut h = ovf_header_read(buf)?;
+                        h.lsn = lsn;
+                        ovf_header_write(buf, &h)?;
+                        rh_page_update_crc(buf)?;
+                    }
+                    _ => {
+                        // неизвестный тип v2 — CRC посчитаем на всякий (если нужен),
+                        // но LSN не знаем куда писать — пропустим.
+                        // Безопасно: apply/replay будет ориентироваться на CRC/LSN только если распознает тип.
+                        rh_page_update_crc(buf)?;
+                    }
+                }
             }
         }
 
