@@ -7,6 +7,7 @@ use crate::meta::read_meta;
 use crate::pager::Pager;
 use crate::util::hex_dump;
 use crate::{init_db, wal_replay_if_any};
+use crate::free::FreeList;
 
 use super::DirtyGuard;
 
@@ -33,6 +34,18 @@ pub fn cmd_status(path: PathBuf) -> Result<()> {
     } else {
         println!("  directory    = (not initialized)");
     }
+
+    // Free-list (optional)
+    match FreeList::open(&path) {
+        Ok(fl) => {
+            let cnt = fl.count()?;
+            println!("  free_pages   = {}", cnt);
+        }
+        Err(_) => {
+            println!("  free_pages   = (free-list not found)");
+        }
+    }
+
     Ok(())
 }
 
@@ -82,5 +95,50 @@ pub fn cmd_read(path: PathBuf, page_id: u64, len: usize) -> Result<()> {
     let n = len.min(ps);
     println!("First {} bytes of page {}:", n, page_id);
     println!("{}", hex_dump(&buf[..n]));
+    Ok(())
+}
+
+// ---------- Free-list tooling (v0.6) ----------
+
+pub fn cmd_free_status(path: PathBuf) -> Result<()> {
+    match FreeList::open(&path) {
+        Ok(fl) => {
+            let cnt = fl.count()?;
+            println!(
+                "Free-list at {}: {} page(s)",
+                fl.path().display(),
+                cnt
+            );
+        }
+        Err(e) => {
+            println!("Free-list not available at {}: {}", path.display(), e);
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_free_push(path: PathBuf, page_id: u64) -> Result<()> {
+    let _lock = acquire_exclusive_lock(&path)?;
+    let fl = FreeList::open(&path)?;
+    fl.push(page_id)?;
+    println!("Pushed page {} into free-list", page_id);
+    Ok(())
+}
+
+pub fn cmd_free_pop(path: PathBuf, count: u32) -> Result<()> {
+    let _lock = acquire_exclusive_lock(&path)?;
+    let fl = FreeList::open(&path)?;
+    let mut popped: Vec<u64> = Vec::new();
+    for _ in 0..count {
+        match fl.pop()? {
+            Some(pid) => popped.push(pid),
+            None => break,
+        }
+    }
+    if popped.is_empty() {
+        println!("Free-list is empty");
+    } else {
+        println!("Popped {} page(s): {:?}", popped.len(), popped);
+    }
     Ok(())
 }

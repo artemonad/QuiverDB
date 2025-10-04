@@ -69,10 +69,10 @@ impl Db {
         }
 
         let bucket = self.dir.bucket_of_key(key);
-        let head = self.dir.head(bucket)?;
+        let mut head = self.dir.head(bucket)?;
         if head == NO_PAGE {
-            // создаём первую страницу в бакете (всегда v2)
-            let new_pid = self.pager.allocate_pages(1)?;
+            // создаём первую страницу в бакете (всегда v2), предпочтительно из free-list
+            let new_pid = self.pager.allocate_one_page()?;
             let mut buf = vec![0u8; ps];
             rh_page_init(&mut buf, new_pid)?;
             let ok = rh_kv_insert(&mut buf, self.dir.hash_kind, key, val)?;
@@ -84,9 +84,11 @@ impl Db {
             return Ok(());
         }
 
-        // ищем место в цепочке v2-страниц
-        let mut pid = head;
+        // Ищем место в цепочке v2-страниц, по пути вычищаем пустые страницы
+        let mut prev: u64 = NO_PAGE;
+        let mut pid: u64 = head;
         let mut tail_pid: u64 = NO_PAGE;
+
         loop {
             let mut buf = vec![0u8; ps];
             self.pager.read_page(pid, &mut buf)?;
@@ -109,17 +111,46 @@ impl Db {
                 }
             }
 
-            // 3) Переходим дальше по цепочке
+            // 3) Проверим, не пустая ли страница — и если пустая, вырежем её из цепочки
             let h = rh_header_read(&buf)?;
+            if h.used_slots == 0 {
+                // unlink pid -> h.next_page_id
+                let next = h.next_page_id;
+                if prev == NO_PAGE {
+                    // срезаем head
+                    self.dir.set_head(bucket, next)?;
+                    head = next;
+                } else {
+                    // обновим next у prev и закоммитим
+                    let mut pbuf = vec![0u8; ps];
+                    self.pager.read_page(prev, &mut pbuf)?;
+                    let mut ph = rh_header_read(&pbuf)?;
+                    ph.next_page_id = next;
+                    rh_header_write(&mut pbuf, &ph)?;
+                    self.pager.commit_page(prev, &mut pbuf)?;
+                }
+                // страницу — в free-list (после unlink)
+                let _ = self.pager.free_page(pid);
+                // продолжаем с next, prev остаётся прежним
+                if next == NO_PAGE {
+                    tail_pid = prev; // цепочка закончилась на prev
+                    break;
+                }
+                pid = next;
+                continue;
+            }
+
+            // 4) Переходим дальше по цепочке
             if h.next_page_id == NO_PAGE {
                 tail_pid = pid;
                 break;
             }
+            prev = pid;
             pid = h.next_page_id;
         }
 
-        // Добавляем новую v2 страницу в конец цепочки
-        let new_pid = self.pager.allocate_pages(1)?;
+        // Добавляем новую v2 страницу в конец цепочки (предпочтительно из free-list)
+        let new_pid = self.pager.allocate_one_page()?;
         let mut newb = vec![0u8; ps];
         rh_page_init(&mut newb, new_pid)?;
         let ok = rh_kv_insert(&mut newb, self.dir.hash_kind, key, val)?;
@@ -128,13 +159,18 @@ impl Db {
         }
         self.pager.commit_page(new_pid, &mut newb)?;
 
-        // Обновим next у хвоста
-        let mut tailb = vec![0u8; ps];
-        self.pager.read_page(tail_pid, &mut tailb)?;
-        let mut th = rh_header_read(&tailb)?;
-        th.next_page_id = new_pid;
-        rh_header_write(&mut tailb, &th)?;
-        self.pager.commit_page(tail_pid, &mut tailb)?;
+        // Обновим next у хвоста (tail_pid может быть NO_PAGE, если цепочка полностью очистилась)
+        if tail_pid == NO_PAGE {
+            // цепочка стала пустой — новый pid становится head
+            self.dir.set_head(bucket, new_pid)?;
+        } else {
+            let mut tailb = vec![0u8; ps];
+            self.pager.read_page(tail_pid, &mut tailb)?;
+            let mut th = rh_header_read(&tailb)?;
+            th.next_page_id = new_pid;
+            rh_header_write(&mut tailb, &th)?;
+            self.pager.commit_page(tail_pid, &mut tailb)?;
+        }
         Ok(())
     }
 
@@ -163,25 +199,71 @@ impl Db {
 
     pub fn del(&mut self, key: &[u8]) -> Result<bool> {
         let bucket = self.dir.bucket_of_key(key);
-        let mut pid = self.dir.head(bucket)?;
-        if pid == NO_PAGE {
+        let mut head = self.dir.head(bucket)?;
+        if head == NO_PAGE {
             return Ok(false);
         }
+
         let ps = self.pager.meta.page_size as usize;
         let mut existed_any = false;
+
+        // prev -> pid -> next обход с очисткой пустых страниц (unlink + free)
+        let mut prev: u64 = NO_PAGE;
+        let mut pid: u64 = head;
+
         while pid != NO_PAGE {
+            // загрузим страницу
             let mut buf = vec![0u8; ps];
             self.pager.read_page(pid, &mut buf)?;
             if !rh_page_is_kv(&buf) {
                 return Err(anyhow!("page {} is not KV-RH (v2) page", pid));
             }
+
+            // попытка удаления
+            let mut modified = false;
             if rh_kv_delete_inplace(&mut buf, self.dir.hash_kind, key)? {
                 existed_any = true;
+                modified = true;
+            }
+
+            if modified {
+                // зафиксируем изменения страницы (LSN, CRC, WAL)
                 self.pager.commit_page(pid, &mut buf)?;
             }
+
+            // проверим, не стала ли страница пустой (или уже была пустой)
             let h = rh_header_read(&buf)?;
-            pid = h.next_page_id;
+            let next = h.next_page_id;
+
+            if h.used_slots == 0 {
+                // unlink этой страницы из цепочки
+                if prev == NO_PAGE {
+                    // удаляем head
+                    self.dir.set_head(bucket, next)?;
+                    head = next;
+                } else {
+                    // обновим next у prev и закоммитим
+                    let mut pbuf = vec![0u8; ps];
+                    self.pager.read_page(prev, &mut pbuf)?;
+                    let mut ph = rh_header_read(&pbuf)?;
+                    ph.next_page_id = next;
+                    rh_header_write(&mut pbuf, &ph)?;
+                    self.pager.commit_page(prev, &mut pbuf)?;
+                }
+
+                // отправим текущую страницу в free-list (после unlink)
+                let _ = self.pager.free_page(pid);
+
+                // не двигаем prev, переходим к next
+                pid = next;
+                continue;
+            }
+
+            // страница не пустая — двигаем prev и pid
+            prev = pid;
+            pid = next;
         }
+
         Ok(existed_any)
     }
 

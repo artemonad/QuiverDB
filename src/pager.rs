@@ -1,4 +1,5 @@
 use crate::consts::{DATA_SEG_EXT, DATA_SEG_PREFIX, PAGE_MAGIC, SEGMENT_SIZE};
+use crate::free::FreeList;
 use crate::meta::{read_meta, write_meta_overwrite, MetaHeader};
 use crate::metrics::{record_cache_hit, record_cache_miss};
 use crate::page_rh::{rh_header_read, rh_header_write, rh_page_update_crc, rh_page_verify_crc};
@@ -96,6 +97,42 @@ impl Pager {
         self.meta.next_page_id = end;
         write_meta_overwrite(&self.root, &self.meta)?;
         Ok(start)
+    }
+
+    /// Попытаться получить одну страницу из free-list; если пуст — аллоцировать новую.
+    /// При реюзе free-страницы meta.next_page_id не меняется.
+    pub fn allocate_one_page(&mut self) -> Result<u64> {
+        if let Ok(fl) = FreeList::open(&self.root) {
+            if let Some(pid) = fl.pop()? {
+                // Защитимся от испорченного free-файла.
+                if pid >= self.meta.next_page_id {
+                    return Err(anyhow!(
+                        "free-list returned invalid page_id {} >= next_page_id {}",
+                        pid,
+                        self.meta.next_page_id
+                    ));
+                }
+                // Убедимся, что физически сегмент/размер присутствуют (после возможного сбоя).
+                self.ensure_allocated(pid)?;
+                return Ok(pid);
+            }
+        }
+        // Фолбэк — аллоцируем новый «хвостовой» page_id.
+        self.allocate_pages(1)
+    }
+
+    /// Добавить страницу во free-list (best-effort).
+    /// Никакой очистки/обнуления не делаем — потребитель обязан перезаписать страницу перед commit.
+    pub fn free_page(&self, page_id: u64) -> Result<()> {
+        if page_id >= self.meta.next_page_id {
+            return Err(anyhow!(
+                "cannot free page {} (>= next_page_id {})",
+                page_id,
+                self.meta.next_page_id
+            ));
+        }
+        let fl = FreeList::open(&self.root)?;
+        fl.push(page_id)
     }
 
     /// Ensure that given page is physically allocated on disk.

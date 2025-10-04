@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::consts::{
     PAGE_MAGIC, WAL_FILE, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE, WAL_REC_OFF_CRC32,
-    WAL_REC_OFF_LEN, WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_PAGE_IMAGE,
+    WAL_REC_OFF_LEN, WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_PAGE_IMAGE, WAL_REC_TRUNCATE,
 };
 use crate::meta::set_last_lsn;
 use crate::pager::Pager;
@@ -93,10 +93,12 @@ pub fn cmd_wal_tail(path: PathBuf, follow: bool) -> Result<()> {
                         wal_lsn, page_id, payload_len, crc_expected
                     );
                 }
-                _ => {
+                // В файле TRUNCATE-записей не будет (они только в ship-стриме),
+                // но если когда-то появятся — отобразим.
+                t => {
                     println!(
                         r#"{{"type":"unknown","code":{},"lsn":{},"len":{},"crc32":{}}}"#,
-                        rec_type, wal_lsn, payload_len, crc_expected
+                        t, wal_lsn, payload_len, crc_expected
                     );
                 }
             }
@@ -120,7 +122,8 @@ pub fn cmd_wal_tail(path: PathBuf, follow: bool) -> Result<()> {
 /// wal-ship: побайтово «стримит» WAL-кадры на stdout в исходном бинарном формате:
 /// - сначала пишет 16-байтовый заголовок WAL (как в файле),
 /// - затем повторяет последовательность [record header (28 B) + payload].
-/// Если follow=true — продолжает слать новые записи, реагируя на truncate (переотправляет header).
+/// Если follow=true — продолжает слать новые записи, реагируя на truncate:
+/// - шлёт TRUNCATE-запись (len=0), затем повторно 16-байтовый заголовок.
 pub fn cmd_wal_ship(path: PathBuf, follow: bool) -> Result<()> {
     let wal_path = path.join(WAL_FILE);
     let mut f = OpenOptions::new()
@@ -152,10 +155,30 @@ pub fn cmd_wal_ship(path: PathBuf, follow: bool) -> Result<()> {
     loop {
         let len = f.metadata()?.len();
         if len < pos {
-            // truncate: переотправим header и начнём заново
+            // truncate: пошлём TRUNCATE-запись, затем повторим header и начнём заново
             pos = WAL_HDR_SIZE as u64;
+
+            // Сформируем TRUNCATE record (len=0, lsn=0, page_id=0)
+            let mut tr_hdr = vec![0u8; WAL_REC_HDR_SIZE];
+            tr_hdr[0] = WAL_REC_TRUNCATE;
+            tr_hdr[1] = 0;
+            LittleEndian::write_u16(&mut tr_hdr[2..4], 0);
+            LittleEndian::write_u64(&mut tr_hdr[WAL_REC_OFF_LSN..WAL_REC_OFF_LSN + 8], 0);
+            LittleEndian::write_u64(&mut tr_hdr[WAL_REC_OFF_PAGE_ID..WAL_REC_OFF_PAGE_ID + 8], 0);
+            LittleEndian::write_u32(&mut tr_hdr[WAL_REC_OFF_LEN..WAL_REC_OFF_LEN + 4], 0);
+
+            let mut hasher = Crc32::new();
+            hasher.update(&tr_hdr[..WAL_REC_OFF_CRC32]);
+            // payload пустой
+            let crc = hasher.finalize();
+            LittleEndian::write_u32(
+                &mut tr_hdr[WAL_REC_OFF_CRC32..WAL_REC_OFF_CRC32 + 4],
+                crc,
+            );
+
             let mut out = std::io::stdout().lock();
-            out.write_all(&hdr16)?;
+            out.write_all(&tr_hdr)?;
+            out.write_all(&hdr16)?; // повторно пошлём header, как и раньше
             out.flush()?;
         }
 
@@ -330,6 +353,10 @@ pub fn wal_apply_from_stream<R: Read>(path: &Path, mut inp: R) -> Result<()> {
                 if apply {
                     pager.write_page_raw(page_id, &payload)?;
                 }
+            }
+            WAL_REC_TRUNCATE => {
+                // Явный сигнал truncate в стриме: для apply делать ничего не нужно.
+                // Мы уже устойчивы к повторам 16-байтового заголовка после него.
             }
             _ => {
                 // незнакомый тип — игнорируем (для будущей совместимости)

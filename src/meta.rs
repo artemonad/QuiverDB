@@ -2,7 +2,9 @@ use crate::consts::{MAGIC, META_FILE};
 use crate::hash::{HashKind, HASH_KIND_DEFAULT};
 use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 

@@ -24,6 +24,15 @@ pub const DIR_FILE: &str = "dir";
 pub const DIR_MAGIC: &[u8; 8] = b"P1DIR001";
 pub const DIR_HDR_SIZE: usize = 24; // [magic8][ver u32][buckets u32][reserved u64]
 
+// -------- Free-list (v0.6) --------
+// Отдельный файл со списком свободных страниц.
+// Формат header (24 байта):
+// [magic8="P1FREE01"][ver u32=1][count u32][reserved u64]
+// Далее последовательность u64 page_id (count штук).
+pub const FREE_FILE: &str = "free";
+pub const FREE_MAGIC: &[u8; 8] = b"P1FREE01";
+pub const FREE_HDR_SIZE: usize = 24;
+
 // -------- WAL --------
 pub const WAL_FILE: &str = "wal-000001.log";
 pub const WAL_MAGIC: &[u8; 8] = b"P1WAL001";
@@ -44,9 +53,8 @@ pub const WAL_REC_HDR_SIZE: usize = 28;
 
 // Типы записей WAL:
 pub const WAL_REC_PAGE_IMAGE: u8 = 1;
-// Новый (опциональный) тип записи для явного сигнала truncate/rotate
-// в стриме (ship). Payload = 0 байт; приемник может игнорировать.
-// Совместим с текущим протоколом: старые клиенты просто пропустят unknown type.
+// Опциональный TRUNCATE-рекорд в стриме ship (payload=0).
+// Старые клиенты проигнорируют как unknown.
 pub const WAL_REC_TRUNCATE: u8 = 2;
 
 // Offsets inside record header

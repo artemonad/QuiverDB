@@ -6,7 +6,7 @@ use std::path::PathBuf;
 mod admin;
 mod rh;
 mod db_cli;
-// CDC (wal-tail/ship/apply) — делаем публичным, чтобы использовать в интеграционных тестах
+// CDC (wal-tail/ship/apply) — публичный, чтобы использовать в интеграционных тестах
 pub mod cdc;
 
 pub use cdc::wal_apply_from_stream; // удобный реэкспорт для тестов и внешнего кода
@@ -94,6 +94,24 @@ pub enum Cmd {
         page_id: u64,
         #[arg(long, default_value_t = 64)]
         len: usize,
+    },
+
+    // Free-list tooling (v0.6)
+    FreeStatus {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    FreePop {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
+    FreePush {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        page_id: u64,
     },
 
     // Низкоуровневые команды (v2: Robin Hood)
@@ -207,6 +225,11 @@ pub fn run() -> Result<()> {
         Cmd::Alloc { path, count } => admin::cmd_alloc(path, count),
         Cmd::Write { path, page_id, fill } => admin::cmd_write(path, page_id, fill),
         Cmd::Read { path, page_id, len } => admin::cmd_read(path, page_id, len),
+
+        // ------- free-list tooling -------
+        Cmd::FreeStatus { path } => admin::cmd_free_status(path),
+        Cmd::FreePop { path, count } => admin::cmd_free_pop(path, count),
+        Cmd::FreePush { path, page_id } => admin::cmd_free_push(path, page_id),
 
         // ------- low-level v2 (Robin Hood) -------
         Cmd::PagefmtRh { path, page_id } => rh::cmd_pagefmt_rh(path, page_id),
