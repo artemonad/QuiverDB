@@ -2,6 +2,21 @@
 name = "QuiverDB"
 version = "1.0.0"
 edition = "2021"
+description = "Embedded KV DB with in-page Robin Hood index, WAL, directory and overflow chains"
+readme = "README.md"
+repository = "https://github.com/artemonad/QuiverDB"
+license = "MIT"
+keywords = ["database", "embedded", "kv", "wal", "robin-hood"]
+categories = ["database", "embedded"]
+authors = ["Федорчук Артем (artemoand)"]
+
+[lib]
+name = "QuiverDB"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quiverdb"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -13,7 +28,3 @@ fs2 = "0.4"
 
 [dev-dependencies]
 oorandom = "11"
-
-[lib]
-name = "QuiverDB"
-path = "src/lib.rs"

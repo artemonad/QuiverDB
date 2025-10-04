@@ -9,16 +9,13 @@
 //   cargo test --test ro_readers -- --nocapture
 
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use byteorder::{ByteOrder, LittleEndian};
 
-use QuiverDB::{init_db, read_meta, set_clean_shutdown, Db, Directory, try_acquire_exclusive_lock};
+use QuiverDB::{init_db, read_meta, set_clean_shutdown, Db, Directory};
 use QuiverDB::consts::{DATA_SEG_EXT, DATA_SEG_PREFIX, WAL_FILE, WAL_HDR_SIZE};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -66,18 +63,16 @@ fn ro_does_not_toggle_clean_flag() -> Result<()> {
 
 #[test]
 fn ro_shared_lock_blocks_exclusive_try() -> Result<()> {
-    use QuiverDB::try_acquire_exclusive_lock;
-
+    // Откроем RO (shared-lock)
     let root = unique_root("lock");
     fs::create_dir_all(&root)?;
     init_db(&root, 4096)?;
     Directory::create(&root, 8)?;
 
-    // Откроем RO (shared-lock)
     let _db_ro = Db::open_ro(&root)?;
 
     // Попробуем взять эксклюзивный lock — должно упасть (try_* возвращает Err)
-    let res = try_acquire_exclusive_lock(&root);
+    let res = QuiverDB::try_acquire_exclusive_lock(&root);
     assert!(
         res.is_err(),
         "try_acquire_exclusive_lock must fail while RO (shared) is held"
@@ -143,13 +138,12 @@ fn ro_does_not_replay_wal_writer_does() -> Result<()> {
 
     // 4) Writer-открытие: выполнит wal_replay_if_any, восстановит страницу, усечёт WAL
     {
-        let db_wr = Db::open(&root)?;
-        // Теперь чтение должно вернуться успешно
-        let v = db_wr.get(b"foo")?.expect("foo must exist after writer replay");
+        let db = Db::open(&root)?;
+        let v = db.get(b"foo")?.expect("foo must exist after writer replay");
         assert_eq!(v, b"bar");
     }
 
-    // WAL усечён до заголовка
+    // WAL усечён
     let wal_len2 = fs::metadata(&wal_path)?.len();
     assert_eq!(wal_len2, WAL_HDR_SIZE as u64, "WAL must be truncated by writer replay");
 

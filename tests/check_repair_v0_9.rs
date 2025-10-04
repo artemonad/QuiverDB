@@ -15,17 +15,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt}; // ReadBytesExt добавлен
+use byteorder::{ByteOrder, LittleEndian}; // Нужен ByteOrder для LittleEndian::read/write_uXX
 use crc32fast::Hasher as Crc32;
 
 use QuiverDB::{init_db, read_meta, Db, Directory};
 use QuiverDB::consts::{
-    DATA_SEG_EXT, DATA_SEG_PREFIX, DIR_FILE, DIR_HDR_SIZE, DIR_MAGIC, FREE_FILE, FREE_HDR_SIZE,
-    FREE_MAGIC, NO_PAGE,
+    DIR_FILE, DIR_HDR_SIZE, DIR_MAGIC, FREE_FILE, FREE_HDR_SIZE, FREE_MAGIC, NO_PAGE,
 };
 use QuiverDB::pager::Pager;
 use QuiverDB::page_ovf::ovf_page_init;
-use QuiverDB::page_rh::{rh_kv_lookup, rh_page_is_kv, rh_page_update_crc};
+use QuiverDB::page_rh::{rh_page_is_kv, rh_page_update_crc};
 use QuiverDB::cli::admin::{cmd_check, cmd_repair};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -42,10 +41,6 @@ fn unique_root(prefix: &str) -> PathBuf {
 }
 
 // ----- helpers -----
-
-fn seg1_path(root: &PathBuf) -> PathBuf {
-    root.join(format!("{}{:06}.{}", DATA_SEG_PREFIX, 1, DATA_SEG_EXT))
-}
 
 fn read_free_set(root: &PathBuf) -> Result<std::collections::HashSet<u64>> {
     let path = root.join(FREE_FILE);
@@ -91,7 +86,7 @@ fn directory_crc_valid_and_detects_corruption() -> Result<()> {
     let root = unique_root("dir-crc");
     fs::create_dir_all(&root)?;
     init_db(&root, 4096)?;
-    let _dir_created = Directory::create(&root, 16)?; // не требуем Debug
+    let _dir_created = Directory::create(&root, 16)?;
 
     // Откроется и валидирует CRC
     let _dir2 = Directory::open(&root)?;
@@ -102,9 +97,20 @@ fn directory_crc_valid_and_detects_corruption() -> Result<()> {
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     assert_eq!(&magic, DIR_MAGIC);
-    let version = f.read_u32::<LittleEndian>()?;
-    let buckets = f.read_u32::<LittleEndian>()?;
-    let stored_crc = f.read_u64::<LittleEndian>()? as u32;
+
+    // version u32
+    let mut ver4 = [0u8; 4];
+    f.read_exact(&mut ver4)?;
+    let version = LittleEndian::read_u32(&ver4);
+    // buckets u32
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b4)?;
+    let buckets = LittleEndian::read_u32(&b4);
+    // stored_crc u64 (берём низ 32 бита)
+    let mut c8 = [0u8; 8];
+    f.read_exact(&mut c8)?;
+    let stored_crc = LittleEndian::read_u64(&c8) as u32;
+
     let heads_len = (buckets as usize) * 8;
     let mut heads = vec![0u8; heads_len];
     f.read_exact(&mut heads)?;
@@ -115,7 +121,7 @@ fn directory_crc_valid_and_detects_corruption() -> Result<()> {
     // Портим один байт в heads и убеждаемся, что open теперь падает по CRC mismatch.
     drop(f);
     let mut fw = OpenOptions::new().read(true).write(true).open(&path)?;
-    let off = (DIR_HDR_SIZE as u64); // начало heads
+    let off = DIR_HDR_SIZE as u64; // начало heads
     fw.seek(SeekFrom::Start(off))?;
     fw.read_exact(&mut heads)?;
     heads[0] ^= 0xFF;
@@ -123,7 +129,7 @@ fn directory_crc_valid_and_detects_corruption() -> Result<()> {
     fw.write_all(&heads)?;
     fw.sync_all()?;
 
-    // Избегаем unwrap_err() (он требует Debug для Ok-типа).
+    // Не используем unwrap_err (требует Debug у Ok-типа)
     let res = Directory::open(&root);
     let err = match res {
         Ok(_) => panic!("expected CRC error after corrupting DIR heads"),

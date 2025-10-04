@@ -143,7 +143,7 @@ pub fn cmd_free_pop(path: PathBuf, count: u32) -> Result<()> {
     Ok(())
 }
 
-// ---------- v0.8: DB check (CRC scan, overflow reachability) ----------
+// ---------- v0.8/0.9: DB check (CRC scan, overflow reachability, strict mode) ----------
 
 use byteorder::{ByteOrder, LittleEndian};
 use std::collections::HashSet;
@@ -183,20 +183,23 @@ fn read_free_set(root: &Path) -> Result<HashSet<u64>> {
     Ok(set)
 }
 
-/// Полный скан БД:
-/// - Проверка каталога (Directory::open валидирует CRC/версию).
-/// - Проход по всем страницам: учёт v2 RH/Overflow, unknown/magic, ошибки/CRC mismatch.
-/// - Подсчёт живых Overflow и достижимых из плейсхолдеров (orphans).
-pub fn cmd_check(path: PathBuf) -> Result<()> {
-    println!("Running check for {}", path.display());
+/// Полный скан БД. Вызывает ошибку в strict-режиме, если обнаружены проблемы:
+/// - Directory ошибка,
+/// - crc_fail > 0,
+/// - io_fail > 0,
+/// - есть сиротские overflow-страницы.
+pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
+    println!("Running check for {} (strict={})", path.display(), strict);
 
     // 1) Directory
+    let mut dir_ok = true;
     match Directory::open(&path) {
         Ok(dir) => {
             println!("Directory: OK (buckets={}, kind={})", dir.bucket_count, dir.hash_kind);
         }
         Err(e) => {
             println!("Directory: ERROR: {}", e);
+            dir_ok = false;
         }
     }
 
@@ -258,7 +261,7 @@ pub fn cmd_check(path: PathBuf) -> Result<()> {
                             magic_other += 1; // наш magic, но не RH/OVF (неожиданный тип/версия)
                         }
                     } else {
-                        magic_other += 1; // старый формат (поддержка не требуется, учитываем как «другой»)
+                        magic_other += 1; // старый формат (учитываем как «другой»)
                     }
                 } else {
                     no_magic += 1;
@@ -300,7 +303,22 @@ pub fn cmd_check(path: PathBuf) -> Result<()> {
         println!("  orphans_preview  = {:?}", preview);
     }
 
+    if strict {
+        let has_issues = !dir_ok || crc_fail > 0 || io_fail > 0 || !ovf_orphans.is_empty();
+        if has_issues {
+            return Err(anyhow!(
+                "check failed (strict): dir_ok={}, crc_fail={}, io_fail={}, overflow_orphans={}",
+                dir_ok, crc_fail, io_fail, ovf_orphans.len()
+            ));
+        }
+    }
+
     Ok(())
+}
+
+/// Сохранённая совместимость: прежняя команда check без строгого режима.
+pub fn cmd_check(path: PathBuf) -> Result<()> {
+    cmd_check_strict(path, false)
 }
 
 /// v0.9: Repair — освободить сиротские overflow-страницы (best-effort).
@@ -316,7 +334,7 @@ pub fn cmd_repair(path: PathBuf) -> Result<()> {
     let dir = Directory::open(&path)
         .map_err(|e| anyhow!("repair requires valid directory: {e}"))?;
 
-    let mut pager = Pager::open(&path)?;
+    let pager = Pager::open(&path)?;
     let ps = pager.meta.page_size as usize;
     let pages = pager.meta.next_page_id;
     let free_set = read_free_set(&path)?;

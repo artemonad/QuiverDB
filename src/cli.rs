@@ -16,7 +16,7 @@ pub use cdc::wal_apply_from_stream; // удобный реэкспорт для 
 use crate::util::parse_u8_byte;
 
 /// RAII-гард, который:
-/// - в begin() ставит clean_shutdown=false (DB «грязная»)
+/// - в begin() ставит clean_shutdown=false (БД «грязная»)
 /// - при нормальном завершении (finish или Drop) возвращает clean_shutdown=true
 /// Если процесс упадёт, Drop не вызовется, и флаг останется false — при старте будет WAL replay.
 pub(crate) struct DirtyGuard {
@@ -217,10 +217,13 @@ pub enum Cmd {
         path: PathBuf,
     },
 
-    // v0.8: check (CRC scan, overflow reachability)
+    // v0.8: check (CRC scan, overflow reachability) + strict режим
     Check {
         #[arg(long)]
         path: PathBuf,
+        /// Strict mode: non-zero exit if problems detected (dir error, CRC/IO errors, orphan overflow)
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
 
     // v0.9: repair (free orphan overflow pages)
@@ -269,8 +272,8 @@ pub fn run() -> Result<()> {
         Cmd::WalShip { path, follow } => cdc::cmd_wal_ship(path, follow),
         Cmd::WalApply { path } => cdc::cmd_wal_apply(path),
 
-        // ------- v0.8: check -------
-        Cmd::Check { path } => admin::cmd_check(path),
+        // ------- v0.8: check + strict -------
+        Cmd::Check { path, strict } => admin::cmd_check_strict(path, strict),
 
         // ------- v0.9: repair -------
         Cmd::Repair { path } => admin::cmd_repair(path),
