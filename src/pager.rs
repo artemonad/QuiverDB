@@ -1,9 +1,22 @@
-use crate::consts::{DATA_SEG_EXT, DATA_SEG_PREFIX, PAGE_MAGIC, SEGMENT_SIZE, PAGE_TYPE_KV_RH, PAGE_TYPE_OVERFLOW};
+// src/pager.rs
+
+//! Pager: segments, page IO, WAL-integrated commits, and a small read cache.
+//!
+//! Env toggles:
+//! - P1_PAGE_CACHE_PAGES=N  -> enable read cache with N pages (default 0 = disabled)
+//! - P1_DATA_FSYNC=[0|1]   -> fsync data segments on every write (default 1)
+//!   If set to 0, durability relies on WAL only and WAL will NOT be truncated
+//!   in commit_page (to keep crash recovery intact). Use for performance/bench,
+//!   not for strict durability of data files.
+
+use crate::consts::{
+    DATA_SEG_EXT, DATA_SEG_PREFIX, PAGE_MAGIC, SEGMENT_SIZE, PAGE_TYPE_KV_RH, PAGE_TYPE_OVERFLOW,
+};
 use crate::free::FreeList;
 use crate::meta::{read_meta, write_meta_overwrite, MetaHeader};
 use crate::metrics::{record_cache_hit, record_cache_miss};
-use crate::page_rh::{rh_header_read, rh_header_write, rh_page_update_crc, rh_page_verify_crc};
 use crate::page_ovf::{ovf_header_read, ovf_header_write};
+use crate::page_rh::{rh_header_read, rh_header_write, rh_page_update_crc, rh_page_verify_crc};
 use crate::util::{read_at, write_at};
 use crate::wal::Wal;
 use anyhow::{anyhow, Context, Result};
@@ -18,6 +31,9 @@ pub struct Pager {
     pub meta: MetaHeader,
     // Небольшой LRU-подобный кэш страниц (включается переменной окружения).
     cache: RefCell<Option<PageCache>>,
+    // Гарантировать ли fsync на сегментах данных при каждой записи.
+    // По умолчанию true. Если false — rely-on-WAL (WAL не будет truncate в commit_page).
+    data_fsync: bool,
 }
 
 impl Pager {
@@ -36,10 +52,21 @@ impl Pager {
             None
         };
 
+        // Флаг fsync данных (по умолчанию включён).
+        // Значения, которые трактуются как false: "0", "false", "off", "no" (case-insensitive).
+        let data_fsync = std::env::var("P1_DATA_FSYNC")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            })
+            .unwrap_or(true);
+
         Ok(Self {
             root: root.to_path_buf(),
             meta,
             cache: RefCell::new(cache),
+            data_fsync,
         })
     }
 
@@ -91,7 +118,9 @@ impl Pager {
             let cur_len = f.metadata()?.len();
             if cur_len < need_len {
                 f.set_len(need_len)?;
-                f.sync_all()?;
+                if self.data_fsync {
+                    f.sync_all()?;
+                }
             }
         }
 
@@ -156,7 +185,9 @@ impl Pager {
             let cur_len = f.metadata()?.len();
             if cur_len < need_len {
                 f.set_len(need_len)?;
-                f.sync_all()?;
+                if self.data_fsync {
+                    f.sync_all()?;
+                }
             }
         }
         Ok(())
@@ -190,7 +221,9 @@ impl Pager {
             ));
         }
         write_at(&mut f, off, buf)?;
-        f.sync_all()?;
+        if self.data_fsync {
+            f.sync_all()?;
+        }
 
         // Обновим кэш (если включён).
         if let Some(cache) = self.cache.borrow_mut().as_mut() {
@@ -257,13 +290,17 @@ impl Pager {
 
         // 2) Пишем страницу
         self.write_page_raw(page_id, buf)?;
-        wal.maybe_truncate()?; // если WAL разросся, очистим до заголовка
 
-        // 3) Зафиксируем last_lsn в meta (best-effort).
+        // 3) WAL-rotate (truncate) только если данные fsync'нуты.
+        if self.data_fsync {
+            wal.maybe_truncate()?; // если WAL разросся, очистим до заголовка
+        }
+
+        // 4) Зафиксируем last_lsn в meta (best-effort).
         self.meta.last_lsn = lsn;
         write_meta_overwrite(&self.root, &self.meta)?;
 
-        // 4) Обновим кэш
+        // 5) Обновим кэш
         if let Some(cache) = self.cache.borrow_mut().as_mut() {
             cache.put(page_id, buf);
         }

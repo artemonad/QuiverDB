@@ -192,7 +192,6 @@ fn overflow_roundtrip_various_sizes() -> Result<()> {
 // Нагрузочный тест (по умолчанию отключен).
 // Запуск: cargo test --test overflow_roundtrip_v0_6 -- --ignored --nocapture
 #[test]
-#[ignore]
 fn heavy_churn_many_updates() -> Result<()> {
     std::env::set_var("P1_WAL_COALESCE_MS", "0");
 

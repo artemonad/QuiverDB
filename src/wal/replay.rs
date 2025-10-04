@@ -1,3 +1,14 @@
+// src/wal/replay.rs
+
+use anyhow::{anyhow, Context, Result};
+use byteorder::{ByteOrder, LittleEndian};
+use crc32fast::Hasher as Crc32;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+use super::writer::write_wal_file_header;
+
 use crate::consts::{
     PAGE_MAGIC, WAL_FILE, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE, WAL_REC_OFF_CRC32,
     WAL_REC_OFF_LEN, WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_PAGE_IMAGE,
@@ -6,15 +17,6 @@ use crate::meta::{read_meta, set_last_lsn};
 use crate::pager::Pager;
 use crate::page_ovf::ovf_header_read;
 use crate::page_rh::rh_header_read;
-use anyhow::{anyhow, Context, Result};
-use byteorder::{ByteOrder, LittleEndian};
-use crc32fast::Hasher as Crc32;
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
-
-// Нужен для инициализации пустого WAL (хедер) при первом старте.
-use super::writer::write_wal_file_header;
 
 /// Попробовать вытащить LSN из v2-страницы (RH или Overflow).
 /// Возвращает Some(lsn), если распознали v2-страницу, иначе None.
@@ -43,6 +45,7 @@ fn v2_page_lsn(buf: &[u8]) -> Option<u64> {
 /// При clean_shutdown == true WAL просто усечётся до заголовка (быстрый старт).
 /// Дополнительно: для v2-страниц применяем запись только при wal_lsn > page_lsn.
 /// Поддерживаются v2-типы: RH и Overflow.
+/// Unknown-типы кадров игнорируются (continue), чтобы не прерывать реплей.
 pub fn wal_replay_if_any(root: &Path) -> Result<()> {
     let wal_path = root.join(WAL_FILE);
     if !wal_path.exists() {
@@ -91,16 +94,19 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
         if f.read_exact(&mut hdr).is_err() {
             break;
         }
+
         let rec_type = hdr[0];
         let payload_len =
             LittleEndian::read_u32(&hdr[WAL_REC_OFF_LEN..WAL_REC_OFF_LEN + 4]) as usize;
         let crc_expected =
             LittleEndian::read_u32(&hdr[WAL_REC_OFF_CRC32..WAL_REC_OFF_CRC32 + 4]);
         let rec_total = WAL_REC_HDR_SIZE as u64 + payload_len as u64;
+
         if pos + rec_total > len {
             // хвост неполон — выходим
             break;
         }
+
         let mut payload = vec![0u8; payload_len];
         f.read_exact(&mut payload)?;
 
@@ -149,11 +155,12 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
                     applied += 1;
                 }
             }
+            // Unknown или будущие типы — игнорируем (forward-совместимость).
             _ => {
-                // Unknown record type: останавливаем реплей, чтобы не читать «мусор» как данные.
-                break;
+                // намеренно ничего не делаем
             }
         }
+
         pos += rec_total;
     }
 

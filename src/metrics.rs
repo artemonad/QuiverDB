@@ -1,31 +1,57 @@
-//! Lightweight global metrics for p1.
-//! Usage: call record_* from subsystems, and snapshot() to read in CLI/DbStats.
+//! Lightweight global metrics for QuiverDB.
+//!
+//! Потокобезопасные атомарные счётчики для подсистем:
+//! - WAL
+//! - Page cache
+//! - Robin Hood compaction
+//! - Overflow (v0.6)
+//! - Sweep orphan (v0.6)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// ----- WAL -----
 static WAL_APPENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WAL_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static WAL_FSYNC_CALLS: AtomicU64 = AtomicU64::new(0);
 static WAL_FSYNC_BATCH_PAGES: AtomicU64 = AtomicU64::new(0);
 static WAL_TRUNCATIONS: AtomicU64 = AtomicU64::new(0);
 
+// ----- Page cache -----
 static PAGE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static PAGE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 
+// ----- Robin Hood -----
 static RH_PAGE_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+
+// ----- Overflow (v0.6) -----
+static OVF_CHAINS_CREATED: AtomicU64 = AtomicU64::new(0);
+static OVF_CHAINS_FREED: AtomicU64 = AtomicU64::new(0);
+
+// ----- Sweep orphan (v0.6) -----
+static SWEEP_ORPHAN_RUNS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
+    // WAL
     pub wal_appends_total: u64,
     pub wal_bytes_written: u64,
     pub wal_fsync_calls: u64,
     pub wal_fsync_batch_pages: u64,
     pub wal_truncations: u64,
 
+    // Page cache
     pub page_cache_hits: u64,
     pub page_cache_misses: u64,
 
+    // Robin Hood
     pub rh_page_compactions: u64,
+
+    // Overflow (v0.6)
+    pub overflow_chains_created: u64,
+    pub overflow_chains_freed: u64,
+
+    // Sweep orphan (v0.6)
+    pub sweep_orphan_runs: u64,
 }
 
 impl MetricsSnapshot {
@@ -36,26 +62,33 @@ impl MetricsSnapshot {
             self.wal_fsync_batch_pages as f64 / self.wal_fsync_calls as f64
         }
     }
+
+    pub fn cache_hit_ratio(&self) -> f64 {
+        let total = self.page_cache_hits + self.page_cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.page_cache_hits as f64 / total as f64
+        }
+    }
 }
 
-/// Record one WAL append of a page record.
+// ----- Recorders (WAL) -----
 pub fn record_wal_append(payload_len: usize) {
     WAL_APPENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
     WAL_BYTES_WRITTEN.fetch_add(payload_len as u64, Ordering::Relaxed);
 }
 
-/// Record a WAL fsync completion. batch_pages = how many page records were made durable by this fsync.
 pub fn record_wal_fsync(batch_pages: u64) {
     WAL_FSYNC_CALLS.fetch_add(1, Ordering::Relaxed);
     WAL_FSYNC_BATCH_PAGES.fetch_add(batch_pages, Ordering::Relaxed);
 }
 
-/// Record WAL truncation (rotation to header).
 pub fn record_wal_truncation() {
     WAL_TRUNCATIONS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Record page cache hit/miss.
+// ----- Recorders (Page cache) -----
 pub fn record_cache_hit() {
     PAGE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
 }
@@ -63,12 +96,25 @@ pub fn record_cache_miss() {
     PAGE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Record a Robin Hood page compaction.
+// ----- Recorders (Robin Hood) -----
 pub fn record_rh_compaction() {
     RH_PAGE_COMPACTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Read current metrics atomically (not clearing them).
+// ----- Recorders (Overflow) -----
+pub fn record_overflow_chain_created() {
+    OVF_CHAINS_CREATED.fetch_add(1, Ordering::Relaxed);
+}
+pub fn record_overflow_chain_freed() {
+    OVF_CHAINS_FREED.fetch_add(1, Ordering::Relaxed);
+}
+
+// ----- Recorders (Sweep orphan) -----
+pub fn record_sweep_orphan_run() {
+    SWEEP_ORPHAN_RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+// ----- Snapshot / Reset -----
 pub fn snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
         wal_appends_total: WAL_APPENDS_TOTAL.load(Ordering::Relaxed),
@@ -81,10 +127,14 @@ pub fn snapshot() -> MetricsSnapshot {
         page_cache_misses: PAGE_CACHE_MISSES.load(Ordering::Relaxed),
 
         rh_page_compactions: RH_PAGE_COMPACTIONS.load(Ordering::Relaxed),
+
+        overflow_chains_created: OVF_CHAINS_CREATED.load(Ordering::Relaxed),
+        overflow_chains_freed: OVF_CHAINS_FREED.load(Ordering::Relaxed),
+
+        sweep_orphan_runs: SWEEP_ORPHAN_RUNS.load(Ordering::Relaxed),
     }
 }
 
-/// Reset all metrics (useful in tests/bench).
 pub fn reset() {
     WAL_APPENDS_TOTAL.store(0, Ordering::Relaxed);
     WAL_BYTES_WRITTEN.store(0, Ordering::Relaxed);
@@ -96,4 +146,9 @@ pub fn reset() {
     PAGE_CACHE_MISSES.store(0, Ordering::Relaxed);
 
     RH_PAGE_COMPACTIONS.store(0, Ordering::Relaxed);
+
+    OVF_CHAINS_CREATED.store(0, Ordering::Relaxed);
+    OVF_CHAINS_FREED.store(0, Ordering::Relaxed);
+
+    SWEEP_ORPHAN_RUNS.store(0, Ordering::Relaxed);
 }

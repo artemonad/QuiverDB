@@ -29,6 +29,7 @@ use std::cmp;
 use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE, PAGE_MAGIC, PAGE_TYPE_OVERFLOW};
 use crate::pager::Pager;
 use crate::page_rh::{rh_page_update_crc, rh_page_verify_crc};
+use crate::metrics::{record_overflow_chain_created, record_overflow_chain_freed};
 
 /// Смещение полей в v2 header (совпадает с RH).
 const OFF_VERSION: usize = 4;      // u16
@@ -158,7 +159,7 @@ pub fn ovf_parse_placeholder(v: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// Записать данные в цепочку overflow-страниц. Возвращает head_page_id.
-/// Требует последующую интеграцию с Pager::commit_page для поддержки overflow-заголовка.
+/// Метрики: один вызов фиксирует одну созданную цепочку.
 pub fn ovf_write_chain(pager: &mut Pager, data: &[u8]) -> Result<u64> {
     let ps = pager.meta.page_size as usize;
     let cap = ovf_chunk_capacity(ps);
@@ -190,7 +191,6 @@ pub fn ovf_write_chain(pager: &mut Pager, data: &[u8]) -> Result<u64> {
 
         // если есть prev — обновим у него next_page_id и закоммитим
         if prev != NO_PAGE {
-            // Чтобы не читать prev заново с диска, мы могли бы кешировать, но оставим просто чтение.
             let mut pbuf = vec![0u8; ps];
             pager.read_page(prev, &mut pbuf)?;
             let mut ph = ovf_header_read(&pbuf)?;
@@ -210,7 +210,12 @@ pub fn ovf_write_chain(pager: &mut Pager, data: &[u8]) -> Result<u64> {
         prev = pid;
     }
 
-    head.ok_or_else(|| anyhow!("empty data for overflow chain"))
+    if let Some(h) = head {
+        record_overflow_chain_created();
+        Ok(h)
+    } else {
+        Err(anyhow!("empty data for overflow chain"))
+    }
 }
 
 /// Прочитать всю цепочку overflow-страниц в буфер.
@@ -260,7 +265,7 @@ pub fn ovf_read_chain(pager: &Pager, head_page_id: u64, expected_len: Option<usi
 }
 
 /// Освободить всю цепочку overflow-страниц (добавить в free-list).
-/// Возвращает, сколько страниц освобождено.
+/// Возвращает, сколько страниц освобождено. Метрика: учитывает одну освобожденную цепочку.
 pub fn ovf_free_chain(pager: &Pager, head_page_id: u64) -> Result<usize> {
     let ps = pager.meta.page_size as usize;
     let mut freed = 0usize;
@@ -275,6 +280,10 @@ pub fn ovf_free_chain(pager: &Pager, head_page_id: u64) -> Result<usize> {
         pager.free_page(pid)?;
         freed += 1;
         pid = next;
+    }
+
+    if freed > 0 {
+        record_overflow_chain_freed();
     }
     Ok(freed)
 }
