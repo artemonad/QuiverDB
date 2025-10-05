@@ -111,7 +111,6 @@ impl Wal {
     }
 
     /// Настроить коалессирование fsync для текущего WAL-файла.
-    /// Можно вызвать один раз при старте (например, из CLI/Db::open).
     pub fn set_group_config(root: &Path, cfg: WalGroupCfg) -> Result<()> {
         let path = root.join(WAL_FILE);
         let reg = REGISTRY.get_or_init(|| Mutex::new(WalRegistry::new()));
@@ -122,6 +121,8 @@ impl Wal {
     }
 
     /// Добавить запись «полное изображение страницы» с LSN.
+    /// Важно: перед каждым append делаем seek на конец файла, чтобы быть устойчивыми
+    /// к внешнему truncate (например, из wal_replay_if_any при clean_shutdown=true).
     pub fn append_page_image(&mut self, lsn: u64, page_id: u64, page: &[u8]) -> Result<()> {
         let mut hdr = vec![0u8; WAL_REC_HDR_SIZE];
         hdr[0] = WAL_REC_PAGE_IMAGE; // type
@@ -144,14 +145,17 @@ impl Wal {
         let crc = hasher.finalize();
         LittleEndian::write_u32(&mut hdr[WAL_REC_OFF_CRC32..WAL_REC_OFF_CRC32 + 4], crc);
 
-        // Append в конец файла
+        // Append в конец файла — всегда seek к концу перед записью.
         {
             let mut f = self.inner.file.lock().unwrap();
+            // Если файл был усечён другим дескриптором, позиция могла "устареть".
+            // Принудительно позиционируемся в конец.
+            let _ = f.seek(SeekFrom::End(0));
             f.write_all(&hdr)?;
             f.write_all(page)?;
         }
 
-        // Метрики: учтём записанные байты (hdr + payload) и инкремент append-счётчика
+        // Метрики
         record_wal_append(WAL_REC_HDR_SIZE + page.len());
 
         // Зафиксируем pending_max_lsn (под мьютексом flush)
@@ -159,17 +163,13 @@ impl Wal {
             let mut st = self.inner.flush.lock().unwrap();
             if lsn > st.pending_max_lsn {
                 st.pending_max_lsn = lsn;
-                // Разбудим возможного «коалесса-ожидателя»
                 self.inner.cv.notify_all();
             }
         }
         Ok(())
     }
 
-    /// Групповой fsync:
-    /// - Если уже идёт fsync — ждём его завершения (и что flushed_lsn >= наш pending_max_lsn).
-    /// - Если никого нет — становимся «флашером», ждём coalesce_ms (если задан),
-    ///   затем делаем sync_all и помечаем flushed_lsn = pending_max_lsn.
+    /// Групповой fsync.
     pub fn fsync(&mut self) -> Result<()> {
         let mut st = self.inner.flush.lock().unwrap();
 
@@ -191,7 +191,7 @@ impl Wal {
         st.flushing = true;
         drop(st);
 
-        // Опциональная коалесса-пауза, чтобы собрать больше записей.
+        // Опциональная коалесса-пауза
         let ms = self.inner.coalesce_ms.load(Ordering::Relaxed);
         if ms > 0 {
             let guard = self.inner.flush.lock().unwrap();
@@ -200,10 +200,9 @@ impl Wal {
                 .cv
                 .wait_timeout(guard, std::time::Duration::from_millis(ms))
                 .unwrap();
-            // guard опускается здесь
         }
 
-        // Снимем финальную цель (что именно хотим сбросить) и проведём fsync вне мьютекса flush.
+        // Финальная цель
         let target = {
             let st2 = self.inner.flush.lock().unwrap();
             st2.pending_max_lsn

@@ -143,7 +143,7 @@ pub fn cmd_free_pop(path: PathBuf, count: u32) -> Result<()> {
     Ok(())
 }
 
-// ---------- v0.8/0.9: DB check (CRC scan, overflow reachability, strict mode) ----------
+// ---------- v0.8/0.9: DB check (CRC scan, overflow reachability, strict mode, JSON) ----------
 
 use byteorder::{ByteOrder, LittleEndian};
 use std::collections::HashSet;
@@ -155,7 +155,6 @@ use crate::consts::{PAGE_MAGIC, NO_PAGE, FREE_FILE, FREE_HDR_SIZE, FREE_MAGIC};
 use crate::page_rh::{rh_header_read, rh_page_is_kv, rh_kv_list};
 use crate::page_ovf::ovf_header_read;
 
-/// Вспомогательно: прочитать множество page_id, лежащих в free-list.
 fn read_free_set(root: &Path) -> Result<HashSet<u64>> {
     let path = root.join(FREE_FILE);
     let mut set = HashSet::new();
@@ -183,23 +182,41 @@ fn read_free_set(root: &Path) -> Result<HashSet<u64>> {
     Ok(set)
 }
 
-/// Полный скан БД. Вызывает ошибку в strict-режиме, если обнаружены проблемы:
-/// - Directory ошибка,
-/// - crc_fail > 0,
-/// - io_fail > 0,
-/// - есть сиротские overflow-страницы.
-pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
-    println!("Running check for {} (strict={})", path.display(), strict);
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// JSON-capable check. If `json=true`, prints a single JSON object with summary.
+/// In strict mode returns error when directory fails, crc/io errors exist, or overflow orphans > 0.
+pub fn cmd_check_strict_json(path: PathBuf, strict: bool, json: bool) -> Result<()> {
+    let mut dir_ok = true;
+    let mut dir_err: Option<String> = None;
 
     // 1) Directory
-    let mut dir_ok = true;
     match Directory::open(&path) {
         Ok(dir) => {
-            println!("Directory: OK (buckets={}, kind={})", dir.bucket_count, dir.hash_kind);
+            if !json {
+                println!("Directory: OK (buckets={}, kind={})", dir.bucket_count, dir.hash_kind);
+            }
         }
         Err(e) => {
-            println!("Directory: ERROR: {}", e);
             dir_ok = false;
+            dir_err = Some(e.to_string());
+            if !json {
+                println!("Directory: ERROR: {}", dir_err.as_ref().unwrap());
+            }
         }
     }
 
@@ -227,17 +244,12 @@ pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
                 if buf.len() >= 4 && &buf[..4] == PAGE_MAGIC {
                     let ver = LittleEndian::read_u16(&buf[4..6]);
                     if ver >= 2 {
-                        // RH?
                         if rh_header_read(&buf).is_ok() {
                             v2_rh += 1;
-
-                            // Соберём головы overflow из значений-«плейсхолдеров» и пометим всю цепочку
                             if let Ok(items) = rh_kv_list(&buf) {
                                 for (_k, v) in items {
-                                    // Плейсхолдер: tag=0xFF, len=18
                                     if v.len() == 18 && v[0] == 0xFF {
                                         let head_pid = LittleEndian::read_u64(&v[10..18]);
-                                        // Обойдём overflow-цепочку и пометим
                                         let mut cur = head_pid;
                                         while cur != NO_PAGE && !ovf_marked.contains(&cur) {
                                             let mut obuf = vec![0u8; ps];
@@ -258,10 +270,10 @@ pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
                             v2_ovf += 1;
                             ovf_all.push(pid);
                         } else {
-                            magic_other += 1; // наш magic, но не RH/OVF (неожиданный тип/версия)
+                            magic_other += 1;
                         }
                     } else {
-                        magic_other += 1; // старый формат (учитываем как «другой»)
+                        magic_other += 1;
                     }
                 } else {
                     no_magic += 1;
@@ -278,7 +290,6 @@ pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
         }
     }
 
-    // Подсчёт сирот: overflow-страницы, которые не помечены достижимыми и не лежат в free-list.
     let mut ovf_orphans: Vec<u64> = Vec::new();
     for pid in ovf_all {
         if !ovf_marked.contains(&pid) && !free_set.contains(&pid) {
@@ -286,21 +297,55 @@ pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
         }
     }
 
-    // 3) Report
-    println!("Check report:");
-    println!("  pages_total      = {}", pages);
-    println!("  v2_rh_pages      = {}", v2_rh);
-    println!("  v2_overflow      = {}", v2_ovf);
-    println!("  other_magic      = {}", magic_other);
-    println!("  no_magic         = {}", no_magic);
-    println!("  crc_fail         = {}", crc_fail);
-    println!("  io_fail          = {}", io_fail);
-    println!("  free_pages       = {}", free_set.len());
-    println!("  overflow_reached = {}", ovf_marked.len());
-    println!("  overflow_orphans = {}", ovf_orphans.len());
-    if !ovf_orphans.is_empty() {
-        let preview = ovf_orphans.iter().take(16).cloned().collect::<Vec<_>>();
-        println!("  orphans_preview  = {:?}", preview);
+    if json {
+        let path_s = json_escape(&path.display().to_string());
+        let preview = format!("[{}]", ovf_orphans.iter().take(16).map(|n| n.to_string()).collect::<Vec<_>>().join(","));
+        let mut fields = vec![
+            format!("\"path\":\"{}\"", path_s),
+            format!("\"dir_ok\":{}", dir_ok),
+            format!("\"pages_total\":{}", pages),
+            format!("\"v2_rh_pages\":{}", v2_rh),
+            format!("\"v2_overflow\":{}", v2_ovf),
+            format!("\"other_magic\":{}", magic_other),
+            format!("\"no_magic\":{}", no_magic),
+            format!("\"crc_fail\":{}", crc_fail),
+            format!("\"io_fail\":{}", io_fail),
+            format!("\"free_pages\":{}", free_set.len()),
+            format!("\"overflow_reached\":{}", ovf_marked.len()),
+            format!("\"overflow_orphans\":{}", ovf_orphans.len()),
+            format!("\"orphans_preview\":{}", preview),
+        ];
+        if !dir_ok {
+            if let Some(e) = &dir_err {
+                fields.push(format!("\"dir_error\":\"{}\"", json_escape(e)));
+            }
+        }
+        println!("{{{}}}", fields.join(","));
+    } else {
+        println!("Running check for {} (strict={})", path.display(), strict);
+        if dir_ok {
+            if let Ok(dir) = Directory::open(&path) {
+                println!("Directory: OK (buckets={}, kind={})", dir.bucket_count, dir.hash_kind);
+            }
+        } else {
+            println!("Directory: ERROR: {}", dir_err.unwrap_or_else(|| "unknown".to_string()));
+        }
+
+        println!("Check report:");
+        println!("  pages_total      = {}", pages);
+        println!("  v2_rh_pages      = {}", v2_rh);
+        println!("  v2_overflow      = {}", v2_ovf);
+        println!("  other_magic      = {}", magic_other);
+        println!("  no_magic         = {}", no_magic);
+        println!("  crc_fail         = {}", crc_fail);
+        println!("  io_fail          = {}", io_fail);
+        println!("  free_pages       = {}", free_set.len());
+        println!("  overflow_reached = {}", ovf_marked.len());
+        println!("  overflow_orphans = {}", ovf_orphans.len());
+        if !ovf_orphans.is_empty() {
+            let preview = ovf_orphans.iter().take(16).cloned().collect::<Vec<_>>();
+            println!("  orphans_preview  = {:?}", preview);
+        }
     }
 
     if strict {
@@ -316,21 +361,21 @@ pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
     Ok(())
 }
 
-/// Сохранённая совместимость: прежняя команда check без строгого режима.
+/// Backward-compatible wrappers
+pub fn cmd_check_strict(path: PathBuf, strict: bool) -> Result<()> {
+    cmd_check_strict_json(path, strict, false)
+}
 pub fn cmd_check(path: PathBuf) -> Result<()> {
-    cmd_check_strict(path, false)
+    cmd_check_strict_json(path, false, false)
 }
 
-/// v0.9: Repair — освободить сиротские overflow-страницы (best-effort).
-/// - Требует exclusive-lock.
-/// - Делает wal_replay_if_any перед сканом.
-/// - Строго маркирует достижимые overflow из каталога; всё остальное, что является overflow и не в free-list — освобождается.
+// ---------- v0.9: Repair (no change here) ----------
+
 pub fn cmd_repair(path: PathBuf) -> Result<()> {
     let _lock = acquire_exclusive_lock(&path)?;
     let guard = DirtyGuard::begin(&path)?;
     wal_replay_if_any(&path)?;
 
-    // Каталог обязателен для консервативного ремонта.
     let dir = Directory::open(&path)
         .map_err(|e| anyhow!("repair requires valid directory: {e}"))?;
 
@@ -339,15 +384,13 @@ pub fn cmd_repair(path: PathBuf) -> Result<()> {
     let pages = pager.meta.next_page_id;
     let free_set = read_free_set(&path)?;
 
-    // Соберём "достижимые" overflow через плейсхолдеры из всех цепочек каталога.
     let mut marked: HashSet<u64> = HashSet::new();
-
     for b in 0..dir.bucket_count {
         let mut pid = dir.head(b)?;
         while pid != NO_PAGE {
             let mut buf = vec![0u8; ps];
             if pager.read_page(pid, &mut buf).is_err() {
-                break; // консервативно
+                break;
             }
             if !rh_page_is_kv(&buf) {
                 break;
@@ -362,7 +405,7 @@ pub fn cmd_repair(path: PathBuf) -> Result<()> {
                             if pager.read_page(cur, &mut obuf).is_err() {
                                 break;
                             }
-                            if let Ok(h) = ovf_header_read(&obuf) {
+                            if let Ok(h) = crate::page_ovf::ovf_header_read(&obuf) {
                                 marked.insert(cur);
                                 cur = h.next_page_id;
                             } else {
@@ -377,18 +420,16 @@ pub fn cmd_repair(path: PathBuf) -> Result<()> {
         }
     }
 
-    // Соберём все overflow-страницы
     let mut all_ovf: Vec<u64> = Vec::new();
     for pid in 0..pages {
         let mut buf = vec![0u8; ps];
         if pager.read_page(pid, &mut buf).is_ok() {
-            if ovf_header_read(&buf).is_ok() {
+            if crate::page_ovf::ovf_header_read(&buf).is_ok() {
                 all_ovf.push(pid);
             }
         }
     }
 
-    // Орфаны: overflow, которые не достижимы и не в free-list.
     let orphans: Vec<u64> = all_ovf
         .into_iter()
         .filter(|pid| !marked.contains(pid) && !free_set.contains(pid))
@@ -405,10 +446,33 @@ pub fn cmd_repair(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-// ---------- v0.9: Metrics (snapshot/reset) ----------
+// ---------- v0.9: Metrics (snapshot/reset + JSON) ----------
 
-pub fn cmd_metrics() -> Result<()> {
+pub fn cmd_metrics_json(json: bool) -> Result<()> {
     let m = crate::metrics::snapshot();
+
+    if json {
+        let avg = m.avg_wal_batch_pages();
+        let hit_ratio = m.cache_hit_ratio() * 100.0;
+        println!(
+            "{{\"wal_appends_total\":{},\"wal_bytes_written\":{},\"wal_fsync_calls\":{},\"wal_fsync_batch_pages\":{},\"wal_truncations\":{},\"page_cache_hits\":{},\"page_cache_misses\":{},\"rh_page_compactions\":{},\"overflow_chains_created\":{},\"overflow_chains_freed\":{},\"sweep_orphan_runs\":{},\"avg_wal_batch_pages\":{:.2},\"page_cache_hit_ratio\":{:.2}}}",
+            m.wal_appends_total,
+            m.wal_bytes_written,
+            m.wal_fsync_calls,
+            m.wal_fsync_batch_pages,
+            m.wal_truncations,
+            m.page_cache_hits,
+            m.page_cache_misses,
+            m.rh_page_compactions,
+            m.overflow_chains_created,
+            m.overflow_chains_freed,
+            m.sweep_orphan_runs,
+            avg,
+            hit_ratio
+        );
+        return Ok(());
+    }
+
     let cache_total = m.page_cache_hits + m.page_cache_misses;
     let cache_hit_ratio = if cache_total > 0 {
         (m.page_cache_hits as f64) / (cache_total as f64)
@@ -430,6 +494,10 @@ pub fn cmd_metrics() -> Result<()> {
     println!("  overflow_chains_freed   = {}", m.overflow_chains_freed);
     println!("  sweep_orphan_runs       = {}", m.sweep_orphan_runs);
     Ok(())
+}
+
+pub fn cmd_metrics() -> Result<()> {
+    cmd_metrics_json(false)
 }
 
 pub fn cmd_metrics_reset() -> Result<()> {

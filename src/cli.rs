@@ -8,7 +8,7 @@ use std::path::PathBuf;
 pub mod admin;   // публичный, чтобы тесты могли вызывать admin::* напрямую
 mod rh;
 mod db_cli;
-// CDC (wal-tail/ship/apply) — публичный, чтобы использовать в интеграционных тестах
+// CDC (wal-tail/ship/apply/record/replay) — публичный, чтобы использовать в интеграционных тестах
 pub mod cdc;
 
 pub use cdc::wal_apply_from_stream; // удобный реэкспорт для тестов и внешнего кода
@@ -195,6 +195,17 @@ pub enum Cmd {
         #[arg(long)]
         path: PathBuf,
     },
+    // Новая команда: скан ключей (вся БД или по префиксу), текст/JSON
+    DbScan {
+        #[arg(long)]
+        path: PathBuf,
+        /// Optional key prefix (string; scanned as bytes)
+        #[arg(long)]
+        prefix: Option<String>,
+        /// JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 
     // CDC / WAL tooling
     WalTail {
@@ -204,26 +215,68 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         follow: bool,
     },
+    // Расширенная версия: поддержка --since-lsn и --sink (tcp://host:port)
     WalShip {
         #[arg(long)]
         path: PathBuf,
         /// Follow new records (send continuously)
         #[arg(long, default_value_t = false)]
         follow: bool,
+        /// Ship only records with lsn > N (resume by LSN)
+        #[arg(long)]
+        since_lsn: Option<u64>,
+        /// Output sink: tcp://host:port (default: stdout)
+        #[arg(long)]
+        sink: Option<String>,
     },
     WalApply {
         /// Target DB path to apply incoming WAL stream from stdin
         #[arg(long)]
         path: PathBuf,
     },
+    /// CDC helper: print meta.last_lsn for resume
+    CdcLastLsn {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// CDC: record WAL stream to a file (wire format), with LSN filtering
+    CdcRecord {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Keep only frames with lsn > from_lsn (optional)
+        #[arg(long)]
+        from_lsn: Option<u64>,
+        /// Keep only frames with lsn <= to_lsn (optional)
+        #[arg(long)]
+        to_lsn: Option<u64>,
+    },
+    /// CDC: replay a WAL stream from file (or stdin), with LSN filtering
+    CdcReplay {
+        #[arg(long)]
+        path: PathBuf,
+        /// Optional input file (wire format). If omitted, read from stdin.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Apply only frames with lsn > from_lsn (optional)
+        #[arg(long)]
+        from_lsn: Option<u64>,
+        /// Apply only frames with lsn <= to_lsn (optional)
+        #[arg(long)]
+        to_lsn: Option<u64>,
+    },
 
-    // v0.8: check (CRC scan, overflow reachability) + strict режим
+    // v0.8: check (CRC scan, overflow reachability) + strict/json режимы
     Check {
         #[arg(long)]
         path: PathBuf,
         /// Strict mode: non-zero exit if problems detected (dir error, CRC/IO errors, orphan overflow)
         #[arg(long, default_value_t = false)]
         strict: bool,
+        /// JSON output: a single JSON object with summary
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     // v0.9: repair (free orphan overflow pages)
@@ -232,8 +285,12 @@ pub enum Cmd {
         path: PathBuf,
     },
 
-    // v0.9: metrics (snapshot / reset)
-    Metrics,
+    // v0.9: metrics (snapshot / reset) + JSON
+    Metrics {
+        /// JSON output: one-line JSON with metrics snapshot
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     MetricsReset,
 }
 
@@ -266,20 +323,27 @@ pub fn run() -> Result<()> {
         Cmd::DbGet { path, key } => db_cli::cmd_db_get(path, key),
         Cmd::DbDel { path, key } => db_cli::cmd_db_del(path, key),
         Cmd::DbStats { path } => db_cli::cmd_db_stats(path),
+        Cmd::DbScan { path, prefix, json } => db_cli::cmd_db_scan(path, prefix, json),
 
         // ------- CDC -------
         Cmd::WalTail { path, follow } => cdc::cmd_wal_tail(path, follow),
-        Cmd::WalShip { path, follow } => cdc::cmd_wal_ship(path, follow),
+        Cmd::WalShip { path, follow, since_lsn, sink } =>
+            cdc::cmd_wal_ship_ext(path, follow, since_lsn, sink),
         Cmd::WalApply { path } => cdc::cmd_wal_apply(path),
+        Cmd::CdcLastLsn { path } => cdc::cmd_cdc_last_lsn(path),
+        Cmd::CdcRecord { path, out, from_lsn, to_lsn } =>
+            cdc::cmd_cdc_record(path, out, from_lsn, to_lsn),
+        Cmd::CdcReplay { path, input, from_lsn, to_lsn } =>
+            cdc::cmd_cdc_replay(path, input, from_lsn, to_lsn),
 
-        // ------- v0.8: check + strict -------
-        Cmd::Check { path, strict } => admin::cmd_check_strict(path, strict),
+        // ------- v0.8: check + strict/json -------
+        Cmd::Check { path, strict, json } => admin::cmd_check_strict_json(path, strict, json),
 
         // ------- v0.9: repair -------
         Cmd::Repair { path } => admin::cmd_repair(path),
 
         // ------- v0.9: metrics -------
-        Cmd::Metrics => admin::cmd_metrics(),
+        Cmd::Metrics { json } => admin::cmd_metrics_json(json),
         Cmd::MetricsReset => admin::cmd_metrics_reset(),
     }
 }

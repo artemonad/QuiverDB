@@ -1,8 +1,6 @@
-// src/pager.rs
-
 //! Pager: segments, page IO, WAL-integrated commits, and a small read cache.
 //!
-//! Env toggles:
+//! Env toggles (backward compatible):
 //! - P1_PAGE_CACHE_PAGES=N  -> enable read cache with N pages (default 0 = disabled)
 //! - P1_DATA_FSYNC=[0|1]   -> fsync data segments on every write (default 1)
 //!   If set to 0, durability relies on WAL only and WAL will NOT be truncated
@@ -26,10 +24,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
+/// New: centralized configuration
+use crate::config::QuiverConfig;
+
 pub struct Pager {
     pub root: PathBuf,
     pub meta: MetaHeader,
-    // Небольшой LRU-подобный кэш страниц (включается переменной окружения).
+    // Небольшой LRU-подобный кэш страниц (включается переменной окружения или через конфиг).
     cache: RefCell<Option<PageCache>>,
     // Гарантировать ли fsync на сегментах данных при каждой записи.
     // По умолчанию true. Если false — rely-on-WAL (WAL не будет truncate в commit_page).
@@ -37,36 +38,27 @@ pub struct Pager {
 }
 
 impl Pager {
+    /// Backward-compatible open: reads env variables and constructs with defaults.
     pub fn open(root: &Path) -> Result<Self> {
+        let cfg = QuiverConfig::from_env();
+        Self::open_with_config(root, &cfg)
+    }
+
+    /// New: open with explicit configuration (preferred).
+    pub fn open_with_config(root: &Path, cfg: &QuiverConfig) -> Result<Self> {
         let meta = read_meta(root)?;
 
-        // Настройка кэша страниц: по умолчанию выключен (0).
-        // Включить: P1_PAGE_CACHE_PAGES=128 (например).
-        let cache_cap = std::env::var("P1_PAGE_CACHE_PAGES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let cache = if cache_cap > 0 {
-            Some(PageCache::new(cache_cap, meta.page_size as usize))
+        let cache = if cfg.page_cache_pages > 0 {
+            Some(PageCache::new(cfg.page_cache_pages, meta.page_size as usize))
         } else {
             None
         };
-
-        // Флаг fsync данных (по умолчанию включён).
-        // Значения, которые трактуются как false: "0", "false", "off", "no" (case-insensitive).
-        let data_fsync = std::env::var("P1_DATA_FSYNC")
-            .ok()
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !(v == "0" || v == "false" || v == "off" || v == "no")
-            })
-            .unwrap_or(true);
 
         Ok(Self {
             root: root.to_path_buf(),
             meta,
             cache: RefCell::new(cache),
-            data_fsync,
+            data_fsync: cfg.data_fsync,
         })
     }
 

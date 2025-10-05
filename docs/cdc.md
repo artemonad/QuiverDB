@@ -1,204 +1,239 @@
-# CDC Guide (wal-tail / wal-ship / wal-apply)
+# QuiverDB CDC Guide (v1.1.0)
 
-Version: v1.0.0 (formats frozen: meta v3, page v2, WAL v1)
 Audience: operators and developers building change capture/replication on top of QuiverDB.
 
-QuiverDB provides simple CDC tooling around its Write-Ahead Log (WAL):
-- wal-tail: JSONL view of WAL frames for logging/inspection.
-- wal-ship: binary stream of raw WAL frames for replication.
-- wal-apply: follower-side applier that consumes a WAL stream and applies page images idempotently.
+Status: v1.1.0 (formats frozen: meta v3, page v2, WAL v1)
+
+QuiverDB exposes CDC around its Write-Ahead Log (WAL). CDC streams full page images with CRC and monotonic LSN. Consumers apply frames idempotently with LSN-gating on v2 pages.
 
 
 ## 1) Overview
 
-- WAL contains full page-image records, each with CRC and monotonic LSN.
-- CDC leverages the WAL to replicate page images to a follower database.
-- The follower applies frames idempotently using LSN-gating on v2 pages (KV_RH and OVERFLOW).
-- Streams are robust to partial tails and mid-stream WAL headers (after rotate/truncate).
+- WAL frames carry:
+    - type (PAGE_IMAGE or TRUNCATE in streams),
+    - monotonic LSN (u64),
+    - page_id (u64) for page images,
+    - payload length,
+    - CRC32 over header-before-crc + payload.
+- Idempotency via LSN-gating:
+    - Apply a v2 page image only if wal_lsn > page_lsn.
+    - Unknown record types are ignored (forward-compatible).
+- Partial tails and rotations:
+    - Short reads (partial record header/payload) are treated as normal EOF.
+    - Stream may include TRUNCATE markers and mid-stream WAL headers after rotation; consumers must tolerate them.
+- Built-in TCP ship + resume:
+    - wal-ship supports sink=tcp://host:port and since-lsn filtering (send only lsn > N).
+- Deterministic record/replay:
+    - cdc record extracts a slice of the wire-format WAL to a file; cdc replay applies it idempotently (with optional LSN filters).
 
 
 ## 2) Commands
 
-- Tail as JSONL (for inspection/logging):
-
-  ```quiverdb wal-tail --path ./db --follow```
-
-- Ship binary WAL stream (producer):
-
-  ```quiverdb wal-ship --path ./db --follow```
-
-- Apply stream on the follower (consumer):
-
-  ```quiverdb wal-ship --path ./leader --follow | quiverdb wal-apply --path ./follower```
+- Tail WAL as JSONL (observability):
+    - quiverdb wal-tail --path ./db [--follow]
+- Ship WAL stream (producer):
+    - quiverdb wal-ship --path ./db [--follow] [--since-lsn N] [--sink=tcp://host:port]
+    - Default sink is stdout when --sink is omitted.
+- Apply stream on follower (consumer):
+    - quiverdb wal-apply --path ./follower  (reads from stdin)
+- Deterministic record/replay:
+    - quiverdb cdc record --path ./leader --out ./slice.bin [--from-lsn X] [--to-lsn Y]
+    - quiverdb cdc replay --path ./follower [--input ./slice.bin] [--from-lsn X] [--to-lsn Y]
+- Follower checkpoint (resume):
+    - quiverdb cdc last-lsn --path ./follower
 
 
 ## 3) Wire formats
 
-### 3.1 JSONL (wal-tail)
+All integers are Little Endian (LE).
 
-Each line is a JSON object with common fields:
-- type: "page_image" | "unknown" (future types)
-- lsn: u64 (monotonic)
-- len: u32 (payload length)
-- page_id: u64 (for page_image)
-- crc32: u32 (stored CRC in record header)
+3.1 JSONL (wal-tail)
+- Each line: JSON object with common fields:
+    - type: "page_image" | "unknown"
+    - lsn: u64
+    - page_id: u64 (for page_image)
+    - len: u32 (payload bytes)
+    - crc32: u32
+- Events: when the underlying file truncates, wal-tail prints {"event":"truncate", ...}.
 - Example:
-
   {"type":"page_image","lsn":42,"page_id":7,"len":4096,"crc32":1234567890}
 
-wal-tail follows the WAL file like `tail -f`, handling file growth and reporting events (e.g., internal truncate notice printed as {"event":"truncate", ...} in the tool).
+3.2 Binary stream (wal-ship)
+- Stream layout:
+    - Initial 16-byte WAL header
+    - Zero or more records, each:
+        - 28-byte record header
+        - payload (len bytes)
+- WAL header (16 bytes, LE):
+    - 0..7:   WAL_MAGIC8 = "P1WAL001"
+    - 8..11:  u32 reserved
+    - 12..15: u32 reserved
+- Record header (28 bytes, LE):
+    - 0:   u8  type            (1 = PAGE_IMAGE, 2 = TRUNCATE)
+    - 1:   u8  flags
+    - 2..3: u16 reserved
+    - 4..11: u64 lsn
+    - 12..19: u64 page_id      (0 for non-page_image types)
+    - 20..23: u32 len          (payload length)
+    - 24..27: u32 crc32        (over header[0..24] + payload)
+- Payload:
+    - PAGE_IMAGE: full page image bytes (page_size).
+    - TRUNCATE: empty (len=0), a marker used by ship to signal rotation/truncation.
+- Rotation/truncate:
+    - On rotation, wal-ship sends a TRUNCATE record and then re-sends the 16-byte WAL header mid-stream. Consumers must skip mid-stream headers and continue.
 
-
-### 3.2 Binary stream (wal-ship)
-
-The ship stream reproduces the WAL file structure:
-- First, a 16-byte WAL header.
-- Then a sequence of records, each as:
-    - 28-byte record header
-    - payload (len bytes)
-
-WAL header (16 bytes, LE):
-- WAL_MAGIC8 = "P1WAL001"
-- u32 reserved
-- u32 reserved
-
-Record header (28 bytes, LE):
-- u8  type            (1 = PAGE_IMAGE, 2 = TRUNCATE)
-- u8  flags
-- u16 reserved
-- u64 lsn
-- u64 page_id         (0 for non-page_image types)
-- u32 len             (payload length)
-- u32 crc32           (CRC over [header bytes before crc32] + payload)
-
-Payload:
-- For PAGE_IMAGE: full page image bytes (page_size).
-- For TRUNCATE: empty (len = 0), a marker used by ship for rotate/truncate.
-
-Rotation/truncate handling:
-- When the WAL file truncates (e.g., checkpoint), `wal-ship` sends a TRUNCATE record and then re-sends the 16-byte WAL header. Consumers must tolerate mid-stream header and continue.
+3.3 TCP sink and resume by LSN
+- wal-ship can connect to a TCP sink directly and resume from a given LSN:
+    - Leader (producer): quiverdb wal-ship --path ./leader --since-lsn N --sink=tcp://follower:9999 --follow
+    - Follower (consumer): nc -l -p 9999 | quiverdb wal-apply --path ./follower
+- Get follower’s checkpoint:
+    - quiverdb cdc last-lsn --path ./follower
+- since-lsn semantics:
+    - Frames are sent only when wal_lsn > since_lsn (exclusive).
 
 
 ## 4) wal-apply (follower applier)
 
 Basic flow:
-1. Read the initial 16-byte WAL header (required at start).
+1. Read the initial 16-byte WAL header (required at the beginning).
 2. Loop:
-    - Read 8 bytes. If equal to WAL_MAGIC (mid-stream header), read 8 more bytes and continue.
-    - Otherwise, read the remaining 20 bytes of the record header (total 28 bytes).
+    - Read 8 bytes. If equal to WAL_MAGIC, read next 8 bytes (mid-stream header) and continue.
+    - Otherwise, read the remaining 20 bytes of the record header (total 28).
     - Read payload (len bytes).
-    - If a short read occurs (partial tail): treat as normal EOF; stop gracefully.
-    - Verify CRC (header-before-crc + payload). Mismatch = abort (stream corruption).
+    - Short reads (partial header/payload) are treated as normal EOF; exit cleanly.
+    - Verify CRC (header-before-crc + payload). Mismatch in a complete frame is an error.
     - If type = PAGE_IMAGE:
-        - Ensure the target page is allocated (`ensure_allocated`).
-        - If payload looks like a v2 page (KV_RH or OVERFLOW), extract its page LSN (new_lsn).
-        - Read current page (if any) and extract its LSN (cur_lsn).
-        - Apply only if `new_lsn > cur_lsn` (LSN-gating).
+        - Ensure the target page is allocated (ensure_allocated).
+        - If payload is a v2 page (KV_RH or OVERFLOW), extract its page LSN (new_lsn).
+        - Read current page (if any) and extract LSN (cur_lsn).
+        - Apply only if new_lsn > cur_lsn (LSN-gating).
     - If type = TRUNCATE: ignore (used only to synchronize rotation).
     - If type is unknown: ignore (forward-compatible).
-3. Track the maximum LSN seen and update follower `meta.last_lsn` best-effort after finish.
+3. Track the maximum wal_lsn seen and update follower meta.last_lsn best-effort at the end.
 
 Idempotency:
-- Re-applying the same frames is safe due to LSN-gating.
-- Unknown frames are ignored.
+- Replaying the same frames is safe due to the LSN-gating on v2 pages.
+- Unknown record types are ignored.
 
 Partial tails:
-- A short read for header or payload is treated as a normal EOF (stream ended mid-frame). No error.
+- Short reads for a record header or payload are treated as normal EOF (producer not finished yet). No error.
 
 Error handling:
-- CRC mismatch within a complete frame results in an error (stream corruption).
-- Unknown types do not error; they are skipped.
+- CRC mismatch within a complete frame aborts with error (stream corruption).
+- Unknown record types do not error; they are skipped.
 
 
 ## 5) End-to-end examples
 
-### 5.1 Local replication (stdin/stdout)
+5.1 Local replication (stdin/stdout)
+- Leader → Follower on the same host:
+  quiverdb wal-ship --path ./leader --follow | quiverdb wal-apply --path ./follower
+- Stop the producer or consumer; wal-apply finishes gracefully on EOF.
 
-Leader → Follower on the same host:
+5.2 Built-in TCP ship with resume
+- On the follower (listener):
+  nc -l -p 9999 | quiverdb wal-apply --path ./follower
+- On the leader (producer):
+  LSN=$(quiverdb cdc last-lsn --path ./follower)
+  quiverdb wal-ship --path ./leader --since-lsn $LSN --sink=tcp://follower_host:9999 --follow
 
-    quiverdb wal-ship --path ./leader --follow | quiverdb wal-apply --path ./follower
+5.3 Inspecting frames in JSON
+- Human-friendly:
+  quiverdb wal-tail --path ./db --follow | jq .
 
-Stop with Ctrl+C on either side; wal-apply will finish gracefully on EOF.
-
-### 5.2 Over TCP (using netcat / socat)
-
-On the leader (producer):
-
-    quiverdb wal-ship --path ./leader --follow | nc -l -p 9999
-
-On the follower (consumer):
-
-    nc <leader_host> 9999 | quiverdb wal-apply --path ./follower
-
-Production-grade deployments should use a TLS-capable transport (e.g., stunnel, ssh tunnel, or a custom TCP service).
-
-### 5.3 Inspecting frames in JSON
-
-    quiverdb wal-tail --path ./db --follow | jq .
-
-Useful for debugging and building observability around WAL activity.
+5.4 Deterministic record/replay (files)
+- Record a slice of the wire stream (LSN filtered):
+  quiverdb cdc record --path ./leader --out ./slice.bin --from-lsn 100 --to-lsn 200
+- Replay from a file (or stdin) on a follower:
+  quiverdb cdc replay --path ./follower --input ./slice.bin --from-lsn 100 --to-lsn 200
 
 
 ## 6) Resuming and checkpoints
 
-- wal-apply does not require an explicit “start-from-LSN”: it is idempotent. You can replay from an older point; LSN-gating prevents regressions.
-- The follower’s `meta.last_lsn` is updated best-effort after apply — you can persist it externally for your own checkpointing logic.
-- If you need to filter frames by LSN before transmission, add a middleware on the leader side that compares record `lsn` and forwards only `lsn > follower_lsn` (custom tooling).
+- wal-apply is idempotent and does not require a start LSN (replaying old frames is harmless).
+- For network efficiency:
+    - Compute follower’s last LSN: quiverdb cdc last-lsn --path ./follower
+    - Pass it as --since-lsn to wal-ship (exclusive): only frames with lsn > follower_lsn are sent.
+- meta.last_lsn on the follower is updated best-effort after apply; you can persist it externally.
 
 
 ## 7) Performance notes
 
-- Group-commit (WAL fsync coalescing) reduces fsync load:
-    - `P1_WAL_COALESCE_MS` (default 3 ms) controls the delay before fsync.
+- Group-commit (WAL fsync coalescing):
+    - P1_WAL_COALESCE_MS (default 3 ms) delays fsync to batch consecutive commits.
 - Data fsync policy:
-    - `P1_DATA_FSYNC=1` (default): commit pages fsync data segments; WAL may be truncated after commit.
-    - `P1_DATA_FSYNC=0`: rely on WAL durability; do not truncate WAL on commit, truncate during replay.
-- Because CDC uses full page images, bandwidth roughly equals page_size per updated page (plus headers). Consider compressing the stream:
-    - `wal-ship ... | gzip -1 | nc ...`
-    - `zstd -q --adapt` is another option.
+    - P1_DATA_FSYNC=1 (default): data segments are fsync’d on every commit, and WAL can be truncated periodically (rotate).
+    - P1_DATA_FSYNC=0: rely solely on WAL durability; commit does not truncate WAL. WAL truncates during replay after an unclean shutdown.
+- Bandwidth and compression:
+    - CDC uses full page images; bandwidth ~ page_size per updated page (+ headers).
+    - Consider compression:
+        - wal-ship ... | gzip -1 | nc ...
+        - zstd -q --adapt is another option.
 
 
 ## 8) Security and deployment tips
 
-- Use TLS tunnels or SSH for WAN transport.
-- Consider running wal-apply in a supervised service (systemd, runit, etc.) with restart on failure.
-- Monitor with `wal-tail` to verify frame emission on leader side.
+- Use TLS-capable tunnels for WAN (stunnel, SSH, VPN) or implement a TLS TCP sink.
+- Run wal-apply under a supervisor (systemd, runit) with restart on failure.
+- Monitor the leader with wal-tail for activity confirmation (e.g., push to logs/metrics).
+- Restrict filesystem permissions of the database path and WAL file.
 
 
 ## 9) Troubleshooting
 
 - wal-apply stops “early”:
-    - Usually a partial tail: the producer hasn’t emitted a full frame yet. This is normal; reconnect or keep the producer running with `--follow`.
+    - Often a partial tail: the producer hasn’t emitted a full frame yet. This is normal on --follow. Reconnect or keep the producer running.
 - CRC mismatch in wal-apply:
-    - Indicates stream corruption in transit or a bug; restart and investigate the transport.
-- Unknown record types appear in wal-tail:
-    - Forward-compatibility: older clients will print `"type":"unknown"...` and skip them.
-- Follower does not reflect updates:
-    - Make sure wal-ship is pointed at the correct path.
-    - Check that LSN is increasing on the leader (wal-tail).
-    - Confirm that the follower can write (it must not be opened in RO mode by another process).
+    - Indicates stream corruption or a bug; restart and inspect the transport layer.
+- Unknown record types in wal-tail:
+    - Forward-compatibility: older clients print "type":"unknown" and skip them.
+- Follower not reflecting updates:
+    - Verify wal-ship --path points at the correct leader.
+    - Check LSN progression on the leader (wal-tail).
+    - Ensure follower can write (not opened in RO by another process).
+- since-lsn behavior:
+    - It is exclusive (lsn > N). If you want inclusive bounds, adjust N accordingly.
 
 
 ## 10) Wire summary (for implementers)
 
 All integers are Little Endian (LE).
 
-WAL header (16 bytes):
-- 0..=7:  WAL_MAGIC = "P1WAL001"
-- 8..=11: u32 reserved
-- 12..=15: u32 reserved
+- WAL header (16 bytes):
+    - 0..7:   WAL_MAGIC = "P1WAL001"
+    - 8..11:  u32 reserved
+    - 12..15: u32 reserved
+- Record header (28 bytes):
+    - 0:   u8  type
+    - 1:   u8  flags
+    - 2..3:  u16 reserved
+    - 4..11: u64 lsn
+    - 12..19: u64 page_id
+    - 20..23: u32 len
+    - 24..27: u32 crc32  (CRC over header[0..24] + payload)
+- Payload:
+    - PAGE_IMAGE: page bytes
+    - TRUNCATE: empty (streaming only)
+- Consumers must skip mid-stream headers (WAL_MAGIC encountered while reading records), e.g., right after a TRUNCATE record.
 
-Record header (28 bytes):
-- 0:   u8  type
-- 1:   u8  flags
-- 2..=3:  u16 reserved
-- 4..=11: u64 lsn
-- 12..=19: u64 page_id
-- 20..=23: u32 len
-- 24..=27: u32 crc32  (over header[0..24] + payload[0..len])
 
-Payload:
-- PAGE_IMAGE: page bytes
-- TRUNCATE: empty
+## 11) Command reference (cheat sheet)
 
-Mid-stream WAL header is allowed and must be skipped by consumers (e.g., after TRUNCATE).
+- Tail:
+    - quiverdb wal-tail --path ./db --follow
+- Ship:
+    - quiverdb wal-ship --path ./leader --follow
+    - quiverdb wal-ship --path ./leader --since-lsn N --sink=tcp://host:9999 --follow
+- Apply:
+    - quiverdb wal-apply --path ./follower     # reads from stdin
+- Record/Replay:
+    - quiverdb cdc last-lsn --path ./follower
+    - quiverdb cdc record --path ./leader --out ./slice.bin --from-lsn 100 --to-lsn 200
+    - quiverdb cdc replay --path ./follower --input ./slice.bin --from-lsn 100 --to-lsn 200
+
+
+## 12) Compatibility
+
+- On-disk formats are frozen (meta v3, page v2, WAL v1).
+- Ship wire format is stable; unknown record types are forward-compatible and ignored by consumers.
+- wal-apply is idempotent; re-applying already applied frames is safe due to page-level LSN-gating on v2 pages.

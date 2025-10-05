@@ -13,8 +13,11 @@ pub mod lock;      // file locking
 pub mod meta;
 pub mod page_rh;   // v2: Robin Hood in-page index
 pub mod page_ovf; // v2: overflow pages
+pub mod config;
 pub mod pager;
 pub mod util;
+pub mod db_scan;
+pub mod subs;
 pub mod wal;
 pub mod cli;       // CLI в отдельном модуле
 pub mod metrics;   // lightweight global metrics
