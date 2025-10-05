@@ -258,7 +258,7 @@ impl Pager {
         }
 
         // [1] COW: если есть активные снапшоты, заморозим текущую страницу (её "старую" версию),
-        // но только если страница уже существует и это v2-страница с корректным LSN.
+        // но только если страница уже существует и это v2-страница.
         if let Some(mgr) = &self.snap_mgr {
             if page_id < self.meta.next_page_id {
                 let mut cur = vec![0u8; self.meta.page_size as usize];
@@ -266,18 +266,21 @@ impl Pager {
                     if &cur[..4] == PAGE_MAGIC {
                         let ver = LittleEndian::read_u16(&cur[4..6]);
                         if ver >= 2 {
-                            // Попробуем распарсить LSN из RH/OVF
-                            let cur_lsn_opt = if rh_header_read(&cur).is_ok() {
-                                rh_header_read(&cur).ok().map(|h| h.lsn)
-                            } else if ovf_header_read(&cur).is_ok() {
-                                ovf_header_read(&cur).ok().map(|h| h.lsn)
-                            } else {
-                                None
-                            };
+                            // Сначала пробуем распарсить нормальный LSN из RH/OVF.
+                            let cur_lsn_opt = rh_header_read(&cur).ok().map(|h| h.lsn)
+                                .or_else(|| ovf_header_read(&cur).ok().map(|h| h.lsn));
+
+                            let mut g = mgr.lock().unwrap();
+
                             if let Some(cur_lsn) = cur_lsn_opt {
-                                // freeze_if_needed для всех активных снапшотов (по их правилам)
-                                let mut g = mgr.lock().unwrap();
+                                // freeze_if_needed (обычный путь) — по LSN.
                                 let _ = g.freeze_if_needed(page_id, cur_lsn, &cur);
+                            } else {
+                                // NEW: raw freeze fallback for v2 pages:
+                                // Если страница выглядит как v2 (MAGIC+ver>=2), но хедер не читается,
+                                // сделаем "безусловный" фриз для всех активных снапшотов,
+                                // передав page_lsn = 0 (snapshot_lsn >= 0 всегда true).
+                                let _ = g.freeze_if_needed(page_id, 0, &cur);
                             }
                         }
                     }

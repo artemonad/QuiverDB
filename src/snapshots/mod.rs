@@ -1,5 +1,3 @@
-// src/snapshots/mod.rs
-
 //! Snapshot Isolation (Phase 1).
 //!
 //! Что уже есть:
@@ -19,6 +17,12 @@
 //! - Если обычный обход цепочки от live head не находит ключ (например, head уже указывает
 //!   на «новую» страницу, недостижимую от старой), используется fallback-скан по всем
 //!   страницам as-of snapshot_lsn с вычислением tail-wins по snapshot next_page_id.
+//!
+//! RAW FALLBACK (новое):
+//! - Если live-страница выглядит как v2 (MAGIC + ver>=2), но парсинг RH/OVF-хедера не удался,
+//!   под снапшотом сначала пробуем frozen-копию (с одним refresh индекса), и если её нет —
+//!   возвращаем live как есть (best-effort). Это согласовано с write-path fallback freeze
+//!   (commit_page замораживает «сырую» v2-страницу с page_lsn=0 перед overwrite/free).
 
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
@@ -30,7 +34,7 @@ use std::io::{Read, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE};
+use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE, PAGE_MAGIC};
 use crate::db::Db;
 use crate::dir::Directory;
 use crate::metrics::{record_snapshot_begin, record_snapshot_end, record_snapshot_freeze_frame};
@@ -340,6 +344,7 @@ impl SnapshotHandle {
     /// Выбрать байты страницы pid как-of snapshot_lsn:
     /// - RH: если live.lsn ≤ snapshot → live; иначе frozen (с одним refresh).
     /// - OVF: если live.lsn ≤ snapshot → live; иначе frozen (с одним refresh).
+    /// - RAW FALLBACK: если live выглядит как v2, но хедер не читается → frozen (try), затем live.
     /// - non-v2: live.
     /// - ошибка чтения live: пытаемся frozen.
     fn page_bytes_at_snapshot(
@@ -351,7 +356,10 @@ impl SnapshotHandle {
         let mut buf = vec![0u8; page_size];
         match pager.read_page(page_id, &mut buf) {
             Ok(()) => {
-                // Попытка как RH
+                // v2?
+                let is_v2 = buf.len() >= 8 && &buf[..4] == PAGE_MAGIC && LittleEndian::read_u16(&buf[4..6]) >= 2;
+
+                // RH (нормальный путь)
                 if let Ok(h) = rh_header_read(&buf) {
                     if h.lsn <= self.lsn {
                         return Ok(Some(buf));
@@ -364,7 +372,7 @@ impl SnapshotHandle {
                     }
                     return Ok(None);
                 }
-                // Попытка как OVF (LSN-гейтинг добавлен)
+                // OVF (нормальный путь)
                 if let Ok(hovf) = ovf_header_read(&buf) {
                     if hovf.lsn <= self.lsn {
                         return Ok(Some(buf));
@@ -377,6 +385,19 @@ impl SnapshotHandle {
                     }
                     return Ok(None);
                 }
+
+                // RAW FALLBACK: выглядит как v2, но хедер не распознан — сначала frozen, потом live.
+                if is_v2 {
+                    if let Some(bytes) = self.read_frozen_page_cached(page_id, page_size, false)? {
+                        return Ok(Some(bytes));
+                    }
+                    if let Some(bytes) = self.read_frozen_page_cached(page_id, page_size, true)? {
+                        return Ok(Some(bytes));
+                    }
+                    // frozen не нашли — вернём live как есть (best-effort)
+                    return Ok(Some(buf));
+                }
+
                 // Не v2 — используем live
                 Ok(Some(buf))
             }
@@ -464,14 +485,6 @@ impl SnapshotHandle {
     }
 
     /// Fallback: найти ключ по полному скану страниц as-of snapshot_lsn (дорого, но безопасно).
-    /// Алгоритм:
-    /// - пройти все pid; для каждой snapshot-версии страницы:
-    ///   - если KV и содержит ключ → add to contains;
-    ///   - сохранить next_page_id (snapshot) в next_map;
-    ///   - запомнить сырое значение v (до разворачивания overflow).
-    /// - среди candidates выбрать tail-most: начиная с каждого кандидата, идём по snapshot next_page_id,
-    ///   если встретим другой candidate — он «позже», запомнить его как tail; в итоге tail должен совпасть.
-    /// - вернуть значение tail (после развёртывания overflow при необходимости).
     fn fallback_get_by_scan(&self, pager: &Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let ps = pager.meta.page_size as usize;
         let total = pager.meta.next_page_id;
