@@ -18,7 +18,66 @@ pub fn cmd_init(path: PathBuf, page_size: u32) -> Result<()> {
 }
 
 pub fn cmd_status(path: PathBuf) -> Result<()> {
+    // JSON toggle via ENV (no CLI change in this step)
+    let json = std::env::var("P1_STATUS_JSON")
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+        .map(|s| s == "1" || s == "true" || s == "yes" || s == "on")
+        .unwrap_or(false);
+
     let meta = read_meta(&path)?;
+    // Directory (optional)
+    let dir_info = Directory::open(&path);
+    let (buckets_opt, used_opt) = match &dir_info {
+        Ok(dir) => {
+            let used = dir.count_used_buckets().unwrap_or(0);
+            (Some(dir.bucket_count), Some(used))
+        }
+        Err(_) => (None, None),
+    };
+
+    // Free-list (optional)
+    let free_pages_opt = match FreeList::open(&path) {
+        Ok(fl) => fl.count().ok(),
+        Err(_) => None,
+    };
+
+    if json {
+        // JSON one-liner summary
+        let path_s = crate::cli::admin::json_escape(&path.display().to_string());
+        let hash_kind = meta.hash_kind.to_string(); // "xxhash64(seed=0)"
+        let tde = (meta.flags & 0x1) != 0;
+
+        let mut fields = Vec::new();
+        fields.push(format!("\"path\":\"{}\"", path_s));
+        fields.push(format!("\"version\":{}", meta.version));
+        fields.push(format!("\"page_size\":{}", meta.page_size));
+        fields.push(format!("\"hash_kind\":\"{}\"", crate::cli::admin::json_escape(&hash_kind)));
+        fields.push(format!("\"flags\":{}", meta.flags));
+        fields.push(format!("\"tde\":{}", tde));
+        fields.push(format!("\"next_page_id\":{}", meta.next_page_id));
+        fields.push(format!("\"last_lsn\":{}", meta.last_lsn));
+        fields.push(format!("\"clean_shutdown\":{}", meta.clean_shutdown));
+        if let Some(b) = buckets_opt {
+            fields.push(format!("\"buckets\":{}", b));
+        } else {
+            fields.push("\"buckets\":null".to_string());
+        }
+        if let Some(u) = used_opt {
+            fields.push(format!("\"used_buckets\":{}", u));
+        } else {
+            fields.push("\"used_buckets\":null".to_string());
+        }
+        if let Some(fp) = free_pages_opt {
+            fields.push(format!("\"free_pages\":{}", fp));
+        } else {
+            fields.push("\"free_pages\":null".to_string());
+        }
+        println!("{{{}}}", fields.join(","));
+        return Ok(());
+    }
+
+    // Human-friendly output (original behavior)
     println!("DB at {}", path.display());
     println!("  version      = {}", meta.version);
     println!("  page_size    = {} bytes", meta.page_size);
@@ -26,6 +85,8 @@ pub fn cmd_status(path: PathBuf) -> Result<()> {
     println!("  flags        = 0x{:08x}", meta.flags);
     println!("    tde        = {}", (meta.flags & 0x1) != 0);
     println!("  next_page_id = {}", meta.next_page_id);
+    println!("  last_lsn     = {}", meta.last_lsn);
+    println!("  clean_shutdown = {}", meta.clean_shutdown);
 
     if let Ok(dir) = Directory::open(&path) {
         println!("  buckets      = {}", dir.bucket_count);
@@ -35,7 +96,6 @@ pub fn cmd_status(path: PathBuf) -> Result<()> {
         println!("  directory    = (not initialized)");
     }
 
-    // Free-list (optional)
     match FreeList::open(&path) {
         Ok(fl) => {
             let cnt = fl.count()?;

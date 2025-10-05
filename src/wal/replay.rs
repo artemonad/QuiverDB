@@ -10,42 +10,19 @@ use std::path::Path;
 use super::writer::write_wal_file_header;
 
 use crate::consts::{
-    PAGE_MAGIC, WAL_FILE, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE, WAL_REC_OFF_CRC32,
-    WAL_REC_OFF_LEN, WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_PAGE_IMAGE,
+    WAL_FILE, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE, WAL_REC_OFF_CRC32, WAL_REC_OFF_LEN,
+    WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_PAGE_IMAGE,
 };
 use crate::meta::{read_meta, set_last_lsn};
 use crate::pager::Pager;
-use crate::page_ovf::ovf_header_read;
-use crate::page_rh::rh_header_read;
-
-/// Попробовать вытащить LSN из v2-страницы (RH или Overflow).
-/// Возвращает Some(lsn), если распознали v2-страницу, иначе None.
-fn v2_page_lsn(buf: &[u8]) -> Option<u64> {
-    if buf.len() < 8 {
-        return None;
-    }
-    if &buf[..4] != PAGE_MAGIC {
-        return None;
-    }
-    let ver = LittleEndian::read_u16(&buf[4..6]);
-    if ver < 2 {
-        return None;
-    }
-    // Сначала пробуем RH, затем Overflow.
-    if let Ok(h) = rh_header_read(buf) {
-        return Some(h.lsn);
-    }
-    if let Ok(h) = ovf_header_read(buf) {
-        return Some(h.lsn);
-    }
-    None
-}
+// Раньше здесь были локальные v2 парсеры header (RH/Overflow). Теперь используем общий helper:
+use crate::util::v2_page_lsn;
 
 /// Реплей WAL только если meta.clean_shutdown == false.
 /// При clean_shutdown == true WAL просто усечётся до заголовка (быстрый старт).
 /// Дополнительно: для v2-страниц применяем запись только при wal_lsn > page_lsn.
 /// Поддерживаются v2-типы: RH и Overflow.
-/// Unknown-типы кадров игнорируются (continue), чтобы не прерывать реплей.
+/// Unknown-типы кадров игнорируются (forward-совместимость).
 pub fn wal_replay_if_any(root: &Path) -> Result<()> {
     let wal_path = root.join(WAL_FILE);
     if !wal_path.exists() {

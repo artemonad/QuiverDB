@@ -14,6 +14,8 @@ pub mod meta;
 pub mod page_rh;   // v2: Robin Hood in-page index
 pub mod page_ovf; // v2: overflow pages
 pub mod config;
+pub mod db_maintenance;
+pub mod db_kv;
 pub mod pager;
 pub mod util;
 pub mod db_scan;

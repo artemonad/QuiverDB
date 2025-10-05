@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.1.5] – 2025-10-05
+
+Added
+- CDC ship sinks:
+  - sink=file://path — write a full WAL stream (header + frames) to a file.
+- CDC ship batching (ENV):
+  - P1_SHIP_FLUSH_EVERY=N — flush every N frames (default 1).
+  - P1_SHIP_FLUSH_BYTES=B — flush when ≥ B bytes have been written since the last flush (default 0 = disabled).
+- Inclusive since-lsn (ENV):
+  - P1_SHIP_SINCE_INCLUSIVE=1|true|yes|on — treat --since-lsn as lsn >= N (default is > N).
+- JSON modes for CLI:
+  - status: P1_STATUS_JSON=1
+  - dbstats: P1_DBSTATS_JSON=1
+
+Changed/Improved
+- wal-apply/cdc replay: perform LSN-gating before ensure_allocated to avoid unnecessary allocations.
+- CDC docs updated (file sink, batching env vars, inclusive since-lsn).
+
+Refactor
+- CDC split into modules: ship/tail/apply/record/replay/last_lsn.
+- Db split: maintenance (sweep/print_stats) and KV put-in-chain moved to separate modules.
+- Pager: page cache moved to pager/cache.rs.
+
+Tests
+- New integration test cdc_file_sink: ship to file + apply from file.
+
+Compatibility
+- On-disk formats unchanged (meta v3, page v2, WAL v1).
+- Backward compatible CLI/behavior.
+
 ## [1.1.0] – 2025-10-05
 
 Formats: unchanged (meta v3, page v2, WAL v1 remain frozen)

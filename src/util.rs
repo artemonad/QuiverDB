@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
+use byteorder::{ByteOrder, LittleEndian};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+use crate::consts::PAGE_MAGIC;
+use crate::page_ovf::ovf_header_read;
+use crate::page_rh::rh_header_read;
 
 pub fn read_at(f: &mut File, offset: u64, buf: &mut [u8]) -> Result<()> {
     f.seek(SeekFrom::Start(offset))?;
@@ -58,4 +63,32 @@ pub fn create_empty_file(path: &Path) -> Result<()> {
         .with_context(|| format!("create file {}", path.display()))?;
     f.sync_all()?;
     Ok(())
+}
+
+/// Extract LSN from a v2 page (KV_RH or OVERFLOW).
+/// Returns:
+/// - Some(lsn) if the buffer looks like a v2 page and header parsed,
+/// - None for non-v2/unknown buffers.
+///
+/// Notes:
+/// - This helper is shared by replay/apply paths to avoid duplication.
+/// - CRC is NOT verified here; callers should verify CRC if needed.
+pub fn v2_page_lsn(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 8 {
+        return None;
+    }
+    if &buf[..4] != PAGE_MAGIC {
+        return None;
+    }
+    let ver = LittleEndian::read_u16(&buf[4..6]);
+    if ver < 2 {
+        return None;
+    }
+    if let Ok(h) = rh_header_read(buf) {
+        Some(h.lsn)
+    } else if let Ok(h) = ovf_header_read(buf) {
+        Some(h.lsn)
+    } else {
+        None
+    }
 }

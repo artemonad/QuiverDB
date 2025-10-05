@@ -27,11 +27,14 @@ use std::path::{Path, PathBuf};
 /// New: centralized configuration
 use crate::config::QuiverConfig;
 
+// Подмодуль кэша страниц (выделен из этого файла)
+mod cache;
+
 pub struct Pager {
     pub root: PathBuf,
     pub meta: MetaHeader,
     // Небольшой LRU-подобный кэш страниц (включается переменной окружения или через конфиг).
-    cache: RefCell<Option<PageCache>>,
+    cache: RefCell<Option<cache::PageCache>>,
     // Гарантировать ли fsync на сегментах данных при каждой записи.
     // По умолчанию true. Если false — rely-on-WAL (WAL не будет truncate в commit_page).
     data_fsync: bool,
@@ -49,7 +52,7 @@ impl Pager {
         let meta = read_meta(root)?;
 
         let cache = if cfg.page_cache_pages > 0 {
-            Some(PageCache::new(cfg.page_cache_pages, meta.page_size as usize))
+            Some(cache::PageCache::new(cfg.page_cache_pages, meta.page_size as usize))
         } else {
             None
         };
@@ -360,70 +363,5 @@ impl Pager {
             cache.put(page_id, buf);
         }
         Ok(())
-    }
-}
-
-// Простой LRU-подобный кэш по количеству страниц.
-// Эвикт — по минимальному last_access (O(n) на эвикт, при капе ~128/256 это нормально).
-struct PageCache {
-    cap: usize,
-    page_size: usize,
-    map: HashMap<u64, CacheEntry>,
-    tick: u64,
-}
-
-struct CacheEntry {
-    data: Vec<u8>,
-    last_access: u64,
-}
-
-impl PageCache {
-    fn new(cap: usize, page_size: usize) -> Self {
-        Self {
-            cap,
-            page_size,
-            map: HashMap::with_capacity(cap),
-            tick: 0,
-        }
-    }
-
-    // Копирует страницу в out, обновляет last_access. Возвращает true, если нашли.
-    fn get_mut(&mut self, page_id: u64, out: &mut [u8]) -> bool {
-        if let Some(e) = self.map.get_mut(&page_id) {
-            if e.data.len() == out.len() {
-                out.copy_from_slice(&e.data);
-                self.tick = self.tick.wrapping_add(1);
-                e.last_access = self.tick;
-                return true;
-            }
-        }
-        false
-    }
-
-    fn put(&mut self, page_id: u64, data: &[u8]) {
-        if data.len() != self.page_size {
-            return;
-        }
-        self.tick = self.tick.wrapping_add(1);
-        let entry = CacheEntry {
-            data: data.to_vec(),
-            last_access: self.tick,
-        };
-        if self.map.len() >= self.cap && !self.map.contains_key(&page_id) {
-            // Найдём наименее недавно использованную запись
-            let mut victim: Option<(u64, u64)> = None; // (pid, last_access)
-            for (pid, e) in self.map.iter() {
-                let la = e.last_access;
-                match victim {
-                    None => victim = Some((*pid, la)),
-                    Some((_, best)) if la < best => victim = Some((*pid, la)),
-                    _ => {}
-                }
-            }
-            if let Some((victim_pid, _)) = victim {
-                self.map.remove(&victim_pid);
-            }
-        }
-        self.map.insert(page_id, entry);
     }
 }
