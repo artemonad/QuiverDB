@@ -1,5 +1,3 @@
-// src/wal/replay.rs
-
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use crc32fast::Hasher as Crc32;
@@ -15,7 +13,6 @@ use crate::consts::{
 };
 use crate::meta::{read_meta, set_last_lsn};
 use crate::pager::Pager;
-// Раньше здесь были локальные v2 парсеры header (RH/Overflow). Теперь используем общий helper:
 use crate::util::v2_page_lsn;
 
 /// Реплей WAL только если meta.clean_shutdown == false.
@@ -107,27 +104,34 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
                 let page_id =
                     LittleEndian::read_u64(&hdr[WAL_REC_OFF_PAGE_ID..WAL_REC_OFF_PAGE_ID + 8]);
 
-                // Убедимся, что файл/сегмент физически есть и достаточного размера.
-                pager.ensure_allocated(page_id)?;
-
-                // По умолчанию применяем запись; можем отменить при v2 и wal_lsn <= page_lsn.
+                // Оптимизация/корректность: LSN-гейтинг ДО ensure_allocated
+                // (избегаем лишних аллокаций, если кадр устарел).
+                let new_lsn_opt = v2_page_lsn(&payload);
                 let mut apply = true;
 
-                // Гейтинг для v2-страниц: сравним LSN текущей страницы и новой.
-                if let Some(new_lsn) = v2_page_lsn(&payload) {
+                if page_id < pager.meta.next_page_id {
                     let mut cur = vec![0u8; pager.meta.page_size as usize];
-                    if page_id < pager.meta.next_page_id {
-                        if pager.read_page(page_id, &mut cur).is_ok() {
-                            if let Some(cur_lsn) = v2_page_lsn(&cur) {
+                    match pager.read_page(page_id, &mut cur) {
+                        Ok(()) => {
+                            if let (Some(new_lsn), Some(cur_lsn)) = (new_lsn_opt, v2_page_lsn(&cur)) {
                                 if cur_lsn >= new_lsn {
                                     apply = false;
                                 }
                             }
                         }
+                        Err(_) => {
+                            // Не смогли прочитать текущую — применим запись (восстановление)
+                            apply = true;
+                        }
                     }
+                } else {
+                    // Страница логически не аллоцирована — применяем, аллоцируем при необходимости
+                    apply = true;
                 }
 
                 if apply {
+                    // Аллоцируем только при реальном применении
+                    pager.ensure_allocated(page_id)?;
                     pager.write_page_raw(page_id, &payload)?;
                     applied += 1;
                 }

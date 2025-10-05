@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use byteorder::{ByteOrder, LittleEndian};
 
 use crate::consts::NO_PAGE;
 use crate::db::Db;

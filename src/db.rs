@@ -1,4 +1,4 @@
-use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE, FREE_FILE, FREE_HDR_SIZE, FREE_MAGIC};
+use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE,};
 use crate::dir::Directory;
 use crate::lock::{acquire_exclusive_lock, acquire_shared_lock, LockGuard};
 use crate::meta::set_clean_shutdown;
@@ -9,15 +9,11 @@ use crate::page_rh::{
 use crate::pager::Pager;
 use crate::page_ovf::{
     ovf_free_chain, ovf_make_placeholder, ovf_parse_placeholder, ovf_read_chain, ovf_write_chain,
-    ovf_header_read,
 };
-use crate::free::FreeList;
+
 use crate::wal::{wal_replay_if_any, Wal, WalGroupCfg};
 use anyhow::{anyhow, Result};
-use byteorder::{ByteOrder, LittleEndian};
-use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
 
 // New: centralized configuration/builder
 use crate::config::{DbBuilder, QuiverConfig};
@@ -31,6 +27,9 @@ use crate::db_maintenance;
 // New: KV put-in-chain delegation
 use crate::db_kv;
 
+// New: snapshots (Phase 1 scaffold + read path)
+use crate::snapshots::{SnapshotManager, SnapshotHandle};
+
 pub struct Db {
     pub root: std::path::PathBuf,
     pub pager: Pager,
@@ -41,6 +40,8 @@ pub struct Db {
     pub cfg: QuiverConfig,
     /// New: in-process subscriptions registry
     pub subs: std::sync::Arc<SubRegistry>,
+    /// New (Phase 1): in-process snapshot manager (writer only)
+    pub snap_mgr: Option<Arc<Mutex<SnapshotManager>>>,
 }
 
 impl Db {
@@ -64,9 +65,18 @@ impl Db {
         // group-commit settings from config
         Wal::set_group_config(root, WalGroupCfg { coalesce_ms: cfg.wal_coalesce_ms })?;
         wal_replay_if_any(root)?;
-        let pager = Pager::open_with_config(root, &cfg)?;
+
+        // Открываем пейджер и каталог
+        let mut pager = Pager::open_with_config(root, &cfg)?;
         let dir = Directory::open(root)?;
+
+        // Writer помечаем как "грязный"
         set_clean_shutdown(root, false)?;
+
+        // Создаём менеджер снапшотов и передаём его в пейджер
+        let snap_mgr = Arc::new(Mutex::new(SnapshotManager::new(root)));
+        pager.set_snapshot_manager(Some(snap_mgr.clone()));
+
         Ok(Self {
             root: root.to_path_buf(),
             pager,
@@ -75,6 +85,7 @@ impl Db {
             readonly: false,
             cfg,
             subs: SubRegistry::new(),
+            snap_mgr: Some(snap_mgr),
         })
     }
 
@@ -91,6 +102,7 @@ impl Db {
             readonly: true,
             cfg,
             subs: SubRegistry::new(),
+            snap_mgr: None, // RO: снапшоты менеджеру writer'а не нужны
         })
     }
 
@@ -106,6 +118,32 @@ impl Db {
     pub fn open_ro(root: &std::path::Path) -> Result<Self> {
         let cfg = QuiverConfig::from_env();
         Self::open_ro_with_config(root, cfg)
+    }
+
+    /// Phase 1: начать снапшотную сессию (in-process).
+    /// Возвращает SnapshotHandle с зафиксированным snapshot_lsn.
+    pub fn snapshot_begin(&mut self) -> Result<SnapshotHandle> {
+        if self.readonly {
+            return Err(anyhow!("Db is read-only; snapshots require a writer handle"));
+        }
+        let mgr = self
+            .snap_mgr
+            .as_ref()
+            .ok_or_else(|| anyhow!("snapshot manager not available"))?;
+        let mut guard = mgr.lock().unwrap();
+        guard.begin(self)
+    }
+
+    /// Phase 1: завершить снапшотную сессию.
+    /// Сообщает менеджеру, а затем удаляет sidecar у handle (best-effort).
+    pub fn snapshot_end(&mut self, snap: &mut SnapshotHandle) -> Result<()> {
+        // Менеджер известит об окончании (пересчёт max_snapshot_lsn)
+        if let Some(mgr) = &self.snap_mgr {
+            let mut g = mgr.lock().unwrap();
+            let _ = g.end(&snap.id); // если уже завершён — ок
+        }
+        // Удалим sidecar'ы (best-effort)
+        snap.end()
     }
 
     /// Helper: publish put event (writer only)
@@ -256,6 +294,14 @@ impl Db {
             let next = h.next_page_id;
 
             if h.used_slots == 0 {
+                // NEW: зафризим KV-страницу перед вырезанием/освобождением,
+                // чтобы снапшоты могли читать "старую" версию цепочки
+                if let Some(mgr) = &self.snap_mgr {
+                    let mut g = mgr.lock().unwrap();
+                    // buf содержит актуальную страницу h.lsn
+                    g.freeze_if_needed(pid, h.lsn, &buf)?;
+                }
+
                 if prev == NO_PAGE {
                     self.dir.set_head(bucket, next)?;
                 } else {
@@ -290,10 +336,6 @@ impl Db {
             return Ok(());
         }
         db_maintenance::sweep_orphan_overflow_writer(self)
-    }
-
-    fn read_free_set(&self) -> Result<HashSet<u64>> {
-        db_maintenance::read_free_set(self)
     }
 
     pub fn print_stats(&self) -> Result<()> {

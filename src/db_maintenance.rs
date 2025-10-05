@@ -9,7 +9,6 @@ use crate::consts::{FREE_FILE, FREE_HDR_SIZE, FREE_MAGIC, NO_PAGE};
 use crate::free::FreeList;
 use crate::page_ovf::{ovf_header_read};
 use crate::page_rh::{rh_header_read, rh_page_is_kv};
-use crate::util::display_text;
 
 /// Прочитать множество page_id из free‑листа (read‑only).
 pub fn read_free_set(db: &Db) -> Result<HashSet<u64>> {

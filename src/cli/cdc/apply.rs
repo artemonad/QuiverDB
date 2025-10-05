@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use crc32fast::Hasher as Crc32;
+use flate2::read::GzDecoder;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 use crate::consts::{
     WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE, WAL_REC_OFF_CRC32, WAL_REC_OFF_LEN,
@@ -11,6 +13,31 @@ use crate::consts::{
 use crate::meta::{read_meta, set_last_lsn};
 use crate::pager::Pager;
 use crate::util::v2_page_lsn;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecompressKind {
+    None,
+    Gzip,
+    Zstd,
+}
+
+fn env_decompress_kind() -> Result<DecompressKind> {
+    match std::env::var("P1_APPLY_DECOMPRESS") {
+        Err(_) => Ok(DecompressKind::None),
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "" | "none" => Ok(DecompressKind::None),
+                "gzip" => Ok(DecompressKind::Gzip),
+                "zstd" => Ok(DecompressKind::Zstd),
+                _ => Err(anyhow!(
+                    "invalid P1_APPLY_DECOMPRESS='{}' (supported: none|gzip|zstd)",
+                    s
+                )),
+            }
+        }
+    }
+}
 
 /// Применить WAL-поток из произвольного Read (идемпотентно).
 /// Правила:
@@ -148,9 +175,28 @@ pub fn wal_apply_from_stream<R: Read>(path: &Path, mut inp: R) -> Result<()> {
     Ok(())
 }
 
-/// CLI-обёртка: читает WAL‑стрим из stdin и применяет его к БД path.
+/// CLI-обёртка: читает WAL‑стрим из stdin (с опциональной декомпрессией) и применяет его к БД path.
 pub fn cmd_wal_apply(path: PathBuf) -> Result<()> {
+    // stdin как базовый источник
     let stdin = std::io::stdin();
-    let mut inp = stdin.lock();
-    wal_apply_from_stream(&path, &mut inp)
+    let base = stdin.lock();
+
+    // Выбираем декомпрессию по ENV
+    let dec_kind = env_decompress_kind()?;
+    match dec_kind {
+        DecompressKind::None => {
+            // Без декомпрессии
+            wal_apply_from_stream(&path, base)
+        }
+        DecompressKind::Gzip => {
+            // Gzip decoder поверх stdin
+            let dec = GzDecoder::new(base);
+            wal_apply_from_stream(&path, dec)
+        }
+        DecompressKind::Zstd => {
+            // Zstd decoder поверх stdin
+            let dec = ZstdDecoder::new(base).context("create zstd decoder")?;
+            wal_apply_from_stream(&path, dec)
+        }
+    }
 }

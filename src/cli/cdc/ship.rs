@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use crc32fast::Hasher as Crc32;
+use flate2::{write::GzEncoder, Compression as GzCompression};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
@@ -8,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::consts::{
     WAL_FILE, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE, WAL_REC_OFF_CRC32,
-    WAL_REC_OFF_LEN, WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID,
+    WAL_REC_OFF_LEN, WAL_REC_OFF_LSN,
 };
 
 /// Внутренний sink: stdout (по умолчанию), TCP или file://path.
@@ -69,11 +70,98 @@ fn env_usize(name: &str) -> usize {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressKind {
+    None,
+    Gzip,
+    Zstd,
+}
+
+fn env_compress_kind() -> Result<CompressKind> {
+    match std::env::var("P1_SHIP_COMPRESS") {
+        Err(_) => Ok(CompressKind::None),
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "" | "none" => Ok(CompressKind::None),
+                "gzip" => Ok(CompressKind::Gzip),
+                "zstd" => Ok(CompressKind::Zstd),
+                _ => Err(anyhow!(
+                    "invalid P1_SHIP_COMPRESS='{}' (supported: none|gzip|zstd)",
+                    s
+                )),
+            }
+        }
+    }
+}
+
+/// Обёртка над sink с опциональной компрессией.
+enum CompressingSink {
+    Plain(Box<dyn Write>),
+    Gzip(GzEncoder<Box<dyn Write>>),
+    Zstd(zstd::stream::write::Encoder<'static, Box<dyn Write>>),
+}
+
+impl CompressingSink {
+    fn new(inner: Box<dyn Write>, kind: CompressKind) -> Result<Self> {
+        Ok(match kind {
+            CompressKind::None => CompressingSink::Plain(inner),
+            CompressKind::Gzip => {
+                let enc = GzEncoder::new(inner, GzCompression::fast());
+                CompressingSink::Gzip(enc)
+            }
+            CompressKind::Zstd => {
+                // level 0: библиотека подберёт подходящий уровень
+                let enc = zstd::stream::write::Encoder::new(inner, 0)
+                    .context("create zstd encoder")?;
+                CompressingSink::Zstd(enc)
+            }
+        })
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            CompressingSink::Plain(mut w) => {
+                w.flush().ok();
+                Ok(())
+            }
+            CompressingSink::Gzip(g) => {
+                // Запишет трейлер и вернёт внутренний writer.
+                let _ = g.finish().context("gzip finish")?;
+                Ok(())
+            }
+            CompressingSink::Zstd(z) => {
+                // Завершит поток и вернёт внутренний writer.
+                let _ = z.finish().context("zstd finish")?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Write for CompressingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            CompressingSink::Plain(w) => w.write(buf),
+            CompressingSink::Gzip(w) => w.write(buf),
+            CompressingSink::Zstd(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            CompressingSink::Plain(w) => w.flush(),
+            CompressingSink::Gzip(w) => w.flush(),
+            CompressingSink::Zstd(w) => w.flush(),
+        }
+    }
+}
+
 /// Ship WAL-стрим в stdout/TCP/file с фильтром по LSN и batch‑flush.
 /// ENV:
 /// - P1_SHIP_FLUSH_EVERY=N      — flush каждые N кадров (default 1 — как раньше)
 /// - P1_SHIP_FLUSH_BYTES=B      — flush при накоплении ≥ B байт (default 0 — отключено)
-/// - P1_SHIP_SINCE_INCLUSIVE=1  — включить фильтр lsn >= N (по умолчанию lsn > N)
+/// - P1_SHIP_SINCE_INCLUSIVE=1  — трактовать lsn >= N (по умолчанию lsn > N)
+/// - P1_SHIP_COMPRESS=none|gzip|zstd — компрессия вывода
 pub fn cmd_wal_ship_ext(
     path: PathBuf,
     follow: bool,
@@ -100,7 +188,12 @@ pub fn cmd_wal_ship_ext(
         return Err(anyhow!("bad WAL magic in {}", wal_path.display()));
     }
 
-    let mut out: Box<dyn Write> = open_sink(sink)?;
+    // Базовый sink (stdout/TCP/file) + опциональная компрессия
+    let raw: Box<dyn Write> = open_sink(sink)?;
+    let compress_kind = env_compress_kind()?;
+    let mut out = CompressingSink::new(raw, compress_kind)?;
+
+    // Пишем header
     out.write_all(&hdr16)?;
     out.flush()?; // начальный header — сразу
 
@@ -130,14 +223,14 @@ pub fn cmd_wal_ship_ext(
             tr_hdr[0] = crate::consts::WAL_REC_TRUNCATE;
             tr_hdr[1] = 0;
             LittleEndian::write_u16(&mut tr_hdr[2..4], 0);
-            LittleEndian::write_u64(&mut tr_hdr[WAL_REC_OFF_LSN..WAL_REC_OFF_LSN + 8], 0);
-            LittleEndian::write_u64(&mut tr_hdr[WAL_REC_OFF_PAGE_ID..WAL_REC_OFF_PAGE_ID + 8], 0);
-            LittleEndian::write_u32(&mut tr_hdr[WAL_REC_OFF_LEN..WAL_REC_OFF_LEN + 4], 0);
+            LittleEndian::write_u64(&mut tr_hdr[crate::consts::WAL_REC_OFF_LSN..crate::consts::WAL_REC_OFF_LSN + 8], 0);
+            LittleEndian::write_u64(&mut tr_hdr[crate::consts::WAL_REC_OFF_PAGE_ID..crate::consts::WAL_REC_OFF_PAGE_ID + 8], 0);
+            LittleEndian::write_u32(&mut tr_hdr[crate::consts::WAL_REC_OFF_LEN..crate::consts::WAL_REC_OFF_LEN + 4], 0);
             let mut hasher = Crc32::new();
-            hasher.update(&tr_hdr[..WAL_REC_OFF_CRC32]);
+            hasher.update(&tr_hdr[..crate::consts::WAL_REC_OFF_CRC32]);
             let crc = hasher.finalize();
             LittleEndian::write_u32(
-                &mut tr_hdr[WAL_REC_OFF_CRC32..WAL_REC_OFF_CRC32 + 4],
+                &mut tr_hdr[crate::consts::WAL_REC_OFF_CRC32..crate::consts::WAL_REC_OFF_CRC32 + 4],
                 crc,
             );
             out.write_all(&tr_hdr)?;
@@ -177,9 +270,9 @@ pub fn cmd_wal_ship_ext(
             let wal_lsn = LittleEndian::read_u64(&hdr[WAL_REC_OFF_LSN..WAL_REC_OFF_LSN + 8]);
             if let Some(min_lsn) = since_lsn {
                 let skip = if since_inclusive {
-                    wal_lsn < min_lsn     // включительно: пропускаем только lsn < N
+                    wal_lsn < min_lsn
                 } else {
-                    wal_lsn <= min_lsn    // по умолчанию: пропускаем lsn <= N
+                    wal_lsn <= min_lsn
                 };
                 if skip {
                     pos += rec_total;
@@ -217,7 +310,8 @@ pub fn cmd_wal_ship_ext(
         }
     }
 
-    // финальный flush на завершение (особенно важно при follow=false)
-    out.flush()?;
+    // финальный flush/finish на завершение (особенно важно при компрессии)
+    out.flush().ok();
+    out.finish()?;
     Ok(())
 }

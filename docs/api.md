@@ -1,66 +1,100 @@
-# QuiverDB API Guide (v1.1.0)
+# QuiverDB API Guide (v1.2, Phase 1)
 
-This document describes the developer-facing API for QuiverDB: Rust interfaces (Db/Pager/Directory), crash-safety contract, locking semantics, configuration (QuiverConfig/DbBuilder), subscriptions, scan APIs, environment variables, and CLI mapping.
+Audience: Rust developers embedding QuiverDB or building tooling around it.  
+Status: v1.2 (Phase 1 snapshots/backup); on-disk formats remain frozen: meta v3, page v2, WAL v1.
 
-Audience: Rust developers embedding QuiverDB or building tooling around it.
+Links:
+- CDC guide: docs/cdc.md
+- On-disk format: docs/format.md
+- FFI (C ABI): docs/ffi.md
+- Snapshots/Backup details: docs/snapshots.md
 
-Status: v1.1.0 (formats frozen: meta v3, page v2, WAL v1)
+Table of contents
+- 1) Concepts
+- 2) Locking and modes
+- 3) Configuration (QuiverConfig/DbBuilder)
+- 4) Crash-safety and commit contract
+- 5) Rust API: Db (high-level)
+- 6) Rust API: Pager (low-level)
+- 7) Directory and free-list
+- 8) WAL (advanced)
+- 9) Environment variables
+- 10) Error handling
+- 11) CLI ↔ API mapping
+- 12) Platform notes
+- 13) On-disk formats (summary)
+- 14) Practical examples
 
+---
 
 ## 1) Concepts
 
 - Single-writer, multi-reader:
   - Writer opens with an exclusive lock and may modify files.
-  - Readers open with a shared lock and must not change files.
+  - Readers open with a shared lock and never mutate files or meta.
 - Crash safety via WAL:
-  - All changes are appended to WAL (CRC-protected, monotonic LSN).
-  - Replay applies page images with LSN-gating (apply only if `wal_lsn > page_lsn` on v2 pages).
-  - On clean shutdown: WAL is truncated to header (fast start).
+  - All writes append page images to WAL (CRC-protected, monotonic LSN).
+  - Replay is tolerant to partial tails and unknown record types.
+  - v2 pages (KV_RH/OVERFLOW) are applied only when wal_lsn > page_lsn (LSN-gating).
 - Pages:
-  - v2 64-byte header with page LSN and CRC, types: KV_RH (Robin Hood) and OVERFLOW.
-  - KV_RH stores key/value pairs in-page with a Robin Hood index.
-  - OVERFLOW stores large values in chains referenced by placeholders from KV pages.
-- Directory:
-  - Per-bucket heads — forms chains of KV pages (head → next → …).
-  - Atomic updates (tmp+rename) + header CRC.
+  - v2 pages have a 64-byte header: MAGIC, version=2, type (KV_RH=2 | OVERFLOW=3), page_id, next_page_id, lsn, crc32.
+  - KV_RH stores key/value pairs with a Robin Hood index.
+  - OVERFLOW stores large values in chains referenced from KV as a fixed 18-byte placeholder.
+- Directory (dir file):
+  - Array of bucket heads; KV pages form chains (head → next → …).
+  - Updates are atomic (tmp+rename) and protect with header CRC.
 - Free-list:
   - Tracks freed page IDs for reuse.
-- Tail-wins within a chain:
-  - If multiple versions of a key exist along a bucket chain, the last one (closer to chain tail) is authoritative for reads and scans.
+- Tail-wins semantics within a chain:
+  - If multiple versions of a key exist along a bucket chain, the last one (closer to the tail) is authoritative.
 
+New in v1.2 (Phase 1)
+- Snapshot isolation for reads by LSN:
+  - In-process snapshots (not persisted across restarts).
+  - Page-level copy-on-write (COW) via “freeze” before overwrite/free.
+  - Snapshot reads choose live or frozen page “as of” snapshot_lsn (see docs/snapshots.md).
+- Backup/Restore on top of snapshots:
+  - Full and incremental backup (since_lsn).
+  - Restore with CRC checks, sets clean_shutdown=true.
+  - No dedup in Phase 1 (Phase 2 adds content-hash dedup).
+
+---
 
 ## 2) Locking and modes
 
 - Writer (read-write):
-  - `Db::open(path) -> Db`
-  - Acquires an exclusive file lock.
-  - Executes `wal_replay_if_any` if needed.
-  - Sets `clean_shutdown=false` on open, restores true on Drop.
+  - Db::open(root) or Db::open_with_config(root, cfg)
+  - Exclusive file lock (fs2).
+  - Executes WAL replay if needed.
+  - Sets clean_shutdown=false on open and clean_shutdown=true on Drop.
+  - Performs space maintenance on Drop (best-effort).
 
 - Reader (read-only):
-  - `Db::open_ro(path) -> Db`
-  - Acquires a shared file lock.
-  - Does NOT replay WAL and does NOT change `clean_shutdown`.
+  - Db::open_ro(root) or Db::open_ro_with_config(root, cfg)
+  - Shared file lock (fs2).
+  - Does NOT replay WAL and does NOT change clean_shutdown.
   - Drop does not run space maintenance.
 
-Lock file path: `<root>/LOCK` (fs2 advisory locks). On Windows, semantics are best-effort but guarded by tests.
+Lock file path: <root>/LOCK. On Windows, advisory locks are best-effort and guarded by tests.
 
+---
 
-## 3) Configuration (v1.1)
+## 3) Configuration (QuiverConfig/DbBuilder)
 
-QuiverDB now has an explicit configuration object with a builder, while remaining backward-compatible with environment variables.
+QuiverDB uses a central config object with a builder. Backward compatibility with environment variables is preserved.
 
-- QuiverConfig fields:
-  - wal_coalesce_ms: u64 — WAL fsync coalescing (ms), default 3
-  - data_fsync: bool — fsync data segments on commit, default true
-  - page_cache_pages: usize — page cache size (0 disables), default 0
-  - ovf_threshold_bytes: Option<usize> — overflow threshold; None → page_size/4
+Fields:
+- wal_coalesce_ms: u64 — group-commit fsync coalescing window (ms). Default: 3.
+- data_fsync: bool — fsync data segments on commit. Default: true.
+- page_cache_pages: usize — page cache size (0 disables). Default: 0.
+- ovf_threshold_bytes: Option<usize> — overflow threshold:
+  - None → page_size/4.
 
-- Sources and precedence:
-  - By default, `Db::open` and `Db::open_ro` read env vars into a QuiverConfig (keeping old behavior).
-  - You can pass an explicit config via `Db::open_with_config` / `Db::open_ro_with_config`. Explicit config takes precedence over env.
+Sources:
+- By default, Db::open/open_ro read env vars into QuiverConfig (old behavior).
+- Explicit config via Db::open_with_config/open_ro_with_config overrides env.
 
-Example (builder + writer/reader):
+Example:
 
 ```rust
 use anyhow::Result;
@@ -74,7 +108,6 @@ fn main() -> Result<()> {
         Directory::create(root, 128)?;
     }
 
-    // Build config (starts from env by default, then override)
     let cfg = DbBuilder::new()
         .wal_coalesce_ms(0)
         .data_fsync(true)
@@ -91,8 +124,7 @@ fn main() -> Result<()> {
     // Reader
     {
         let db_ro = Db::open_ro_with_config(root, cfg)?;
-        let v = db_ro.get(b"alpha")?.unwrap();
-        assert_eq!(v, b"1");
+        assert_eq!(db_ro.get(b"alpha")?.as_deref(), Some(b"1".as_ref()));
     }
 
     Ok(())
@@ -100,243 +132,245 @@ fn main() -> Result<()> {
 ```
 
 Notes:
-- When `data_fsync=false`, durability relies on WAL; WAL is not truncated on commit and will truncate during replay after an unclean shutdown.
-- Page cache is per-Pager instance; hits/misses are tracked in metrics.
+- With data_fsync=false, durability relies on WAL only; WAL is not truncated on commit and will truncate during replay after an unclean shutdown.
+- Page cache is per-Pager instance; hits/misses recorded in metrics.
 
+---
 
 ## 4) Crash-safety and commit contract
 
 Commit sequence for a page write:
-1. Compute new LSN = `meta.last_lsn + 1`.
-2. If page is v2, write `lsn` into header and update page CRC.
-3. Append WAL record (header + payload), fsync WAL (group-commit).
-4. Write data page to its segment file (fsync controlled by `data_fsync`).
-5. Optionally rotate (truncate) WAL — only when data fsync is enabled.
-6. Update `meta.last_lsn`.
-7. Update page cache entry (if enabled).
+1. Compute new LSN = meta.last_lsn + 1.
+2. Snapshot COW: if there are active snapshots that may need the current page (snapshot_lsn ≥ current_page_lsn), freeze the current page bytes before overwrite (append to freeze.bin and index.bin).
+3. If page is v2, write lsn into header and update page CRC.
+4. Append WAL record (header + payload), fsync WAL (group-commit).
+5. Write data page to its segment file (fsync controlled by data_fsync).
+6. Maybe rotate (truncate) WAL — only when data_fsync is enabled.
+7. Update meta.last_lsn.
+8. Update page cache entry (if enabled).
+
+Additional COW cases:
+- Freeing overflow chains: freeze each OVERFLOW page before free if any snapshot may need it.
+- Removing empty KV pages from chains: freeze the KV page before free if any snapshot may need it.
 
 Replay (writer only):
-- If `meta.clean_shutdown == false`, read WAL frames (CRC + length + partial tail tolerant).
+- If meta.clean_shutdown == false, read WAL frames (CRC + length + partial tail tolerant).
 - Ignore unknown record types (forward-compatible).
 - Apply page images with LSN-gating for v2 pages (KV_RH/OVERFLOW).
-- Truncate WAL to header after success; update `last_lsn` best-effort.
+- Truncate WAL to header after success; update last_lsn best-effort.
 
 Partial tails:
-- A short read for a record header or payload is treated as normal EOF (tail still being written), not an error.
+- A short read for a record header or payload is treated as normal EOF.
 
+Optimization (v1.2):
+- WAL replay performs LSN-gating before ensure_allocated to avoid unnecessary allocations.
+
+---
 
 ## 5) Rust API: Db (high-level)
 
 Core operations:
+- Db::open / Db::open_with_config (writer; exclusive lock)
+- Db::open_ro / Db::open_ro_with_config (reader; shared lock)
+- put(key, val)
+- get(key)
+- del(key)
+- print_stats()
 
-- `Db::open` (exclusive; from env)
-- `Db::open_with_config` (exclusive; explicit config)
-- `Db::open_ro` (shared; from env)
-- `Db::open_ro_with_config` (shared; explicit config)
-- `put(key, val)` — insert/update; may use overflow chains for large values
-- `get(key)` — resolves overflow chains transparently
-- `del(key)` — deletes key and frees its overflow chain if present
-- `print_stats()` — prints DB stats and a metrics snapshot (human-friendly)
-
-Scanning (v1.1):
-- `scan_all() -> Vec<(Vec<u8>, Vec<u8>)>`
-- `scan_prefix(prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>`
+Scanning:
+- scan_all() -> Vec<(Vec<u8>, Vec<u8>)>
+- scan_prefix(prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>
   - Collects KV pairs across all buckets/chains.
-  - Tail-wins semantics: last occurrence along a chain overrides earlier ones.
-  - Return order is unspecified (use your own sorting if needed).
+  - Tail-wins semantics: last occurrence along a chain wins.
+  - Return order is unspecified.
 
-Subscriptions (v1.1):
-- `subscribe_prefix(prefix, callback) -> SubscriptionHandle`
-  - In-process pub/sub for live events emitted by the writer right after a successful commit.
-  - Event: `{ key: Vec<u8>, value: Option<Vec<u8>>, lsn: u64 }`
-    - `value=Some(...)` for put/update, `None` for delete.
-  - Drop the SubscriptionHandle to unsubscribe.
-  - Callbacks run synchronously in the writer thread; keep handlers fast, offload heavy work to another thread if needed.
+Subscriptions (in-process):
+- subscribe_prefix(prefix, callback) -> SubscriptionHandle
+  - Synchronous callbacks on writer thread after successful commit.
+  - Event: { key: Vec<u8>, value: Option<Vec<u8>>, lsn: u64 }.
 
-Example:
+Snapshot Isolation (Phase 1):
+- Db::snapshot_begin() -> Result<SnapshotHandle>
+  - SnapshotHandle:
+    - lsn() -> u64
+    - get(key: &[u8]) -> Result<Option<Vec<u8>>> — consistent at snapshot_lsn
+    - scan_all()/scan_prefix() — consistent at snapshot_lsn
+    - end() — drop sidecar (freeze/index)
+- Details:
+  - Snapshot reads choose live vs frozen page for each page_id (as-of snapshot LSN).
+  - Overflow chains resolved per-page the same way (as-of snapshot).
+  - Fallback scan (rare) reconstructs tail-wins if chain head moved after snapshot.
 
-```rust
-use std::sync::{Arc, Mutex};
-use QuiverDB::{Db, Directory, init_db};
-use QuiverDB::subs::Event;
+Backup/Restore (Phase 1):
+- backup::backup_to_dir(&db, &snap, out_dir, since_lsn: Option<u64>)
+  - Full: since_lsn=None, includes all pages as-of snapshot_lsn.
+  - Incremental: since_lsn=Some(N), includes pages with page_lsn ∈ (N, S].
+  - Output: pages.bin (frames), dir.bin (optional), manifest.json (summary).
+  - Retries index refresh for frozen pages (hot backup robustness).
+- backup::restore_from_dir(dst_root, backup_dir)
+  - Writes pages to dst_root, installs dir.bin if present, updates last_lsn and clean_shutdown.
 
-fn main() -> anyhow::Result<()> {
-    let root = std::path::Path::new("./db");
-    if !root.exists() {
-        init_db(root, 4096)?;
-        Directory::create(root, 128)?;
-    }
+Page cache:
+- Enabled when page_cache_pages > 0.
+- Metrics track hits/misses.
 
-    let mut db = Db::open(root)?;
-    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
-    let evs = events.clone();
-
-    let _h = db.subscribe_prefix(b"k".to_vec(), move |ev: &Event| {
-        evs.lock().unwrap().push(ev.clone());
-    });
-
-    db.put(b"k1", b"v1")?;
-    db.del(b"k1")?;
-
-    assert_eq!(events.lock().unwrap().len(), 2);
-    Ok(())
-}
-```
-
-Notes:
-- In bucket chains, the newest copy is the last encountered (tail). Db::get and scans choose the last match to avoid stale reads if earlier pages were updated for other keys.
-
+---
 
 ## 6) Rust API: Pager (low-level)
 
-For low-level tooling/testing (bypasses the KV layer). Use with care.
+For tooling/testing (bypasses the KV layer). Use with care.
 
-- `Pager::open(root) -> Pager` (from env)
-- `Pager::open_with_config(root, &cfg) -> Pager` (explicit conf)
-- `allocate_pages(n) -> start_id`
-- `allocate_one_page() -> page_id` (prefers reusing from free-list)
-- `ensure_allocated(page_id)` — ensure segment exists and length covers the page
-- `write_page_raw(page_id, &buf)` — writes page without WAL (used by replay)
-- `commit_page(page_id, &mut buf)` — writes via WAL + fsync (commit sequence above)
-- `read_page(page_id, &mut buf)`
-
-Example:
-
-```rust
-use anyhow::Result;
-use QuiverDB::pager::Pager;
-use QuiverDB::page_rh::{rh_page_init, rh_page_update_crc};
-
-fn commit_example(root: &std::path::Path) -> Result<()> {
-    let mut pager = Pager::open(root)?;
-    let pid = pager.allocate_one_page()?;
-    let ps = pager.meta.page_size as usize;
-
-    let mut page = vec![0u8; ps];
-    rh_page_init(&mut page, pid)?;           // format as KV_RH
-    rh_page_update_crc(&mut page)?;
-    pager.commit_page(pid, &mut page)?;      // WAL + data write
-    Ok(())
-}
-```
+- Pager::open(root) / Pager::open_with_config(root, &cfg)
+- allocate_pages(n) -> start_id
+- allocate_one_page() -> page_id (reuses from free-list when possible)
+- ensure_allocated(page_id) — ensure underlying segment exists and covers the page
+- write_page_raw(page_id, &buf) — writes page without WAL (used by replay/restore)
+- commit_page(page_id, &mut buf) — WAL + fsync (commit sequence above)
+- read_page(page_id, &mut buf)
 
 Page cache:
-- Enabled by config (or env) with `page_cache_pages > 0`.
+- Enabled by config/env; page_cache_pages > 0.
 - Metrics report hits/misses.
 
+---
 
 ## 7) Directory and free-list
 
 Directory:
-- `Directory::create(root, buckets)` — creates the directory file with heads=NO_PAGE and header CRC.
-- `Directory::open(root)` — validates magic/version and CRC.
-- `head(bucket) -> page_id` and updates via `set_head(bucket, page_id)` are atomic (tmp+rename). Header stores CRC (computed over `[version u32][buckets u32] + heads bytes`).
+- Directory::create(root, buckets) — creates the dir file with heads=NO_PAGE and header CRC.
+- Directory::open(root) — validates magic/version and CRC.
+- head(bucket) -> page_id and set_head(bucket, page_id) — atomic (tmp+rename), CRC updated.
 
 Free-list:
-- File `<root>/free` with magic/version and appended `u64` page IDs.
-- `FreeList::open`, `push(page_id)`, `pop() -> Option<u64>`, `count()`.
-- `count()` is computed from file length; header `count` is best-effort.
+- File <root>/free with magic/version and appended u64 page IDs.
+- FreeList::open, push(page_id), pop() -> Option<u64>, count().
+- count() derived from file length; header count is best-effort.
 
+---
 
 ## 8) WAL (advanced)
 
-Most users should not use WAL directly (Db/Pager handle it). Advanced APIs:
-- `wal::Wal::open_for_append(root)`
-- `wal::Wal::append_page_image(lsn, page_id, payload)`
-- `wal::Wal::fsync()`, `wal::Wal::maybe_truncate()`
-- `wal_replay_if_any(root)` — writer-only startup recovery
+Most users should not use WAL directly. Advanced APIs:
+- wal::Wal::open_for_append(root)
+- wal::Wal::append_page_image(lsn, page_id, payload)
+- wal::Wal::fsync()
+- wal::Wal::maybe_truncate()
+- wal_replay_if_any(root) — writer-only startup recovery
 
-CDC tooling (see docs/cdc.md for full guide):
-- `wal-tail` prints JSONL frames (type/lsn/page_id/len/crc32).
-- `wal-ship` emits the raw binary stream (WAL header + records); handles mid-stream header/truncate.
-  - v1.1: `--sink=tcp://host:port` and `--since-lsn N` (filter frames with lsn > N).
-- `wal-apply` consumes a WAL stream and applies page images idempotently (LSN-gated for v2).
-- `cdc record` stores a slice of the wire-format WAL to a file with LSN filters.
-- `cdc replay` replays from file (or stdin) with optional LSN filters.
-- `cdc last-lsn` prints follower’s last LSN for resume.
+CDC tooling (see docs/cdc.md):
+- wal-tail — JSONL frames (type/lsn/page_id/len/crc32)
+- wal-ship — wire stream (header + frames), TCP/file/stdout sinks, compression (gzip/zstd), since-lsn, batching
+- wal-apply — idempotent apply with LSN-gating
+- record/replay — deterministic ranges by LSN
+- last-lsn — follower checkpoint helper
 
+Wire format (v1):
+- Header (16): "P1WAL001" + reserved u32 + reserved u32
+- Record (28): [type u8][flags u8][reserved u16][lsn u64][page_id u64][len u32][crc32 u32]
+- Payload: full page image (PAGE_IMAGE), empty for TRUNCATE in streaming ship
+- Partial tails tolerated; unknown record types ignored
+
+---
 
 ## 9) Environment variables
 
-- `P1_WAL_COALESCE_MS=` integer (default 3) — WAL fsync coalescing delay (ms).
-- `P1_DATA_FSYNC=0|1` (default 1) — fsync data segments per commit:
-  - When `0`: rely solely on WAL durability; WAL is not truncated at commit and will truncate during replay.
-- `P1_PAGE_CACHE_PAGES=N` — number of pages in the read cache (0 disables).
-- `P1_OVF_THRESHOLD_BYTES=N` — value size threshold for overflow (default: page_size/4).
-- `P1_RH_COMPACT_DEAD_FRAC`, `P1_RH_COMPACT_MIN_BYTES` — RH auto-compaction heuristics.
-- `P1_DB_GET_OUT=path` — raw value output file for `dbget`.
+Core:
+- P1_WAL_COALESCE_MS = integer (default 3) — WAL fsync coalescing (ms)
+- P1_DATA_FSYNC = 0|1 (default 1) — fsync data segments per commit
+  - When 0: WAL is not truncated at commit; truncated on replay.
+- P1_PAGE_CACHE_PAGES = N — read cache size (0 disables)
+- P1_OVF_THRESHOLD_BYTES = N — overflow threshold (default: page_size/4)
 
-Note: Using `Db::open_with_config`/`Db::open_ro_with_config` lets you override env-driven defaults.
+RH compaction heuristics:
+- P1_RH_COMPACT_DEAD_FRAC, P1_RH_COMPACT_MIN_BYTES
 
+CDC (ship/apply):
+- P1_SHIP_FLUSH_EVERY, P1_SHIP_FLUSH_BYTES
+- P1_SHIP_SINCE_INCLUSIVE = 1|true|yes|on
+- P1_SHIP_COMPRESS = none|gzip|zstd
+- P1_APPLY_DECOMPRESS = none|gzip|zstd
+
+CLI helper:
+- P1_DB_GET_OUT = path — write raw value to a file in dbget
+
+---
 
 ## 10) Error handling
 
-- APIs return `anyhow::Result`; errors include I/O and logical validation failures (CRC mismatch, invalid magic).
-- WAL replay skips partial frames or CRC mismatches at the tail (treated as normal EOF).
-- `check --strict` exits with error on directory failure, CRC/IO issues, or overflow orphans.
+- APIs return anyhow::Result.
+- WAL replay skips partial frames and treats CRC mismatches at the tail as normal EOF.
+- check --strict exits with error on directory failure, CRC/IO issues, or overflow orphans.
 
+---
 
 ## 11) CLI ↔ API mapping
 
-- Admin/low-level:
-  - `init` (init_db), `status` (meta/dir/free summary), `alloc/read/write` (Pager)
-  - `free-status/free-pop/free-push` (FreeList)
-  - RH page ops: `pagefmt-rh`, `rh-put`, `rh-get`, `rh-list`, `rh-del`, `rh-compact`
-- High-level DB:
-  - `dbinit` (Directory::create)
-  - `dbput/dbget/dbdel/dbstats` (Db)
-  - v1.1: `dbscan [--prefix ...] [--json]` (Db::scan_all/scan_prefix)
-- Integrity/maintenance:
-  - `check [--strict] [--json]`, `repair`
-- Metrics:
-  - `metrics [--json]`, `metrics-reset`
-- CDC:
-  - `wal-tail [--follow]`
-  - `wal-ship [--follow] [--since-lsn N] [--sink=tcp://host:port]`
-  - `wal-apply --path ./follower` (reads from stdin)
-  - `cdc last-lsn --path`
-  - `cdc record --path --out file [--from-lsn X] [--to-lsn Y]`
-  - `cdc replay --path [--input file] [--from-lsn X] [--to-lsn Y]`
+Admin/low-level:
+- init (init_db), status (meta/dir/free summary), alloc/read/write (Pager)
+- free-status/free-pop/free-push (FreeList)
+- RH ops: pagefmt-rh, rh-put, rh-get, rh-list, rh-del, rh-compact
 
+High-level DB:
+- dbinit (Directory::create)
+- dbput/dbget/dbdel/dbstats (Db)
+- dbscan [--prefix ...] [--json] (Db::scan_all/scan_prefix)
+
+Snapshots/Backup:
+- backup --path ./db --out ./backup [--since-lsn N]
+- restore --path ./dst --from ./backup [--verify]
+  - verify runs strict check after restore
+
+Integrity/maintenance:
+- check [--strict] [--json], repair
+- metrics [--json], metrics-reset
+
+CDC:
+- wal-tail [--follow]
+- wal-ship [--follow] [--since-lsn N] [--sink=tcp://host:port|file://path]
+- wal-apply --path ./follower (reads stdin)
+- cdc last-lsn --path
+- cdc record --path --out file [--from-lsn X] [--to-lsn Y]
+- cdc replay --path [--input file] [--from-lsn X] [--to-lsn Y]
+
+---
 
 ## 12) Platform notes
 
-- Windows: fsync of directory entries after `rename` is best-effort. On Unix, parent directory fsync is performed.
+- Windows: fsync of directory entries after rename is best-effort. On Unix, parent directory fsync is performed.
 - Endianness: all integers on disk are little-endian.
+- Locks: fs2 advisory locks, file <root>/LOCK.
 
+---
 
 ## 13) On-disk formats (summary)
 
-Meta (v3) — `<root>/meta`:
-- Magic: `P1DBMETA`
-- Fields (LE): `version u32=3`, `page_size u32`, `flags u32`, `next_page_id u64`, `hash_kind u32`, `last_lsn u64`, `clean_shutdown u8`
-- Written via temp file + rename; directory fsync (best-effort on Windows).
+Meta (v3) — <root>/meta:
+- Magic: P1DBMETA
+- Fields (LE): version u32=3, page_size u32, flags u32, next_page_id u64, hash_kind u32, last_lsn u64, clean_shutdown u8
+- Written via temp file + rename; parent dir fsync (best-effort on Windows)
 
-Page (v2) — size = `page_size` bytes:
+Page (v2) — size = page_size:
 - 64-byte header:
-  - `MAGIC4="P1PG"`, `version u16=2`, `type u16` (KV_RH=2 | OVERFLOW=3), `pad u32`
-  - `page_id u64`, `data_start u16`, `table_slots u16`, `used_slots u16`, `flags u16`
-  - `next_page_id u64`, `lsn u64`, `seed u64`, `crc32 u32`
-- CRC is computed over the whole page with the CRC field zeroed.
+  - MAGIC4="P1PG", version u16=2, type u16 (KV_RH=2 | OVERFLOW=3), pad u32
+  - page_id u64, data_start u16, table_slots u16, used_slots u16, flags u16
+  - next_page_id u64, lsn u64, seed u64, crc32 u32
+- CRC computed over the whole page with the CRC field zeroed
 
 KV_RH (2):
-- Records in data area: `[klen u16][vlen u16][key bytes][value bytes]`
-- Slot table at the end: array of `[off u16][fp u8][dist u8]` (Robin Hood probing)
+- Records: [klen u16][vlen u16][key][value]
+- Slot table at the end: [off u16][fp u8][dist u8] (Robin Hood probing)
 
 OVERFLOW (3):
-- Stores chunks of large values in a chain (`next_page_id`).
-- KV value stores an 18-byte placeholder: `[0xFF][0][total_len u64][head_pid u64]`
+- Data chunk length in data_start (u16), chains via next_page_id
+- KV entry stores an 18-byte placeholder: [0xFF][0][total_len u64][head_pid u64]
 
-WAL (v1) — `<root>/wal-000001.log`:
-- Header (16): `P1WAL001` + reserved u32 + reserved u32
-- Record header (28):
-  - `type u8` (1=PAGE_IMAGE, 2=TRUNCATE (streaming))
-  - `flags u8`, `reserved u16`, `lsn u64`, `page_id u64`, `len u32`, `crc32 u32`
-- Payload:
-  - PAGE_IMAGE: full page image (`page_size` bytes); TRUNCATE: empty
-- Replay rules:
-  - Verify CRC, stop on partial tail, ignore unknown types, LSN-gate for v2 pages, truncate to header after success
+WAL (v1) — <root>/wal-000001.log:
+- Header (16): P1WAL001 + reserved u32 + reserved u32
+- Record header (28): type u8, flags u8, reserved u16, lsn u64, page_id u64, len u32, crc32 u32
+- Payload: full page image (PAGE_IMAGE). TRUNCATE (streaming) has empty payload.
+- Replay rules: CRC verify, stop on partial tail, ignore unknown types, LSN-gate for v2 pages, truncate to header after success.
 
+---
 
 ## 14) Practical examples
 
@@ -362,20 +396,49 @@ quiverdb dbscan --path ./db --prefix k --json
 LSN=$(quiverdb cdc last-lsn --path ./follower)
 quiverdb wal-ship --path ./leader --since-lsn $LSN --sink=tcp://127.0.0.1:9999 --follow
 
-# Deterministic record/replay
+# Record/replay deterministic slice
 quiverdb cdc record --path ./leader --out ./slice.bin --from-lsn 100 --to-lsn 200
 quiverdb cdc replay --path ./follower --input ./slice.bin --from-lsn 100 --to-lsn 200
 ```
 
-Metrics and integrity:
+Snapshots/Backup:
 
 ```bash
-quiverdb metrics --json
-quiverdb check --path ./db --strict --json
-quiverdb repair --path ./db
+# Full backup at snapshot
+quiverdb backup --path ./db --out ./backup
+
+# Incremental backup
+quiverdb backup --path ./db --out ./backup_incr --since-lsn 12345
+
+# Restore (optional verify)
+quiverdb restore --path ./db_restored --from ./backup --verify
 ```
 
+Rust (snapshot isolation):
+
+```rust
+use anyhow::Result;
+use QuiverDB::{Db, Directory, init_db};
+
+fn main() -> Result<()> {
+    let root = std::path::Path::new("./db");
+    if !root.exists() {
+        init_db(root, 4096)?;
+        Directory::create(root, 128)?;
+    }
+
+    let mut db = Db::open(root)?;
+    db.put(b"k", b"v0")?;
+
+    let mut s = db.snapshot_begin()?;
+    db.put(b"k", b"v1")?;
+
+    assert_eq!(s.get(b"k")?.as_deref(), Some(b"v0".as_ref()));
+    db.snapshot_end(&mut s)?;
+    Ok(())
+}
+```
 
 ---
 
-For replication details, wire formats, and follower apply rules, see docs/cdc.md.
+This API guide summarizes v1.2 Phase 1: in-process snapshot isolation and backup/restore without changing frozen on-disk formats, plus the existing WAL/CDC, directory, and KV APIs.

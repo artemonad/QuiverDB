@@ -11,7 +11,6 @@
 
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

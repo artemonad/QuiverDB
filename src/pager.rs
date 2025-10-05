@@ -20,9 +20,12 @@ use crate::wal::Wal;
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+// NEW: снапшоты (freeze интеграция)
+use std::sync::{Arc, Mutex};
+use crate::snapshots::SnapshotManager;
 
 /// New: centralized configuration
 use crate::config::QuiverConfig;
@@ -38,6 +41,8 @@ pub struct Pager {
     // Гарантировать ли fsync на сегментах данных при каждой записи.
     // По умолчанию true. Если false — rely-on-WAL (WAL не будет truncate в commit_page).
     data_fsync: bool,
+    // NEW: in-process SnapshotManager (shared с Db; используется для freeze перед перезаписью)
+    pub(crate) snap_mgr: Option<Arc<Mutex<SnapshotManager>>>,
 }
 
 impl Pager {
@@ -62,7 +67,13 @@ impl Pager {
             meta,
             cache: RefCell::new(cache),
             data_fsync: cfg.data_fsync,
+            snap_mgr: None, // присвоим из Db при открытии writer'а
         })
+    }
+
+    /// NEW: установить менеджер снапшотов (вызывается Db::open_with_config для writer'а).
+    pub fn set_snapshot_manager(&mut self, mgr: Option<Arc<Mutex<SnapshotManager>>>) {
+        self.snap_mgr = mgr;
     }
 
     fn pages_per_seg(&self) -> u64 {
@@ -229,13 +240,14 @@ impl Pager {
 
     /// Запись через WAL с LSN:
     /// Порядок:
-    /// 1) Присваиваем новый LSN (meta.last_lsn + 1).
-    /// 2) Если это v2-страница — вписываем LSN в заголовок (RH/Overflow).
-    /// 3) Обновляем CRC (v2).
-    /// 4) append + fsync WAL (с коалессированием).
-    /// 5) Пишем страницу в сегмент.
-    /// 6) Обновляем meta.last_lsn и (опционально) ротация WAL.
-    /// 7) Обновляем кэш.
+    /// 1) Если есть активные снапшоты — заморозить текущую страницу (COW по LSN).
+    /// 2) Присваиваем новый LSN (meta.last_lsn + 1).
+    /// 3) Если это v2-страница — вписываем LSN в заголовок (RH/Overflow).
+    /// 4) Обновляем CRC (v2).
+    /// 5) append + fsync WAL (с коалессированием).
+    /// 6) Пишем страницу в сегмент.
+    /// 7) Обновляем meta.last_lsn и (опционально) ротация WAL.
+    /// 8) Обновляем кэш.
     pub fn commit_page(&mut self, page_id: u64, buf: &mut [u8]) -> Result<()> {
         if buf.len() != self.meta.page_size as usize {
             return Err(anyhow!(
@@ -245,7 +257,35 @@ impl Pager {
             ));
         }
 
-        // Новый LSN для записи
+        // [1] COW: если есть активные снапшоты, заморозим текущую страницу (её "старую" версию),
+        // но только если страница уже существует и это v2-страница с корректным LSN.
+        if let Some(mgr) = &self.snap_mgr {
+            if page_id < self.meta.next_page_id {
+                let mut cur = vec![0u8; self.meta.page_size as usize];
+                if self.read_page(page_id, &mut cur).is_ok() {
+                    if &cur[..4] == PAGE_MAGIC {
+                        let ver = LittleEndian::read_u16(&cur[4..6]);
+                        if ver >= 2 {
+                            // Попробуем распарсить LSN из RH/OVF
+                            let cur_lsn_opt = if rh_header_read(&cur).is_ok() {
+                                rh_header_read(&cur).ok().map(|h| h.lsn)
+                            } else if ovf_header_read(&cur).is_ok() {
+                                ovf_header_read(&cur).ok().map(|h| h.lsn)
+                            } else {
+                                None
+                            };
+                            if let Some(cur_lsn) = cur_lsn_opt {
+                                // freeze_if_needed для всех активных снапшотов (по их правилам)
+                                let mut g = mgr.lock().unwrap();
+                                let _ = g.freeze_if_needed(page_id, cur_lsn, &cur);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // [2] Новый LSN для записи
         let lsn = self.meta.last_lsn.wrapping_add(1);
 
         // Если это наша страница — для v2 впишем LSN в заголовок, затем посчитаем CRC.
@@ -269,33 +309,31 @@ impl Pager {
                         rh_page_update_crc(buf)?;
                     }
                     _ => {
-                        // неизвестный тип v2 — CRC посчитаем на всякий (если нужен),
-                        // но LSN не знаем куда писать — пропустим.
-                        // Безопасно: apply/replay будет ориентироваться на CRC/LSN только если распознает тип.
+                        // неизвестный тип v2 — CRC посчитаем на всякий
                         rh_page_update_crc(buf)?;
                     }
                 }
             }
         }
 
-        // 1) Append WAL (содержит lsn) + fsync
+        // [5] Append WAL (содержит lsn) + fsync
         let mut wal = Wal::open_for_append(&self.root)?;
         wal.append_page_image(lsn, page_id, buf)?;
         wal.fsync()?; // group-commit коалессирует fsync внутри
 
-        // 2) Пишем страницу
+        // [6] Пишем страницу
         self.write_page_raw(page_id, buf)?;
 
-        // 3) WAL-rotate (truncate) только если данные fsync'нуты.
+        // [7] WAL-rotate (truncate) только если данные fsync'нуты.
         if self.data_fsync {
             wal.maybe_truncate()?; // если WAL разросся, очистим до заголовка
         }
 
-        // 4) Зафиксируем last_lsn в meta (best-effort).
+        // [7b] Зафиксируем last_lsn в meta (best-effort).
         self.meta.last_lsn = lsn;
         write_meta_overwrite(&self.root, &self.meta)?;
 
-        // 5) Обновим кэш
+        // [8] Обновим кэш
         if let Some(cache) = self.cache.borrow_mut().as_mut() {
             cache.put(page_id, buf);
         }
@@ -325,7 +363,6 @@ impl Pager {
                     record_cache_hit();
                     return Ok(());
                 } else {
-                    // Мы проверили кэш и не нашли — это miss.
                     record_cache_miss();
                 }
             }

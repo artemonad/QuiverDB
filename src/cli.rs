@@ -1,5 +1,3 @@
-// src/cli.rs
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -74,6 +72,9 @@ pub enum Cmd {
     Status {
         #[arg(long)]
         path: PathBuf,
+        /// JSON output (shortcut for P1_STATUS_JSON=1)
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Alloc {
         #[arg(long)]
@@ -194,6 +195,9 @@ pub enum Cmd {
     DbStats {
         #[arg(long)]
         path: PathBuf,
+        /// JSON output (shortcut for P1_DBSTATS_JSON=1)
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     // Новая команда: скан ключей (вся БД или по префиксу), текст/JSON
     DbScan {
@@ -215,7 +219,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         follow: bool,
     },
-    // Расширенная версия: поддержка --since-lsn и --sink (tcp://host:port)
+    // Расширенная версия: поддержка --since-lsn и --sink (tcp://host:port | file://path)
     WalShip {
         #[arg(long)]
         path: PathBuf,
@@ -225,14 +229,30 @@ pub enum Cmd {
         /// Ship only records with lsn > N (resume by LSN)
         #[arg(long)]
         since_lsn: Option<u64>,
-        /// Output sink: tcp://host:port (default: stdout)
+        /// Output sink: tcp://host:port | file://path (default: stdout)
         #[arg(long)]
         sink: Option<String>,
+        /// Flush every N frames (shortcut for P1_SHIP_FLUSH_EVERY)
+        #[arg(long)]
+        flush_every: Option<usize>,
+        /// Flush after >= B written bytes (shortcut for P1_SHIP_FLUSH_BYTES)
+        #[arg(long)]
+        flush_bytes: Option<usize>,
+        /// Treat --since-lsn as inclusive (lsn >= N). Default is exclusive (> N).
+        /// Shortcut for P1_SHIP_SINCE_INCLUSIVE=1.
+        #[arg(long, default_value_t = false)]
+        since_inclusive: bool,
+        /// Compress stream: none|gzip|zstd (shortcut for P1_SHIP_COMPRESS)
+        #[arg(long)]
+        compress: Option<String>,
     },
     WalApply {
         /// Target DB path to apply incoming WAL stream from stdin
         #[arg(long)]
         path: PathBuf,
+        /// Decompress input: none|gzip|zstd (shortcut for P1_APPLY_DECOMPRESS)
+        #[arg(long)]
+        decompress: Option<String>,
     },
     /// CDC helper: print meta.last_lsn for resume
     CdcLastLsn {
@@ -267,11 +287,37 @@ pub enum Cmd {
         to_lsn: Option<u64>,
     },
 
+    // Snapshot/Backup (Phase 1 — one-shot backup with implicit snapshot)
+    Backup {
+        /// DB path
+        #[arg(long)]
+        path: PathBuf,
+        /// Output directory (will be created)
+        #[arg(long)]
+        out: PathBuf,
+        /// Incremental backup: include only pages with lsn in (since_lsn, snapshot_lsn]
+        #[arg(long)]
+        since_lsn: Option<u64>,
+    },
+
+    // Restore (Phase 1) — новый CLI
+    Restore {
+        /// Destination DB path (will be created if missing)
+        #[arg(long)]
+        path: PathBuf,
+        /// Backup directory (produced by `quiverdb backup`)
+        #[arg(long)]
+        from: PathBuf,
+        /// Verify restored DB with strict check
+        #[arg(long, default_value_t = false)]
+        verify: bool,
+    },
+
     // v0.8: check (CRC scan, overflow reachability) + strict/json режимы
     Check {
         #[arg(long)]
         path: PathBuf,
-        /// Strict mode: non-zero exit if problems detected (dir error, CRC/IO errors, orphan overflow)
+        /// Strict mode: non-zero exit if problems detected (dir error, CRC/IO issues, orphan overflow)
         #[arg(long, default_value_t = false)]
         strict: bool,
         /// JSON output: a single JSON object with summary
@@ -285,7 +331,7 @@ pub enum Cmd {
         path: PathBuf,
     },
 
-    // v0.9: metrics (snapshot / reset) + JSON
+    // v0.9: metrics (snapshot/reset) + JSON
     Metrics {
         /// JSON output: one-line JSON with metrics snapshot
         #[arg(long, default_value_t = false)]
@@ -299,7 +345,12 @@ pub fn run() -> Result<()> {
     match cli.cmd {
         // ------- common low-level -------
         Cmd::Init { path, page_size } => admin::cmd_init(path, page_size),
-        Cmd::Status { path } => admin::cmd_status(path),
+        Cmd::Status { path, json } => {
+            if json {
+                std::env::set_var("P1_STATUS_JSON", "1");
+            }
+            admin::cmd_status(path)
+        }
         Cmd::Alloc { path, count } => admin::cmd_alloc(path, count),
         Cmd::Write { path, page_id, fill } => admin::cmd_write(path, page_id, fill),
         Cmd::Read { path, page_id, len } => admin::cmd_read(path, page_id, len),
@@ -322,19 +373,74 @@ pub fn run() -> Result<()> {
         Cmd::DbPut { path, key, value } => db_cli::cmd_db_put(path, key, value),
         Cmd::DbGet { path, key } => db_cli::cmd_db_get(path, key),
         Cmd::DbDel { path, key } => db_cli::cmd_db_del(path, key),
-        Cmd::DbStats { path } => db_cli::cmd_db_stats(path),
+        Cmd::DbStats { path, json } => {
+            if json {
+                std::env::set_var("P1_DBSTATS_JSON", "1");
+            }
+            db_cli::cmd_db_stats(path)
+        }
         Cmd::DbScan { path, prefix, json } => db_cli::cmd_db_scan(path, prefix, json),
 
         // ------- CDC -------
         Cmd::WalTail { path, follow } => cdc::cmd_wal_tail(path, follow),
-        Cmd::WalShip { path, follow, since_lsn, sink } =>
-            cdc::cmd_wal_ship_ext(path, follow, since_lsn, sink),
-        Cmd::WalApply { path } => cdc::cmd_wal_apply(path),
+        Cmd::WalShip {
+            path,
+            follow,
+            since_lsn,
+            sink,
+            flush_every,
+            flush_bytes,
+            since_inclusive,
+            compress,
+        } => {
+            // ENV для ship‑подсистемы (batching, inclusive bound, compression)
+            if let Some(n) = flush_every {
+                std::env::set_var("P1_SHIP_FLUSH_EVERY", n.to_string());
+            }
+            if let Some(b) = flush_bytes {
+                std::env::set_var("P1_SHIP_FLUSH_BYTES", b.to_string());
+            }
+            if since_inclusive {
+                std::env::set_var("P1_SHIP_SINCE_INCLUSIVE", "1");
+            }
+            if let Some(cmp) = compress {
+                std::env::set_var("P1_SHIP_COMPRESS", cmp.to_ascii_lowercase());
+            }
+            cdc::cmd_wal_ship_ext(path, follow, since_lsn, sink)
+        }
+        Cmd::WalApply { path, decompress } => {
+            if let Some(dc) = decompress {
+                std::env::set_var("P1_APPLY_DECOMPRESS", dc.to_ascii_lowercase());
+            }
+            cdc::cmd_wal_apply(path)
+        }
         Cmd::CdcLastLsn { path } => cdc::cmd_cdc_last_lsn(path),
         Cmd::CdcRecord { path, out, from_lsn, to_lsn } =>
             cdc::cmd_cdc_record(path, out, from_lsn, to_lsn),
         Cmd::CdcReplay { path, input, from_lsn, to_lsn } =>
             cdc::cmd_cdc_replay(path, input, from_lsn, to_lsn),
+
+        // ------- Snapshot/Backup (Phase 1: one-shot) -------
+        Cmd::Backup { path, out, since_lsn } => {
+            use crate::Db;
+            let mut db = Db::open(&path)?;
+            let mut snap = db.snapshot_begin()?;
+            crate::backup::backup_to_dir(&db, &snap, &out, since_lsn)?;
+            db.snapshot_end(&mut snap)?;
+            println!("Backup completed at {}", out.display());
+            Ok(())
+        }
+
+        // ------- Restore (Phase 1) -------
+        Cmd::Restore { path, from, verify } => {
+            crate::backup::restore_from_dir(&path, &from)?;
+            if verify {
+                // strict + human output (json=false)
+                admin::cmd_check_strict_json(path.clone(), true, false)?;
+            }
+            println!("Restore completed to {}", path.display());
+            Ok(())
+        }
 
         // ------- v0.8: check + strict/json -------
         Cmd::Check { path, strict, json } => admin::cmd_check_strict_json(path, strict, json),

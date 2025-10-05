@@ -277,6 +277,13 @@ pub fn ovf_free_chain(pager: &Pager, head_page_id: u64) -> Result<usize> {
         let h = ovf_header_read(&buf)?;
         let next = h.next_page_id;
 
+        // NEW: если есть активные снапшоты, заморозим текущую overflow‑страницу
+        if let Some(mgr) = &pager.snap_mgr {
+            let mut g = mgr.lock().unwrap();
+            // freeze_if_needed сам проверяет, нужен ли freeze (snapshot_lsn >= h.lsn)
+            g.freeze_if_needed(pid, h.lsn, &buf)?;
+        }
+
         pager.free_page(pid)?;
         freed += 1;
         pid = next;

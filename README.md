@@ -4,120 +4,132 @@
 [![Docs](https://img.shields.io/badge/docs-API%20%2F%20Format%20%2F%20CDC-informational)](docs/)
 [![GitHub stars](https://img.shields.io/github/stars/artemonad/QuiverDB?style=social)](https://github.com/artemonad/QuiverDB/stargazers)
 
-Embedded Rust key–value database with in-page Robin Hood indexing, write-ahead log (WAL), directory of bucket heads, and overflow chains for large values.
+Embedded Rust key–value database with in-page Robin Hood indexing, WAL, a CRC-validated directory of bucket heads, and overflow chains for large values.
 
-Status: v1.1.0 (formats frozen: meta v3, page v2, WAL v1)
-
-- Frozen on-disk formats (no migrations).
-- Crash safety via WAL (CRC, LSN-gating, partial-tail tolerant).
-- Single writer, multiple readers (shared lock; readers never mutate).
-- Integrity tools (check/repair), metrics, CDC utilities.
-- New in 1.1:
-  - Config builder (QuiverConfig/DbBuilder), explicit open_with_config.
-  - In-process subscriptions (live events on put/del).
-  - Scan APIs (scan_all / scan_prefix) + CLI dbscan.
-  - CDC extras: wal-ship sink=tcp://…, --since-lsn, deterministic record/replay, last-lsn helper.
-
-Links:
-- API guide: docs/api.md
-- CDC guide: docs/cdc.md
-- On-disk format: docs/format.md
+Status: v1.2 (Phase 1) — Snapshot Isolation and Backup/Restore, with frozen on-disk formats:
+- meta v3, page v2, WAL v1 (no migrations, forward/backward compatible)
+- Phase 1 snapshots are in-process (not persisted); backup/restore does not include dedup yet (planned in a later phase)
 
 
 ## Highlights
 
-- Page v2 (64-byte header): MAGIC, type, per-page LSN, whole-page CRC.
-- In-page Robin Hood index: insert/update/delete/list/compact/rebuild.
-- WAL v1: full page images, CRC, monotonic LSN, group-commit (fsync coalescing).
-- CDC:
-  - wal-tail — JSONL view for observability.
-  - wal-ship — binary wire (handles mid-stream header/rotate), now with --since-lsn and tcp:// sink.
-  - wal-apply — idempotent apply with LSN-gating.
-  - cdc record/replay — deterministic slices with LSN filters; cdc last-lsn for resume.
-- Directory: per-bucket heads; atomic tmp+rename with header CRC.
-- Overflow pages: chains for large values; free-list to reuse pages; orphan sweep/repair.
-- Read-only readers: shared lock, no WAL replay, no meta changes.
-- Config builder: override env in code; page cache toggle and size.
-- Subscriptions: subscribe_prefix for live events in-process.
-- Integrity: check --strict/--json; repair frees orphan overflow chains.
+- Frozen on-disk formats
+  - Meta v3, Page v2 (64-byte header, per-page LSN, whole-page CRC), WAL v1
+  - No format migrations across 1.x
+
+- Crash safety with WAL
+  - Full page images, CRC, monotonic LSN
+  - Replay tolerates partial tails and ignores unknown record types (forward-compatible)
+  - LSN-gating: v2 pages (KV_RH/OVERFLOW) only apply when wal_lsn > page_lsn
+
+- Single writer, multiple readers
+  - Writer: exclusive lock; replays WAL if needed; sets clean_shutdown=false on open → true on drop
+  - Readers: shared lock; never replay WAL; do not modify meta; safe concurrent reads
+
+- KV with in-page Robin Hood index
+  - Insert/update/delete/list/compact and rebuild at page level
+  - Large values stored in overflow chains referenced by a compact placeholder
+
+- Directory and free-list
+  - Directory heads (per bucket) with CRC and atomic tmp+rename updates
+  - Free-list file for page reuse
+
+- CDC (Change Data Capture)
+  - wal-ship (stdout/TCP/file, since-lsn), wal-apply (idempotent, LSN-gating), wal-tail (JSONL)
+  - Deterministic record/replay with LSN filters
+  - Optional compression (gzip/zstd) for the wire stream
+
+- Snapshot Isolation (Phase 1) + Backup/Restore
+  - In-process snapshots “as of LSN” with page-level copy-on-write
+  - Full and incremental backup (since_lsn), robust restore, CRC-checked archives
+  - Phase 1 does not include deduplication (planned later)
+
+- Developer comfort
+  - Config builder (QuiverConfig/DbBuilder) + env compatibility
+  - In-process subscriptions: subscribe_prefix(prefix, callback)
+  - Scan APIs: scan_all(), scan_prefix(prefix)
+  - Metrics, check/repair, JSON modes in CLI
+  - Minimal C FFI (qdb_init_db/open_ro/get/put/del)
 
 
-## Install / Build
+## Contents
 
-- CLI (Release):
-```
-cargo build --release
-```
-Binary path: target/release/quiverdb
-
-- Library (Cargo.toml):
-```toml
-[dependencies]
-QuiverDB = { path = "./QuiverDB" }  # or your git path
-```
-
-Rust version: 2021 edition.
+- Quick start (CLI)
+- Quick start (Rust API)
+- Snapshot Isolation and Backup/Restore (Phase 1)
+- CDC overview
+- Configuration (env and builder)
+- CLI cheat sheet
+- On-disk formats (summary)
+- Platform notes
+- License
 
 
 ## Quick start (CLI)
 
-Initialize database + directory:
-```
-quiverdb init --path ./db --page-size 4096
+Initialize a new DB and directory:
+```bash
+quiverdb init   --path ./db --page-size 4096
 quiverdb dbinit --path ./db --page-size 4096 --buckets 128
 ```
 
-KV operations:
-```
-quiverdb dbput  --path ./db --key hello --value world
-quiverdb dbget  --path ./db --key hello
-quiverdb dbdel  --path ./db --key hello
+Basic KV:
+```bash
+quiverdb dbput --path ./db --key alpha --value 1
+quiverdb dbget --path ./db --key alpha
+quiverdb dbdel --path ./db --key alpha
 quiverdb dbstats --path ./db
 ```
 
 Scan (all / by prefix), optionally JSON:
-```
+```bash
 quiverdb dbscan --path ./db --json
 quiverdb dbscan --path ./db --prefix k --json
 ```
 
-Integrity + metrics:
-```
+Integrity and metrics:
+```bash
 quiverdb check --path ./db --strict --json
 quiverdb repair --path ./db
 quiverdb metrics --json
 quiverdb metrics-reset
 ```
 
-CDC (local pipe or TCP):
+Backup/Restore (Phase 1):
+```bash
+# Full backup
+quiverdb backup --path ./db --out ./backup
 
-- Pipe (local):
+# Incremental backup (pages with page_lsn in (since, snapshot])
+quiverdb backup --path ./db --out ./backup_incr --since-lsn 12345
+
+# Restore (optional strict verification after restore)
+quiverdb restore --path ./db_restored --from ./backup --verify
 ```
+
+CDC (local pipe, TCP, and deterministic slices):
+```bash
+# Local pipe
 quiverdb wal-ship --path ./leader --follow | quiverdb wal-apply --path ./follower
-```
 
-- TCP + resume by LSN:
-```
-# Get follower checkpoint
+# Resume by follower’s last LSN over TCP
 LSN=$(quiverdb cdc last-lsn --path ./follower)
-
-# Ship only frames with lsn > $LSN, to TCP sink
 quiverdb wal-ship --path ./leader --since-lsn $LSN --sink=tcp://127.0.0.1:9999 --follow
 # On follower:
 nc -l -p 9999 | quiverdb wal-apply --path ./follower
-```
 
-Deterministic record/replay (wire format):
-```
+# Deterministic record/replay
 quiverdb cdc record --path ./leader --out ./slice.bin --from-lsn 100 --to-lsn 200
 quiverdb cdc replay --path ./follower --input ./slice.bin --from-lsn 100 --to-lsn 200
 ```
 
+Tip:
+- Some commands also support JSON via flags (e.g., dbstats --json) or env toggles (see Configuration).
+
 
 ## Quick start (Rust API)
 
-Minimal put/get with explicit config (builder):
-
+Using the config builder and explicit open_with_config:
 ```rust
 use anyhow::Result;
 use QuiverDB::{Db, Directory, init_db};
@@ -130,7 +142,6 @@ fn main() -> Result<()> {
         Directory::create(root, 128)?;
     }
 
-    // Config: start from env, override desired fields
     let cfg = DbBuilder::new()
         .wal_coalesce_ms(0)
         .data_fsync(true)
@@ -154,8 +165,7 @@ fn main() -> Result<()> {
 }
 ```
 
-Subscriptions (in-process) and scans:
-
+Subscriptions and scans:
 ```rust
 use std::sync::{Arc, Mutex};
 use QuiverDB::{Db, Directory, init_db};
@@ -166,7 +176,8 @@ fn main() -> anyhow::Result<()> {
     if !root.exists() { init_db(root, 4096)?; Directory::create(root, 128)?; }
 
     let mut db = Db::open(root)?;
-    // Subscribe to changes for keys starting with "k"
+
+    // In-process subscription for keys starting with "k"
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
     let evs = events.clone();
     let _h = db.subscribe_prefix(b"k".to_vec(), move |ev: &Event| {
@@ -176,125 +187,160 @@ fn main() -> anyhow::Result<()> {
     db.put(b"k123", b"v1")?;
     db.del(b"k123")?;
 
-    // Scan by prefix (tail-wins semantics)
+    // Scans (tail-wins within a chain)
     let pairs = db.scan_prefix(b"k")?;
-    // pairs: Vec<(key, value)>
-
     Ok(())
 }
 ```
 
 
-## Concepts
+## Snapshot Isolation and Backup/Restore (Phase 1)
 
-- Single writer, multiple readers:
-  - Writer: exclusive lock; replays WAL if needed; sets clean_shutdown=false on open, true on drop.
-  - Reader: shared lock; no WAL replay; never mutates meta; drop does not run space maintenance.
-- Crash safety with WAL:
-  - All changes are page images appended to WAL (CRC + monotonic LSN).
-  - Writer replay is tolerant to partial tails, ignores unknown types, and applies v2 pages only when wal_lsn > page_lsn (LSN-gating).
-  - Clean shutdown enables fast start (truncate WAL to header).
-- Pages:
-  - v2 64-byte header (MAGIC, type KV_RH or OVERFLOW, LSN, CRC).
-  - KV_RH stores small values in-page; overflow chains store large values referenced from KV entries via a 18-byte placeholder.
-- Directory:
-  - Array of bucket heads; KV pages form chains (head → next → …).
-  - Updates are atomic via tmp+rename; header includes CRC.
-- Free-list:
-  - Reuse freed pages; best-effort count in header (truth is file length).
-- Tail-wins:
-  - If a key is duplicated along a bucket chain, the last entry (closer to tail) is authoritative (Db::get and scans honor this).
+- In-process snapshots capture a consistent view at a specific LSN (snapshot_lsn)
+  - SnapshotHandle::get/scan_* read “as of LSN”
+  - Page-level copy-on-write: before overwriting/freeing a v2 page whose LSN may be needed by a live snapshot, the current image is frozen into a sidecar store
+  - Readers choose live vs frozen per page; overflow chains are resolved per page the same way
+  - Rarely, a fallback scan reconstructs tail-wins when hot chain mutations occur after the snapshot
 
+- Backup/Restore built on top of snapshots
+  - Full: all page images as-of snapshot_lsn
+  - Incremental: only pages with page_lsn in (since_lsn, snapshot_lsn]
+  - Archive layout:
+    - pages.bin — concatenated frames: [page_id u64][page_lsn u64][page_len u32][crc32 u32] + payload(page_size)
+    - dir.bin — copy of the directory (if present)
+    - manifest.json — summary (snapshot_lsn, since_lsn, page_size, counters)
+  - Restore writes pages back (raw), installs dir.bin if present, sets last_lsn and clean_shutdown
 
-## Environment
-
-- P1_WAL_COALESCE_MS (default 3) — fsync coalescing for WAL group-commit (ms).
-- P1_DATA_FSYNC=0|1 (default 1) — fsync data segments on commit.
-  - When 0: durability relies on WAL; WAL is not truncated on commit (truncated by replay).
-- P1_PAGE_CACHE_PAGES=N — read cache size (0 disables).
-- P1_OVF_THRESHOLD_BYTES=N — overflow threshold (default page_size/4).
-- P1_RH_COMPACT_DEAD_FRAC, P1_RH_COMPACT_MIN_BYTES — RH auto-compaction heuristics.
-- P1_DB_GET_OUT=path — redirect dbget value to a file (raw bytes).
-
-Tip: Prefer explicit config via Db::open_with_config/Db::open_ro_with_config (builder overrides env).
+Notes:
+- Phase 1 snapshots are in-process (not persisted across restarts)
+- No deduplication in Phase 1 (planned later)
+- Freeze sidecar lives under <root>/.snapshots/<snapshot_id> (CRC-checked on read)
 
 
-## Crash safety (commit and replay)
+## CDC overview
 
-Commit sequence:
-1) LSN = meta.last_lsn + 1
-2) For v2, write LSN into page header and update page CRC
-3) Append WAL record, fsync WAL (group-commit)
-4) Write data page (fsync controlled by data_fsync)
-5) Maybe truncate WAL (only when data fsync is enabled)
-6) Update meta.last_lsn
-7) Update page cache (if enabled)
+- wal-ship
+  - Streams a binary WAL header + records to stdout/TCP/file
+  - since-lsn filter on the leader (default exclusive > N; an inclusive variant via env)
+  - Optional compression: gzip/zstd applied to the entire wire stream
 
-Replay (writer only; when clean_shutdown=false):
-- Read WAL, verify CRC; stop on partial tails.
-- Ignore unknown record types (forward-compatible).
-- Apply page images only if wal_lsn > page_lsn for v2 pages.
-- Truncate WAL back to header after success.
+- wal-apply
+  - Reads a WAL wire stream from stdin (optionally with decompression)
+  - Verifies CRC, tolerates partial tails, ignores unknown types, and applies v2 page images only when wal_lsn > page_lsn (idempotent)
+
+- wal-tail
+  - JSONL view of WAL frames for observability; prints “truncate” events on rotations
+
+- cdc record / replay
+  - Save a deterministic slice of the WAL wire stream to a file (LSN filters)
+  - Reapply it idempotently (optionally with additional LSN bounds)
+
+- last-lsn
+  - Prints meta.last_lsn — useful to resume shipping from followers
 
 
-## On-disk formats (frozen)
+## Configuration (env and builder)
 
-- Meta v3 (file meta):
-  - MAGIC “P1DBMETA”; fields: version u32=3, page_size u32, flags u32, next_page_id u64, hash_kind u32, last_lsn u64, clean_shutdown u8
-- Page v2 (size=page_size):
-  - 64-byte header:
-    - MAGIC “P1PG”, version=2, type (KV_RH=2 | OVERFLOW=3), pad, page_id u64,
-      data_start u16, table_slots u16, used_slots u16, flags u16,
-      next_page_id u64, lsn u64, seed u64, crc32 u32
-- WAL v1:
-  - Header (16): “P1WAL001” + reserved u32 + reserved u32
-  - Record (28): [type u8][flags u8][reserved u16][lsn u64][page_id u64][len u32][crc32 u32]
-  - Payload: full page image (PAGE_IMAGE) or empty (TRUNCATE for streaming ship)
+Builder (preferred inside code):
+- QuiverConfig/DbBuilder with:
+  - wal_coalesce_ms (group-commit fsync window; default 3 ms)
+  - data_fsync (fsync data segments per commit; default true)
+  - page_cache_pages (read cache size; default 0 = disabled)
+  - ovf_threshold_bytes (None = page_size/4)
 
-All integers are Little Endian. See docs/format.md for details.
+Environment variables (backward-compatible):
+- Core
+  - P1_WAL_COALESCE_MS
+  - P1_DATA_FSYNC=0|1
+  - P1_PAGE_CACHE_PAGES=N
+  - P1_OVF_THRESHOLD_BYTES=N
+- Robin Hood heuristics
+  - P1_RH_COMPACT_DEAD_FRAC, P1_RH_COMPACT_MIN_BYTES
+- CDC
+  - P1_SHIP_FLUSH_EVERY, P1_SHIP_FLUSH_BYTES
+  - P1_SHIP_SINCE_INCLUSIVE=1|true|yes|on
+  - P1_SHIP_COMPRESS=none|gzip|zstd
+  - P1_APPLY_DECOMPRESS=none|gzip|zstd
+- CLI helper
+  - P1_DB_GET_OUT=path (write dbget payload to a file)
+
+Builder takes precedence when you use open_with_config/open_ro_with_config; env remains supported.
 
 
 ## CLI cheat sheet
 
-Integrity/maintenance:
-- check [--strict] [--json]
-- repair
-- metrics [--json]
-- metrics-reset
+- High-level DB
+  - dbinit, dbput, dbget, dbdel, dbstats
+  - dbscan [--prefix ...] [--json]
+- Snapshots/Backup (Phase 1)
+  - backup --path ./db --out ./backup [--since-lsn N]
+  - restore --path ./db_restored --from ./backup [--verify]
+- CDC
+  - wal-tail [--follow]
+  - wal-ship [--follow] [--since-lsn N] [--sink=tcp://host:port|file://path]
+  - wal-apply --path ./follower (reads stdin)
+  - cdc last-lsn --path
+  - cdc record --path --out file [--from-lsn X] [--to-lsn Y]
+  - cdc replay --path [--input file] [--from-lsn X] [--to-lsn Y]
+- Integrity/Maintenance
+  - check [--strict] [--json], repair
+  - metrics [--json], metrics-reset
+- Admin/low-level
+  - init, status, alloc, read, write
+  - free-status, free-pop, free-push
+  - Robin Hood page ops: pagefmt-rh, rh-put, rh-get, rh-list, rh-del, rh-compact
 
-High-level DB:
-- dbinit
-- dbput / dbget / dbdel / dbstats
-- dbscan [--prefix ...] [--json]
 
-CDC:
-- wal-tail [--follow]
-- wal-ship [--follow] [--since-lsn N] [--sink=tcp://host:port]
-- wal-apply --path ./follower  (reads stdin)
-- cdc last-lsn --path
-- cdc record --path --out file [--from-lsn X] [--to-lsn Y]
-- cdc replay --path [--input file] [--from-lsn X] [--to-lsn Y]
+## On-disk formats (summary)
 
-Low-level/admin:
-- init, status, alloc, read, write
-- free-status / free-pop / free-push
-- pagefmt-rh / rh-put / rh-get / rh-list / rh-del / rh-compact
+- Meta (v3)
+  - MAGIC “P1DBMETA”
+  - version u32=3, page_size u32, flags u32, next_page_id u64, hash_kind u32, last_lsn u64, clean_shutdown u8
+  - Written via tmp+rename; parent dir fsync on Unix (best-effort on Windows)
+
+- Page (v2)
+  - 64-byte header:
+    - MAGIC “P1PG”, version=2, type (KV_RH=2 | OVERFLOW=3)
+    - page_id u64, data_start u16, table_slots u16, used_slots u16, flags u16
+    - next_page_id u64, lsn u64, seed u64, crc32 u32
+  - Whole-page CRC with its field zeroed during calculation
+
+- WAL (v1)
+  - Header (16B): “P1WAL001” + reserved u32 + reserved u32
+  - Record (28B): [type u8][flags u8][reserved u16][lsn u64][page_id u64][len u32][crc32 u32]
+  - Payload: full page image for PAGE_IMAGE; empty for TRUNCATE (streaming ship)
+  - Replay: CRC verify; stop on partial tail; ignore unknown types; LSN-gating for v2 pages
+
+All integers are Little Endian (LE). See docs/format.md for details.
 
 
 ## Platform notes
 
-- Windows: directory fsync after rename is best-effort (on Unix we fsync the parent directory).
-- Advisory locks via fs2 (LOCK file).
-- Endianness: LE for all on-disk integer fields.
+- Locks: fs2 advisory locks using <root>/LOCK
+- Windows: directory fsync after rename is best-effort (enabled on Unix)
+- Endianness: on-disk integers are little-endian
 
 
-## Roadmap (short)
+## Build / Install
 
-- 1.2: Snapshot isolation (COW + LSN), incremental backup/restore with dedup.
-- 1.3: Observability and packaging (OTel metrics/spans, GitHub Actions, release artifacts).
-- See docs/api.md and docs/cdc.md for the most up-to-date API and CDC details.
+- CLI (Release):
+```bash
+cargo build --release
+```
+Binary path: target/release/quiverdb
+
+- Library usage (Cargo.toml):
+```toml
+[dependencies]
+QuiverDB = { path = "./QuiverDB" } # or your git path
+```
+
+- FFI (C ABI): see docs/ffi.md
+  - Build with feature “ffi”: cdylib + cbindgen header generation
 
 
 ## License
 
 MIT — see LICENSE.
+
+Contributions, issues, and feature requests are welcome. Check docs/api.md, docs/cdc.md, docs/snapshots.md for details and examples.

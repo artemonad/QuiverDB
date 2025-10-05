@@ -6,6 +6,7 @@
 //! - Robin Hood compaction
 //! - Overflow (v0.6)
 //! - Sweep orphan (v0.6)
+//! - Snapshots / Backup / Restore (v1.2 scaffold)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,6 +31,15 @@ static OVF_CHAINS_FREED: AtomicU64 = AtomicU64::new(0);
 // ----- Sweep orphan (v0.6) -----
 static SWEEP_ORPHAN_RUNS: AtomicU64 = AtomicU64::new(0);
 
+// ----- Snapshots / Backup / Restore (v1.2 scaffold) -----
+static SNAPSHOTS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_FREEZE_FRAMES: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_FREEZE_BYTES: AtomicU64 = AtomicU64::new(0);
+static BACKUP_PAGES_EMITTED: AtomicU64 = AtomicU64::new(0);
+static BACKUP_BYTES_EMITTED: AtomicU64 = AtomicU64::new(0);
+static RESTORE_PAGES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static RESTORE_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     // WAL
@@ -52,6 +62,15 @@ pub struct MetricsSnapshot {
 
     // Sweep orphan (v0.6)
     pub sweep_orphan_runs: u64,
+
+    // Snapshots / Backup / Restore (v1.2 scaffold)
+    pub snapshots_active: u64,
+    pub snapshot_freeze_frames: u64,
+    pub snapshot_freeze_bytes: u64,
+    pub backup_pages_emitted: u64,
+    pub backup_bytes_emitted: u64,
+    pub restore_pages_written: u64,
+    pub restore_bytes_written: u64,
 }
 
 impl MetricsSnapshot {
@@ -114,6 +133,30 @@ pub fn record_sweep_orphan_run() {
     SWEEP_ORPHAN_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
+// ----- Recorders (Snapshots / Backup / Restore) -----
+pub fn record_snapshot_begin() {
+    SNAPSHOTS_ACTIVE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_snapshot_end() {
+    SNAPSHOTS_ACTIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1))).ok();
+}
+
+pub fn record_snapshot_freeze_frame(bytes: usize) {
+    SNAPSHOT_FREEZE_FRAMES.fetch_add(1, Ordering::Relaxed);
+    SNAPSHOT_FREEZE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub fn record_backup_page_emitted(bytes: usize) {
+    BACKUP_PAGES_EMITTED.fetch_add(1, Ordering::Relaxed);
+    BACKUP_BYTES_EMITTED.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+pub fn record_restore_page_written(bytes: usize) {
+    RESTORE_PAGES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    RESTORE_BYTES_WRITTEN.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
 // ----- Snapshot / Reset -----
 pub fn snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
@@ -132,6 +175,14 @@ pub fn snapshot() -> MetricsSnapshot {
         overflow_chains_freed: OVF_CHAINS_FREED.load(Ordering::Relaxed),
 
         sweep_orphan_runs: SWEEP_ORPHAN_RUNS.load(Ordering::Relaxed),
+
+        snapshots_active: SNAPSHOTS_ACTIVE.load(Ordering::Relaxed),
+        snapshot_freeze_frames: SNAPSHOT_FREEZE_FRAMES.load(Ordering::Relaxed),
+        snapshot_freeze_bytes: SNAPSHOT_FREEZE_BYTES.load(Ordering::Relaxed),
+        backup_pages_emitted: BACKUP_PAGES_EMITTED.load(Ordering::Relaxed),
+        backup_bytes_emitted: BACKUP_BYTES_EMITTED.load(Ordering::Relaxed),
+        restore_pages_written: RESTORE_PAGES_WRITTEN.load(Ordering::Relaxed),
+        restore_bytes_written: RESTORE_BYTES_WRITTEN.load(Ordering::Relaxed),
     }
 }
 
@@ -151,4 +202,12 @@ pub fn reset() {
     OVF_CHAINS_FREED.store(0, Ordering::Relaxed);
 
     SWEEP_ORPHAN_RUNS.store(0, Ordering::Relaxed);
+
+    SNAPSHOTS_ACTIVE.store(0, Ordering::Relaxed);
+    SNAPSHOT_FREEZE_FRAMES.store(0, Ordering::Relaxed);
+    SNAPSHOT_FREEZE_BYTES.store(0, Ordering::Relaxed);
+    BACKUP_PAGES_EMITTED.store(0, Ordering::Relaxed);
+    BACKUP_BYTES_EMITTED.store(0, Ordering::Relaxed);
+    RESTORE_PAGES_WRITTEN.store(0, Ordering::Relaxed);
+    RESTORE_BYTES_WRITTEN.store(0, Ordering::Relaxed);
 }

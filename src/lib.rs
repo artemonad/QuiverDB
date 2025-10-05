@@ -1,3 +1,4 @@
+// src/lib.rs
 #![allow(non_snake_case)]
 
 use anyhow::Result;
@@ -6,24 +7,30 @@ use std::path::Path;
 
 // Публичные модули
 pub mod consts;
+pub mod config;
 pub mod db;
+pub mod db_kv;            // вынесенная KV-логика (put_in_chain)
+pub mod db_maintenance;   // вынесенные maintenance-функции (stats/sweep)
 pub mod dir;
+pub mod free;
 pub mod hash;
 pub mod lock;      // file locking
 pub mod meta;
 pub mod page_rh;   // v2: Robin Hood in-page index
-pub mod page_ovf; // v2: overflow pages
-pub mod config;
-pub mod db_maintenance;
-pub mod db_kv;
+pub mod page_ovf;  // v2: overflow pages
 pub mod pager;
 pub mod util;
 pub mod db_scan;
 pub mod subs;
 pub mod wal;
-pub mod cli;       // CLI в отдельном модуле
-pub mod metrics;   // lightweight global metrics
-pub mod free;      // v0.6: free-list
+pub mod backup;
+pub mod cli;
+pub mod metrics;
+pub mod snapshots; // NEW: snapshots scaffold (Phase 1)
+
+// FFI (C ABI) — подключается только при сборке с фичей "ffi"
+#[cfg(feature = "ffi")]
+pub mod ffi;
 
 // Переэкспорты часто используемых сущностей
 pub use db::Db;
@@ -77,7 +84,7 @@ pub fn init_db(root: &Path, page_size: u32) -> Result<()> {
         f.sync_all()?;
     }
 
-    // Пустой free-list (v0.6)
+    // Пустой free-list
     let free_path = root.join(FREE_FILE);
     if !free_path.exists() {
         // создаст файл с корректным заголовком и count=0
