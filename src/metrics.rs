@@ -40,6 +40,9 @@ static BACKUP_BYTES_EMITTED: AtomicU64 = AtomicU64::new(0);
 static RESTORE_PAGES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static RESTORE_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
+// NEW: редкая ветка — fallback-сканы под снапшотами (когда обычный обход цепочки не сработал)
+static SNAPSHOT_FALLBACK_SCANS: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     // WAL
@@ -71,6 +74,9 @@ pub struct MetricsSnapshot {
     pub backup_bytes_emitted: u64,
     pub restore_pages_written: u64,
     pub restore_bytes_written: u64,
+
+    // NEW: fallback-сканы под снапшотами
+    pub snapshot_fallback_scans: u64,
 }
 
 impl MetricsSnapshot {
@@ -139,7 +145,9 @@ pub fn record_snapshot_begin() {
 }
 
 pub fn record_snapshot_end() {
-    SNAPSHOTS_ACTIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1))).ok();
+    SNAPSHOTS_ACTIVE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)))
+        .ok();
 }
 
 pub fn record_snapshot_freeze_frame(bytes: usize) {
@@ -155,6 +163,11 @@ pub fn record_backup_page_emitted(bytes: usize) {
 pub fn record_restore_page_written(bytes: usize) {
     RESTORE_PAGES_WRITTEN.fetch_add(1, Ordering::Relaxed);
     RESTORE_BYTES_WRITTEN.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+// NEW: fallback-скан под снапшотом
+pub fn record_snapshot_fallback_scan() {
+    SNAPSHOT_FALLBACK_SCANS.fetch_add(1, Ordering::Relaxed);
 }
 
 // ----- Snapshot / Reset -----
@@ -183,6 +196,8 @@ pub fn snapshot() -> MetricsSnapshot {
         backup_bytes_emitted: BACKUP_BYTES_EMITTED.load(Ordering::Relaxed),
         restore_pages_written: RESTORE_PAGES_WRITTEN.load(Ordering::Relaxed),
         restore_bytes_written: RESTORE_BYTES_WRITTEN.load(Ordering::Relaxed),
+
+        snapshot_fallback_scans: SNAPSHOT_FALLBACK_SCANS.load(Ordering::Relaxed),
     }
 }
 
@@ -210,4 +225,7 @@ pub fn reset() {
     BACKUP_BYTES_EMITTED.store(0, Ordering::Relaxed);
     RESTORE_PAGES_WRITTEN.store(0, Ordering::Relaxed);
     RESTORE_BYTES_WRITTEN.store(0, Ordering::Relaxed);
+
+    // NEW
+    SNAPSHOT_FALLBACK_SCANS.store(0, Ordering::Relaxed);
 }

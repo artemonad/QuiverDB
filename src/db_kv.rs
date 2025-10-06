@@ -114,6 +114,12 @@ pub fn put_in_chain(
                 let h2 = rh_header_read(&buf2)?;
                 let next2 = h2.next_page_id;
                 if h2.used_slots == 0 {
+                    // NEW: freeze пустую KV‑страницу перед вырезанием, чтобы снапшоты могли её читать
+                    if let Some(mgr) = &db.pager.snap_mgr {
+                        let mut g = mgr.lock().unwrap();
+                        g.freeze_if_needed(cur, h2.lsn, &buf2)?;
+                    }
+
                     // Вырезаем пустую страницу из цепочки
                     let mut pbuf = vec![0u8; ps];
                     db.pager.read_page(prev2, &mut pbuf)?;
@@ -173,6 +179,12 @@ pub fn put_in_chain(
                     let h2 = rh_header_read(&buf2)?;
                     let next2 = h2.next_page_id;
                     if h2.used_slots == 0 {
+                        // NEW: freeze пустую KV‑страницу перед вырезанием
+                        if let Some(mgr) = &db.pager.snap_mgr {
+                            let mut g = mgr.lock().unwrap();
+                            g.freeze_if_needed(cur, h2.lsn, &buf2)?;
+                        }
+
                         let mut pbuf = vec![0u8; ps];
                         db.pager.read_page(prev2, &mut pbuf)?;
                         let mut ph = rh_header_read(&pbuf)?;
@@ -193,9 +205,15 @@ pub fn put_in_chain(
             }
         }
 
-        // Удаление пустых страниц из цепочки
+        // Удаление пустых страниц из цепочки (на текущей позиции)
         let h = rh_header_read(&buf)?;
         if h.used_slots == 0 {
+            // NEW: freeze текущую KV‑страницу перед вырезанием
+            if let Some(mgr) = &db.pager.snap_mgr {
+                let mut g = mgr.lock().unwrap();
+                g.freeze_if_needed(pid, h.lsn, &buf)?;
+            }
+
             let next = h.next_page_id;
             if prev == NO_PAGE {
                 db.dir.set_head(bucket, next)?;
@@ -275,6 +293,12 @@ pub fn put_in_chain(
             let h2 = rh_header_read(&buf2)?;
             let next2 = h2.next_page_id;
             if h2.used_slots == 0 {
+                // NEW: freeze пустую KV‑страницу перед вырезанием
+                if let Some(mgr) = &db.pager.snap_mgr {
+                    let mut g = mgr.lock().unwrap();
+                    g.freeze_if_needed(cur, h2.lsn, &buf2)?;
+                }
+
                 if prev2 == NO_PAGE {
                     db.dir.set_head(bucket, next2)?;
                 } else {

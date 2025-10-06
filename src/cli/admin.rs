@@ -1,10 +1,9 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
-use crate::dir::Directory;
-use crate::lock::acquire_exclusive_lock;
 use crate::meta::read_meta;
 use crate::pager::Pager;
+use crate::dir::Directory;
 use crate::util::hex_dump;
 use crate::{init_db, wal_replay_if_any};
 use crate::free::FreeList;
@@ -110,7 +109,7 @@ pub fn cmd_status(path: PathBuf) -> Result<()> {
 }
 
 pub fn cmd_alloc(path: PathBuf, count: u32) -> Result<()> {
-    let _lock = acquire_exclusive_lock(&path)?;
+    let _lock = crate::lock::acquire_exclusive_lock(&path)?;
     let guard = DirtyGuard::begin(&path)?;
     wal_replay_if_any(&path)?;
     let mut pager = Pager::open(&path)?;
@@ -126,7 +125,7 @@ pub fn cmd_alloc(path: PathBuf, count: u32) -> Result<()> {
 }
 
 pub fn cmd_write(path: PathBuf, page_id: u64, fill: u8) -> Result<()> {
-    let _lock = acquire_exclusive_lock(&path)?;
+    let _lock = crate::lock::acquire_exclusive_lock(&path)?;
     let guard = DirtyGuard::begin(&path)?;
     wal_replay_if_any(&path)?;
     let mut pager = Pager::open(&path)?;
@@ -178,7 +177,7 @@ pub fn cmd_free_status(path: PathBuf) -> Result<()> {
 }
 
 pub fn cmd_free_push(path: PathBuf, page_id: u64) -> Result<()> {
-    let _lock = acquire_exclusive_lock(&path)?;
+    let _lock = crate::lock::acquire_exclusive_lock(&path)?;
     let fl = FreeList::open(&path)?;
     fl.push(page_id)?;
     println!("Pushed page {} into free-list", page_id);
@@ -186,7 +185,7 @@ pub fn cmd_free_push(path: PathBuf, page_id: u64) -> Result<()> {
 }
 
 pub fn cmd_free_pop(path: PathBuf, count: u32) -> Result<()> {
-    let _lock = acquire_exclusive_lock(&path)?;
+    let _lock = crate::lock::acquire_exclusive_lock(&path)?;
     let fl = FreeList::open(&path)?;
     let mut popped: Vec<u64> = Vec::new();
     for _ in 0..count {
@@ -212,7 +211,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::consts::{PAGE_MAGIC, NO_PAGE, FREE_FILE, FREE_HDR_SIZE, FREE_MAGIC};
-use crate::page_rh::{rh_header_read, rh_page_is_kv, rh_kv_list};
+use crate::page_rh::{rh_header_read, rh_kv_list};
 use crate::page_ovf::ovf_header_read;
 
 fn read_free_set(root: &Path) -> Result<HashSet<u64>> {
@@ -432,7 +431,7 @@ pub fn cmd_check(path: PathBuf) -> Result<()> {
 // ---------- v0.9: Repair (no change here) ----------
 
 pub fn cmd_repair(path: PathBuf) -> Result<()> {
-    let _lock = acquire_exclusive_lock(&path)?;
+    let _lock = crate::lock::acquire_exclusive_lock(&path)?;
     let guard = DirtyGuard::begin(&path)?;
     wal_replay_if_any(&path)?;
 
@@ -452,7 +451,7 @@ pub fn cmd_repair(path: PathBuf) -> Result<()> {
             if pager.read_page(pid, &mut buf).is_err() {
                 break;
             }
-            if !rh_page_is_kv(&buf) {
+            if !crate::page_rh::rh_page_is_kv(&buf) {
                 break;
             }
             if let Ok(items) = crate::page_rh::rh_kv_list(&buf) {
@@ -475,7 +474,7 @@ pub fn cmd_repair(path: PathBuf) -> Result<()> {
                     }
                 }
             }
-            let h = rh_header_read(&buf)?;
+            let h = crate::page_rh::rh_header_read(&buf)?;
             pid = h.next_page_id;
         }
     }
@@ -515,7 +514,29 @@ pub fn cmd_metrics_json(json: bool) -> Result<()> {
         let avg = m.avg_wal_batch_pages();
         let hit_ratio = m.cache_hit_ratio() * 100.0;
         println!(
-            "{{\"wal_appends_total\":{},\"wal_bytes_written\":{},\"wal_fsync_calls\":{},\"wal_fsync_batch_pages\":{},\"wal_truncations\":{},\"page_cache_hits\":{},\"page_cache_misses\":{},\"rh_page_compactions\":{},\"overflow_chains_created\":{},\"overflow_chains_freed\":{},\"sweep_orphan_runs\":{},\"avg_wal_batch_pages\":{:.2},\"page_cache_hit_ratio\":{:.2}}}",
+            "{{\
+            \"wal_appends_total\":{},\
+            \"wal_bytes_written\":{},\
+            \"wal_fsync_calls\":{},\
+            \"wal_fsync_batch_pages\":{},\
+            \"wal_truncations\":{},\
+            \"page_cache_hits\":{},\
+            \"page_cache_misses\":{},\
+            \"rh_page_compactions\":{},\
+            \"overflow_chains_created\":{},\
+            \"overflow_chains_freed\":{},\
+            \"sweep_orphan_runs\":{},\
+            \"avg_wal_batch_pages\":{:.2},\
+            \"page_cache_hit_ratio\":{:.2},\
+            \"snapshots_active\":{},\
+            \"snapshot_freeze_frames\":{},\
+            \"snapshot_freeze_bytes\":{},\
+            \"backup_pages_emitted\":{},\
+            \"backup_bytes_emitted\":{},\
+            \"restore_pages_written\":{},\
+            \"restore_bytes_written\":{},\
+            \"snapshot_fallback_scans\":{}\
+            }}",
             m.wal_appends_total,
             m.wal_bytes_written,
             m.wal_fsync_calls,
@@ -528,7 +549,15 @@ pub fn cmd_metrics_json(json: bool) -> Result<()> {
             m.overflow_chains_freed,
             m.sweep_orphan_runs,
             avg,
-            hit_ratio
+            hit_ratio,
+            m.snapshots_active,
+            m.snapshot_freeze_frames,
+            m.snapshot_freeze_bytes,
+            m.backup_pages_emitted,
+            m.backup_bytes_emitted,
+            m.restore_pages_written,
+            m.restore_bytes_written,
+            m.snapshot_fallback_scans
         );
         return Ok(());
     }
@@ -541,18 +570,28 @@ pub fn cmd_metrics_json(json: bool) -> Result<()> {
     };
 
     println!("Metrics snapshot:");
-    println!("  wal_appends_total       = {}", m.wal_appends_total);
-    println!("  wal_bytes_written       = {}", m.wal_bytes_written);
-    println!("  wal_fsync_calls         = {}", m.wal_fsync_calls);
-    println!("  wal_avg_batch_pages     = {:.2}", m.avg_wal_batch_pages());
-    println!("  wal_truncations         = {}", m.wal_truncations);
-    println!("  page_cache_hits         = {}", m.page_cache_hits);
-    println!("  page_cache_misses       = {}", m.page_cache_misses);
-    println!("  page_cache_hit_ratio    = {:.2}%", cache_hit_ratio * 100.0);
-    println!("  rh_page_compactions     = {}", m.rh_page_compactions);
-    println!("  overflow_chains_created = {}", m.overflow_chains_created);
-    println!("  overflow_chains_freed   = {}", m.overflow_chains_freed);
-    println!("  sweep_orphan_runs       = {}", m.sweep_orphan_runs);
+    println!("  wal_appends_total        = {}", m.wal_appends_total);
+    println!("  wal_bytes_written        = {}", m.wal_bytes_written);
+    println!("  wal_fsync_calls          = {}", m.wal_fsync_calls);
+    println!("  wal_avg_batch_pages      = {:.2}", m.avg_wal_batch_pages());
+    println!("  wal_truncations          = {}", m.wal_truncations);
+    println!("  page_cache_hits          = {}", m.page_cache_hits);
+    println!("  page_cache_misses        = {}", m.page_cache_misses);
+    println!("  page_cache_hit_ratio     = {:.2}%", cache_hit_ratio * 100.0);
+    println!("  rh_page_compactions      = {}", m.rh_page_compactions);
+    println!("  overflow_chains_created  = {}", m.overflow_chains_created);
+    println!("  overflow_chains_freed    = {}", m.overflow_chains_freed);
+    println!("  sweep_orphan_runs        = {}", m.sweep_orphan_runs);
+    // NEW: снапшоты/бэкап/рестор + fallback
+    println!("  snapshots_active         = {}", m.snapshots_active);
+    println!("  snapshot_freeze_frames   = {}", m.snapshot_freeze_frames);
+    println!("  snapshot_freeze_bytes    = {}", m.snapshot_freeze_bytes);
+    println!("  backup_pages_emitted     = {}", m.backup_pages_emitted);
+    println!("  backup_bytes_emitted     = {}", m.backup_bytes_emitted);
+    println!("  restore_pages_written    = {}", m.restore_pages_written);
+    println!("  restore_bytes_written    = {}", m.restore_bytes_written);
+    println!("  snapshot_fallback_scans  = {}", m.snapshot_fallback_scans);
+
     Ok(())
 }
 

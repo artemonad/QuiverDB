@@ -1,18 +1,18 @@
-use anyhow::Result;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyModule};
 
-use quiverdb_core as core;
-use core::{Directory};
+use quiverdb_core as qdb;
+use qdb::Directory;
 
 fn pyerr<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-#[pyclass]
+// Db внутри содержит несендобельные поля (RefCell и т.п.) — помечаем как unsendable.
+#[pyclass(unsendable)]
 struct Database {
-    inner: core::Db,
+    inner: qdb::Db,
 }
 
 #[pymethods]
@@ -20,7 +20,7 @@ impl Database {
     /// Create a new DB if missing: meta/seg1/WAL/free + directory.
     #[staticmethod]
     pub fn init_db(path: &str, page_size: u32, buckets: u32) -> PyResult<()> {
-        core::init_db(std::path::Path::new(path), page_size).map_err(pyerr)?;
+        qdb::init_db(std::path::Path::new(path), page_size).map_err(pyerr)?;
         Directory::create(std::path::Path::new(path), buckets).map_err(pyerr)?;
         Ok(())
     }
@@ -36,21 +36,21 @@ impl Database {
         page_cache_pages: Option<usize>,
         ovf_threshold_bytes: Option<usize>,
     ) -> PyResult<Self> {
-        let mut cfg = core::config::QuiverConfig::from_env();
+        let mut cfg = qdb::config::QuiverConfig::from_env();
         if let Some(v) = wal_coalesce_ms { cfg.wal_coalesce_ms = v; }
         if let Some(v) = data_fsync { cfg.data_fsync = v; }
         if let Some(v) = page_cache_pages { cfg.page_cache_pages = v; }
         if let Some(v) = ovf_threshold_bytes { cfg.ovf_threshold_bytes = Some(v); }
 
-        let db = core::Db::open_with_config(std::path::Path::new(path), cfg).map_err(pyerr)?;
+        let db = qdb::Db::open_with_config(std::path::Path::new(path), cfg).map_err(pyerr)?;
         Ok(Self { inner: db })
     }
 
     /// Open read-only.
     #[staticmethod]
     pub fn open_ro(path: &str) -> PyResult<Self> {
-        let cfg = core::config::QuiverConfig::from_env();
-        let db = core::Db::open_ro_with_config(std::path::Path::new(path), cfg).map_err(pyerr)?;
+        let cfg = qdb::config::QuiverConfig::from_env();
+        let db = qdb::Db::open_ro_with_config(std::path::Path::new(path), cfg).map_err(pyerr)?;
         Ok(Self { inner: db })
     }
 
@@ -59,8 +59,8 @@ impl Database {
         self.inner.put(key, value).map_err(pyerr)
     }
 
-    /// Get key -> Optional[bytes].
-    pub fn get<'py>(&self, py: Python<'py>, key: &[u8]) -> PyResult<Option<&'py PyBytes>> {
+    /// Get key -> Optional[bytes] (pyo3 0.26: PyBytes::new возвращает Bound<'py, PyBytes>).
+    pub fn get<'py>(&self, py: Python<'py>, key: &[u8]) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let v = self.inner.get(key).map_err(pyerr)?;
         Ok(v.map(|b| PyBytes::new(py, &b)))
     }
@@ -70,18 +70,20 @@ impl Database {
         self.inner.del(key).map_err(pyerr)
     }
 
-    /// Scan all -> List[(bytes, bytes)] (simple materialization).
-    pub fn scan_all<'py>(&self, py: Python<'py>) -> PyResult<Vec<(&'py PyBytes, &'py PyBytes)>> {
+    /// Scan all -> List[(bytes, bytes)].
+    pub fn scan_all<'py>(&self, py: Python<'py>) -> PyResult<Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>> {
         let pairs = self.inner.scan_all().map_err(pyerr)?;
-        Ok(pairs.into_iter()
+        Ok(pairs
+            .into_iter()
             .map(|(k, v)| (PyBytes::new(py, &k), PyBytes::new(py, &v)))
             .collect())
     }
 
     /// Scan by prefix -> List[(bytes, bytes)].
-    pub fn scan_prefix<'py>(&self, py: Python<'py>, prefix: &[u8]) -> PyResult<Vec<(&'py PyBytes, &'py PyBytes)>> {
+    pub fn scan_prefix<'py>(&self, py: Python<'py>, prefix: &[u8]) -> PyResult<Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)>> {
         let pairs = self.inner.scan_prefix(prefix).map_err(pyerr)?;
-        Ok(pairs.into_iter()
+        Ok(pairs
+            .into_iter()
             .map(|(k, v)| (PyBytes::new(py, &k), PyBytes::new(py, &v)))
             .collect())
     }
@@ -89,9 +91,9 @@ impl Database {
     /// One-shot snapshot + backup (Phase 1).
     #[pyo3(signature = (out_dir, since_lsn=None))]
     pub fn backup(&mut self, out_dir: &str, since_lsn: Option<u64>) -> PyResult<()> {
-        use core::backup::{backup_to_dir};
         let mut snap = self.inner.snapshot_begin().map_err(pyerr)?;
-        backup_to_dir(&self.inner, &snap, std::path::Path::new(out_dir), since_lsn).map_err(pyerr)?;
+        qdb::backup::backup_to_dir(&self.inner, &snap, std::path::Path::new(out_dir), since_lsn)
+            .map_err(pyerr)?;
         self.inner.snapshot_end(&mut snap).map_err(pyerr)?;
         Ok(())
     }
@@ -99,8 +101,11 @@ impl Database {
     /// Restore from backup dir into destination DB path.
     #[staticmethod]
     pub fn restore(dst_path: &str, backup_dir: &str) -> PyResult<()> {
-        use core::backup::restore_from_dir;
-        restore_from_dir(std::path::Path::new(dst_path), std::path::Path::new(backup_dir)).map_err(pyerr)
+        qdb::backup::restore_from_dir(
+            std::path::Path::new(dst_path),
+            std::path::Path::new(backup_dir),
+        )
+            .map_err(pyerr)
     }
 
     /// Return last LSN (helper).
@@ -109,8 +114,9 @@ impl Database {
     }
 }
 
+/// pyo3 0.26: модуль принимает &Bound<PyModule>.
 #[pymodule]
-fn quiverdb(_py: Python, m: &PyModule) -> PyResult<()> {
+fn quiverdb(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
     m.add("version", env!("CARGO_PKG_VERSION"))?;
     Ok(())

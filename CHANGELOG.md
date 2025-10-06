@@ -8,6 +8,41 @@ On-disk formats remain frozen across 1.x:
 Dates use ISO format (YYYY-MM-DD).
 
 
+## [1.2.2] – 2025-10-06
+
+Hardening and polish for Phase 1 snapshots and startup replay. Formats unchanged.
+
+Added
+- Metrics
+  - snapshot_fallback_scans — counts rare “fallback scans” under snapshots (when a hot chain mutation forces reconstructing tail-wins).
+  - CLI: quiverdb metrics now prints snapshot_fallback_scans (text and JSON).
+- Structured logs
+  - log + env_logger (CLI initialization).
+  - Replay/backup/restore now emit informative logs (debug/info/warn).
+
+Changed/Improved
+- Startup WAL replay optimization:
+  - Perform LSN‑gating before ensure_allocated (symmetry with wal-apply/cdc replay). Avoids unnecessary allocations for old frames.
+- Backup/Restore:
+  - Switched from println!/eprintln! to structured logs; kept the same behavior and CRC checks.
+
+Fixed
+- Snapshot correctness under churn:
+  - Freeze KV pages before free in all chain‑cleanup paths (db_kv::put_in_chain), ensuring snapshots can still read old page images even when empty pages are cut out of chains.
+- Minor warnings cleanup and consistent imports (no functional changes).
+
+Docs
+- Mentioned snapshot_fallback_scans and structured logs in the 1.2 Phase 1 context.
+
+Compatibility
+- On-disk formats unchanged (meta v3, page v2, WAL v1).
+- CLI/API unchanged, except additional metrics fields in “metrics” output.
+
+Upgrade notes
+- If you tail logs, enable with e.g. RUST_LOG=info quiverdb ... (debug for detailed replay/backups).
+- No data migrations required.
+
+
 ## [1.2.0] – 2025-10-06
 
 Phase 1: Snapshot Isolation and Backup/Restore (no dedup yet). Formats unchanged.
@@ -42,7 +77,7 @@ Changed/Improved
   - Fallback scan reconstructs tail-wins view when chain heads move after the snapshot (rare)
 - CDC apply path optimization:
   - wal-apply and cdc replay perform LSN-gating before ensure_allocated (avoids unnecessary allocations)
-  - Note: the same optimization for startup WAL replay is planned for 1.2.1
+  - Note: same optimization for startup WAL replay landed in 1.2.2
 
 Docs
 - New docs/snapshots.md (semantics, COW details, sidecar formats, backup/restore)
@@ -140,7 +175,3 @@ Initial 1.x with frozen formats (meta v3, page v2, WAL v1).
   - WAL group-commit (fsync coalescing), P1_DATA_FSYNC option, page cache (optional)
 - CDC
   - wal-tail (JSONL), wal-ship (binary), wal-apply (idempotent apply with LSN gating)
-
-
-—  
-For details and examples, see docs/api.md, docs/cdc.md, docs/format.md, and docs/snapshots.md.

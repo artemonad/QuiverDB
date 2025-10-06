@@ -30,14 +30,18 @@ use crc32fast::Hasher as Crc32;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::consts::{NO_PAGE, PAGE_HDR_V2_SIZE, PAGE_MAGIC};
 use crate::db::Db;
 use crate::dir::Directory;
-use crate::metrics::{record_snapshot_begin, record_snapshot_end, record_snapshot_freeze_frame};
+use crate::metrics::{
+    record_snapshot_begin,
+    record_snapshot_end,
+    record_snapshot_freeze_frame,
+};
 use crate::pager::Pager;
 use crate::page_ovf::ovf_header_read;
 use crate::page_rh::{rh_header_read, rh_kv_list, rh_kv_lookup, rh_page_is_kv};
@@ -73,7 +77,7 @@ pub struct SnapshotManager {
     next_ctr: u64,
     // приватно (наружу этот state не нужен)
     active: HashMap<SnapshotId, SnapshotState>,
-    pub max_snapshot_lsn: u64, // максимум lsn по активным снапшотам
+    pub max_snapshot_lsn: u64, // максимум lsn по активным снапSHOTам
 }
 
 impl SnapshotManager {
@@ -160,7 +164,7 @@ impl SnapshotManager {
         }
     }
 
-    /// Проверить, нужна ли страница снапшоту (заморожена ли уже).
+    /// Проверить, нужна ли страница снапSHOTу (заморожена ли уже).
     pub fn is_frozen(&self, id: &str, page_id: u64) -> bool {
         self.active
             .get(id)
@@ -168,7 +172,7 @@ impl SnapshotManager {
             .unwrap_or(false)
     }
 
-    /// freeze_if_needed: если у какого-либо активного снапшота snapshot_lsn >= page_lsn
+    /// freeze_if_needed: если у какого-либо активного снапSHOTа snapshot_lsn >= page_lsn
     /// и ещё нет копии — записать кадр в freeze.bin + index.bin.
     pub fn freeze_if_needed(
         &mut self,
@@ -344,7 +348,7 @@ impl SnapshotHandle {
     /// Выбрать байты страницы pid как-of snapshot_lsn:
     /// - RH: если live.lsn ≤ snapshot → live; иначе frozen (с одним refresh).
     /// - OVF: если live.lsn ≤ snapshot → live; иначе frozen (с одним refresh).
-    /// - RAW FALLBACK: если live выглядит как v2, но хедер не читается → frozen (try), затем live.
+    /// - RAW FALLBACK: если live выглядит как v2, но хедер не распознан — сначала frozen (try), затем live.
     /// - non-v2: live.
     /// - ошибка чтения live: пытаемся frozen.
     fn page_bytes_at_snapshot(
@@ -486,6 +490,9 @@ impl SnapshotHandle {
 
     /// Fallback: найти ключ по полному скану страниц as-of snapshot_lsn (дорого, но безопасно).
     fn fallback_get_by_scan(&self, pager: &Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // NEW: метрика редкой ветки
+        crate::metrics::record_snapshot_fallback_scan();
+
         let ps = pager.meta.page_size as usize;
         let total = pager.meta.next_page_id;
 
@@ -631,7 +638,7 @@ fn write_freeze_frame(
     LittleEndian::write_u32(&mut hdr[20..24], crc);
 
     // Append header + payload
-    std::io::Seek::seek(&mut f, SeekFrom::End(0))?;
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::End(0))?;
     f.write_all(&hdr)?;
     f.write_all(page_bytes)?;
 
@@ -643,7 +650,7 @@ fn write_freeze_frame(
         .read(true)
         .open(&index_path)
         .with_context(|| format!("open index {}", index_path.display()))?;
-    std::io::Seek::seek(&mut idx, SeekFrom::End(0))?;
+    std::io::Seek::seek(&mut idx, std::io::SeekFrom::End(0))?;
 
     // Index entry: [page_id u64][offset u64][page_lsn u64]
     let mut entry = vec![0u8; 8 + 8 + 8];
@@ -674,7 +681,7 @@ fn build_freeze_index(freeze_dir: &Path) -> Result<HashMap<u64, u64>> {
     const REC: u64 = 8 + 8 + 8;
     let mut buf = vec![0u8; REC as usize];
     while pos + REC <= len {
-        std::io::Seek::seek(&mut f, SeekFrom::Start(pos))?;
+        std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(pos))?;
         f.read_exact(&mut buf)?;
         let page_id = LittleEndian::read_u64(&buf[0..8]);
         let off = LittleEndian::read_u64(&buf[8..16]);
@@ -702,7 +709,7 @@ fn read_frozen_page_at_offset(
 
     // Header: [page_id u64][page_lsn u64][page_len u32][crc32 u32]
     let mut hdr = [0u8; 8 + 8 + 4 + 4];
-    std::io::Seek::seek(&mut f, SeekFrom::Start(off))?;
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(off))?;
     f.read_exact(&mut hdr)?;
     let pid = LittleEndian::read_u64(&hdr[0..8]);
     if pid != page_id {

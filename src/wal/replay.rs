@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use crc32fast::Hasher as Crc32;
+use log::{debug, info, warn};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -23,8 +24,10 @@ use crate::util::v2_page_lsn;
 pub fn wal_replay_if_any(root: &Path) -> Result<()> {
     let wal_path = root.join(WAL_FILE);
     if !wal_path.exists() {
+        debug!("wal_replay_if_any: WAL file not found at {}, nothing to do", wal_path.display());
         return Ok(());
     }
+
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)
@@ -33,10 +36,15 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
 
     // Заголовок есть? Если нет — инициализируем.
     if f.metadata()?.len() < WAL_HDR_SIZE as u64 {
+        debug!(
+            "wal_replay_if_any: WAL too small (< header), writing fresh header to {}",
+            wal_path.display()
+        );
         write_wal_file_header(&mut f)?;
         f.sync_all()?;
         return Ok(());
     }
+
     let mut magic = [0u8; 8];
     f.seek(SeekFrom::Start(0))?;
     f.read_exact(&mut magic)?;
@@ -49,13 +57,24 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
     if meta.clean_shutdown {
         let len = f.metadata()?.len();
         if len > WAL_HDR_SIZE as u64 {
+            debug!(
+                "wal_replay_if_any: clean shutdown -> truncate WAL to header ({} -> {})",
+                len,
+                WAL_HDR_SIZE
+            );
             f.set_len(WAL_HDR_SIZE as u64)?;
             f.sync_all()?;
+        } else {
+            debug!("wal_replay_if_any: clean shutdown, WAL already header-sized");
         }
         return Ok(());
     }
 
     // Нечистое завершение — реплеим.
+    debug!(
+        "wal_replay_if_any: unclean shutdown -> start replay from {}",
+        wal_path.display()
+    );
     let mut pager = Pager::open(root)?;
     let mut pos = WAL_HDR_SIZE as u64;
     let len = f.metadata()?.len();
@@ -66,6 +85,8 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
         f.seek(SeekFrom::Start(pos))?;
         let mut hdr = vec![0u8; WAL_REC_HDR_SIZE];
         if f.read_exact(&mut hdr).is_err() {
+            // частичный хвост заголовка — нормальный конец
+            debug!("wal_replay_if_any: partial header tail at off={}, stop", pos);
             break;
         }
 
@@ -78,6 +99,10 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
 
         if pos + rec_total > len {
             // хвост неполон — выходим
+            debug!(
+                "wal_replay_if_any: partial record tail at off={}, need {} bytes, stop",
+                pos, rec_total
+            );
             break;
         }
 
@@ -91,6 +116,10 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
         let crc_actual = hasher.finalize();
         if crc_actual != crc_expected {
             // возможно, запись ещё дописывается — выходим
+            warn!(
+                "wal_replay_if_any: CRC mismatch at off={}, expected={}, actual={}, stop",
+                pos, crc_expected, crc_actual
+            );
             break;
         }
 
@@ -116,6 +145,10 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
                             if let (Some(new_lsn), Some(cur_lsn)) = (new_lsn_opt, v2_page_lsn(&cur)) {
                                 if cur_lsn >= new_lsn {
                                     apply = false;
+                                    debug!(
+                                        "wal_replay_if_any: skip page {} (cur_lsn {} >= wal_lsn {})",
+                                        page_id, cur_lsn, new_lsn
+                                    );
                                 }
                             }
                         }
@@ -130,7 +163,6 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
                 }
 
                 if apply {
-                    // Аллоцируем только при реальном применении
                     pager.ensure_allocated(page_id)?;
                     pager.write_page_raw(page_id, &payload)?;
                     applied += 1;
@@ -138,7 +170,7 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
             }
             // Unknown или будущие типы — игнорируем (forward-совместимость).
             _ => {
-                // намеренно ничего не делаем
+                debug!("wal_replay_if_any: skip unknown record type {}", rec_type);
             }
         }
 
@@ -146,16 +178,20 @@ pub fn wal_replay_if_any(root: &Path) -> Result<()> {
     }
 
     if applied > 0 {
-        println!("WAL replay: applied {} record(s)", applied);
+        info!("WAL replay: applied {} record(s)", applied);
+    } else {
+        debug!("WAL replay: nothing to apply");
     }
 
     // Truncate WAL to header после успешного прохода.
     f.set_len(WAL_HDR_SIZE as u64)?;
     f.sync_all()?;
+    debug!("wal_replay_if_any: WAL truncated to header");
 
     // Update last_lsn в meta (best-effort).
     if max_lsn > 0 {
         let _ = set_last_lsn(root, max_lsn);
+        debug!("wal_replay_if_any: set last_lsn={}", max_lsn);
     }
     Ok(())
 }

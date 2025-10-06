@@ -18,6 +18,7 @@
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use crc32fast::Hasher as Crc32;
+use log::{debug, info, warn};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,14 @@ pub fn backup_to_dir(
     let ps = db.pager.meta.page_size as usize;
     let snapshot_lsn = snap.lsn;
 
+    info!(
+        "backup: start, root={}, out={}, snapshot_lsn={}, since_lsn={}",
+        db.root.display(),
+        out_dir.display(),
+        snapshot_lsn,
+        since_lsn.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())
+    );
+
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create backup dir {}", out_dir.display()))?;
 
@@ -68,6 +77,10 @@ pub fn backup_to_dir(
 
     // Пройдём все page_id
     let total_pages = db.pager.meta.next_page_id;
+    debug!(
+        "backup: scanning {} page(s), page_size={}, root={}",
+        total_pages, ps, db.root.display()
+    );
 
     for pid in 0..total_pages {
         // Выбор источника payload для этой страницы с учётом snapshot_lsn и retry на заморозку
@@ -75,7 +88,7 @@ pub fn backup_to_dir(
             Ok(opt) => opt,
             Err(e) => {
                 // best-effort: пропустим страницу при ошибке чтения (не валим весь бэкап)
-                eprintln!("backup: skip page {} due to error: {}", pid, e);
+                warn!("backup: skip page {} due to error: {}", pid, e);
                 None
             }
         };
@@ -141,12 +154,23 @@ pub fn backup_to_dir(
     fs::write(&manifest_path, manifest)
         .with_context(|| format!("write manifest {}", manifest_path.display()))?;
 
+    info!(
+        "backup: done pages={}, bytes={}, dir_present={}, dir_bytes={}, out={}",
+        pages_emitted, bytes_emitted, dir_present, dir_bytes, out_dir.display()
+    );
+
     Ok(())
 }
 
 /// Восстановление БД из директории бэкапа (pages.bin + manifest.json + dir.bin).
 /// Предполагается пустой/новый путь dst_root. Создаёт БД, заливает страницы, копирует каталог.
 pub fn restore_from_dir(dst_root: &Path, backup_dir: &Path) -> Result<()> {
+    info!(
+        "restore: start, dst={}, from={}",
+        dst_root.display(),
+        backup_dir.display()
+    );
+
     // Прочитаем manifest.json (минимальный парсинг page_size)
     let manifest_path = backup_dir.join("manifest.json");
     let manifest = fs::read_to_string(&manifest_path)
@@ -185,6 +209,9 @@ pub fn restore_from_dir(dst_root: &Path, backup_dir: &Path) -> Result<()> {
     let ps = pager.meta.page_size as usize;
     let mut max_lsn: u64 = 0;
 
+    let mut pages_written: u64 = 0;
+    let mut bytes_written: u64 = 0;
+
     let mut pos = 0u64;
     let len = f.metadata()?.len();
 
@@ -200,6 +227,10 @@ pub fn restore_from_dir(dst_root: &Path, backup_dir: &Path) -> Result<()> {
 
         let rec_total = 24u64 + page_len as u64;
         if pos + rec_total > len {
+            debug!(
+                "restore: partial tail at off={}, need {} bytes, stop",
+                pos, rec_total
+            );
             break; // неполный хвост — выходим
         }
 
@@ -230,6 +261,9 @@ pub fn restore_from_dir(dst_root: &Path, backup_dir: &Path) -> Result<()> {
         // Метрики restore
         record_restore_page_written(payload.len());
 
+        pages_written += 1;
+        bytes_written += (24 + payload.len()) as u64;
+
         if page_lsn > max_lsn {
             max_lsn = page_lsn;
         }
@@ -241,6 +275,11 @@ pub fn restore_from_dir(dst_root: &Path, backup_dir: &Path) -> Result<()> {
         set_last_lsn(dst_root, max_lsn)?;
     }
     set_clean_shutdown(dst_root, true)?;
+
+    info!(
+        "restore: done pages={}, bytes={}, last_lsn={}, dst={}",
+        pages_written, bytes_written, max_lsn, dst_root.display()
+    );
 
     Ok(())
 }
