@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "quiverdb"
+description = "Python bindings for QuiverDB (embedded KV DB with Robin Hood index, WAL, snapshots, backup/restore)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "../../LICENSE" }
+authors = [{ name = "Artem Fedorchuk (artemonad)" }]
+keywords = ["database", "embedded", "kv", "wal", "snapshot", "backup"]
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database"
+]
+
+[tool.maturin]
+# имя модуля в Python-пакете: quiverdb/quiverdb.*.so
+module-name = "quiverdb.quiverdb"
+bindings = "pyo3"

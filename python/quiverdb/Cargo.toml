@@ -1,0 +1,15 @@
+[package]
+name = "quiverdb-py"
+version = "1.2.0"
+edition = "2021"
+
+[lib]
+name = "quiverdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+pyo3 = { version = "0.21", features = ["extension-module"] }
+
+# Ссылка на основной крейт:
+quiverdb_core = { path = "../../", package = "QuiverDB" }

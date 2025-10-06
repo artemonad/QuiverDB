@@ -1,3 +1,9 @@
+[workspace]
+members = [
+    ".",                # корневой крейт QuiverDB (lib+bin)
+    "python/quiverdb",  # PyO3-обёртка для Python (cdylib)
+]
+
 [package]
 name = "QuiverDB"
 version = "1.2.0"
@@ -33,7 +39,7 @@ fs2 = "0.4"
 # CDC compression
 flate2 = "1"        # gzip encoder/decoder
 zstd = "0.13"       # zstd encoder/decoder
-# NEW: FFI JSON config
+# FFI JSON config (используются в ffi.rs; можно оставить общими)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
