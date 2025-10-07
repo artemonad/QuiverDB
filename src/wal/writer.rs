@@ -238,6 +238,17 @@ impl Wal {
         }
         Ok(())
     }
+
+    /// Принудительно обрезать WAL до заголовка (без проверки порога).
+    /// Предполагается вызывать после того, как данные гарантированно синхронизированы.
+    pub fn truncate_to_header(&mut self) -> Result<()> {
+        let mut f = self.inner.file.lock().unwrap();
+        f.set_len(WAL_HDR_SIZE as u64)?;
+        f.seek(SeekFrom::End(0))?;
+        f.sync_all()?;
+        record_wal_truncation();
+        Ok(())
+    }
 }
 
 /// Заголовок WAL-файла.

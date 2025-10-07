@@ -6,10 +6,9 @@
 
 Embedded Rust key–value database with in-page Robin Hood indexing, WAL, a CRC-validated directory of bucket heads, and overflow chains for large values.
 
-Status: v1.2 (Phase 1) — Snapshot Isolation and Backup/Restore, with frozen on-disk formats:
+Status: v1.2 (Phase 1) + Phase 2 features (snapstore dedup and persisted snapshots), with frozen on-disk formats:
 - meta v3, page v2, WAL v1 (no migrations, forward/backward compatible)
-- Phase 1 snapshots are in-process (not persisted); backup/restore does not include dedup yet (planned in a later phase)
-
+- Phase 1 snapshots are in-process by default; Phase 2 adds optional persisted snapshots and a shared dedup store (snapstore)
 
 ## Highlights
 
@@ -42,7 +41,12 @@ Status: v1.2 (Phase 1) — Snapshot Isolation and Backup/Restore, with frozen on
 - Snapshot Isolation (Phase 1) + Backup/Restore
   - In-process snapshots “as of LSN” with page-level copy-on-write
   - Full and incremental backup (since_lsn), robust restore, CRC-checked archives
-  - Phase 1 does not include deduplication (planned later)
+  - Rare fallback scans reconstruct tail-wins when hot chain mutations occur after the snapshot
+
+- Phase 2: Snapstore (dedup) and persisted snapshots
+  - Content-addressed store for frozen page images with refcounting and compact
+  - Persisted snapshot registry (.snapshots/registry.json) with CLI to list/remove
+  - Snapshot readers can fallback to snapstore via hashindex.bin if sidecar freeze.bin is missing
 
 - Developer comfort
   - Config builder (QuiverConfig/DbBuilder) + env compatibility
@@ -50,20 +54,20 @@ Status: v1.2 (Phase 1) — Snapshot Isolation and Backup/Restore, with frozen on
   - Scan APIs: scan_all(), scan_prefix(prefix)
   - Metrics, check/repair, JSON modes in CLI
   - Minimal C FFI (qdb_init_db/open_ro/get/put/del)
-
+  - Python bindings via PyO3 (minimal wrapper)
 
 ## Contents
 
 - Quick start (CLI)
 - Quick start (Rust API)
-- Snapshot Isolation and Backup/Restore (Phase 1)
+- Snapshot Isolation and Backup/Restore (Phase 1 + Phase 2 dedup)
 - CDC overview
 - Configuration (env and builder)
 - CLI cheat sheet
+- Environment variables
 - On-disk formats (summary)
 - Platform notes
 - License
-
 
 ## Quick start (CLI)
 
@@ -107,6 +111,24 @@ quiverdb backup --path ./db --out ./backup_incr --since-lsn 12345
 quiverdb restore --path ./db_restored --from ./backup --verify
 ```
 
+Snapshots (Phase 2: persisted snapshots + snapstore)
+```bash
+# List persisted snapshots (from .snapshots/registry.json)
+quiverdb snapshots --path ./db [--json]
+
+# Remove a persisted snapshot: dec_ref in snapstore + delete sidecar, mark ended in registry
+quiverdb snaprm --path ./db --id <snapshot_id>
+
+# Compact snapstore: rewrite store.bin to keep only frames with refcnt > 0
+quiverdb snapcompact --path ./db [--json]
+```
+
+WAL checkpoint (manual)
+```bash
+# Truncate WAL to header (requires data_fsync=true)
+quiverdb checkpoint --path ./db
+```
+
 CDC (local pipe, TCP, and deterministic slices):
 ```bash
 # Local pipe
@@ -124,8 +146,7 @@ quiverdb cdc replay --path ./follower --input ./slice.bin --from-lsn 100 --to-ls
 ```
 
 Tip:
-- Some commands also support JSON via flags (e.g., dbstats --json) or env toggles (see Configuration).
-
+- Some commands also support JSON via flags (e.g., dbstats --json) or env toggles (see Environment variables).
 
 ## Quick start (Rust API)
 
@@ -193,10 +214,9 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+## Snapshot Isolation and Backup/Restore (Phase 1 + Phase 2)
 
-## Snapshot Isolation and Backup/Restore (Phase 1)
-
-- In-process snapshots capture a consistent view at a specific LSN (snapshot_lsn)
+- Phase 1: in-process snapshots capture a consistent view at a specific LSN (snapshot_lsn)
   - SnapshotHandle::get/scan_* read “as of LSN”
   - Page-level copy-on-write: before overwriting/freeing a v2 page whose LSN may be needed by a live snapshot, the current image is frozen into a sidecar store
   - Readers choose live vs frozen per page; overflow chains are resolved per page the same way
@@ -211,11 +231,19 @@ fn main() -> anyhow::Result<()> {
     - manifest.json — summary (snapshot_lsn, since_lsn, page_size, counters)
   - Restore writes pages back (raw), installs dir.bin if present, sets last_lsn and clean_shutdown
 
-Notes:
-- Phase 1 snapshots are in-process (not persisted across restarts)
-- No deduplication in Phase 1 (planned later)
-- Freeze sidecar lives under <root>/.snapshots/<snapshot_id> (CRC-checked on read)
+- Phase 2: persisted snapshots and snapstore (dedup)
+  - Persisted snapshot registry under <root>/.snapshots/registry.json (best-effort)
+  - Snapstore is a content-addressed store under <root>/.snapstore by default (configurable via P1_SNAPSTORE_DIR)
+    - store.bin stores frames [hash u64][len u32][crc32 u32] + payload
+    - index.bin maintains a full mapping hash → (offset, refcnt)
+  - Each sidecar also writes hashindex.bin with [page_id u64][hash u64][page_lsn u64]
+  - Snapshot readers can fallback to snapstore by hash when sidecar freeze.bin is missing
+  - Refcounting ensures frames are retained until all referencing snapshots are removed; snapcompact reclaims space
 
+Notes:
+- Formats remain frozen: meta v3, page v2, WAL v1
+- Phase 1 snapshots are in-process by default; Phase 2 makes them manageable/persistable and deduplicated
+- Snapstore directory can be customized via env (see below)
 
 ## CDC overview
 
@@ -238,7 +266,6 @@ Notes:
 - last-lsn
   - Prints meta.last_lsn — useful to resume shipping from followers
 
-
 ## Configuration (env and builder)
 
 Builder (preferred inside code):
@@ -247,8 +274,11 @@ Builder (preferred inside code):
   - data_fsync (fsync data segments per commit; default true)
   - page_cache_pages (read cache size; default 0 = disabled)
   - ovf_threshold_bytes (None = page_size/4)
+  - snap_persist (enable persisted snapshots; default false)
+  - snap_dedup (enable content-addressed dedup; default false)
+  - snapstore_dir (optional custom directory for snapstore; default <root>/.snapstore)
 
-Environment variables (backward-compatible):
+Environment variables (backward-compatible + Phase 2):
 - Core
   - P1_WAL_COALESCE_MS
   - P1_DATA_FSYNC=0|1
@@ -261,11 +291,14 @@ Environment variables (backward-compatible):
   - P1_SHIP_SINCE_INCLUSIVE=1|true|yes|on
   - P1_SHIP_COMPRESS=none|gzip|zstd
   - P1_APPLY_DECOMPRESS=none|gzip|zstd
-- CLI helper
-  - P1_DB_GET_OUT=path (write dbget payload to a file)
+- Snapshots / Snapstore (Phase 2)
+  - P1_SNAP_PERSIST=0|1 — keep sidecar and track in registry.json
+  - P1_SNAP_DEDUP=0|1 — enable snapstore dedup and hashindex
+  - P1_SNAPSTORE_DIR=path — custom snapstore directory:
+    - absolute path used as-is,
+    - relative path resolved against DB root (<root>/<path>)
 
-Builder takes precedence when you use open_with_config/open_ro_with_config; env remains supported.
-
+Builder takes precedence when you use open_with_config/open_ro_with_config for core tunables; snapstore directory is resolved via env at the moment.
 
 ## CLI cheat sheet
 
@@ -285,11 +318,32 @@ Builder takes precedence when you use open_with_config/open_ro_with_config; env 
 - Integrity/Maintenance
   - check [--strict] [--json], repair
   - metrics [--json], metrics-reset
+- Snapshots (Phase 2)
+  - snapshots --path ./db [--json]
+  - snaprm --path ./db --id <snapshot_id>
+  - snapcompact --path ./db [--json]
+- WAL
+  - checkpoint --path ./db (truncate WAL to header; requires data_fsync=true)
 - Admin/low-level
   - init, status, alloc, read, write
   - free-status, free-pop, free-push
   - Robin Hood page ops: pagefmt-rh, rh-put, rh-get, rh-list, rh-del, rh-compact
 
+## Environment variables
+
+- P1_WAL_COALESCE_MS=ms — group-commit fsync coalescing window (default 3)
+- P1_DATA_FSYNC=0|1 — fsync data segments per commit (default 1; when 0, WAL is only truncated on replay)
+- P1_PAGE_CACHE_PAGES=N — page cache size (0 disables)
+- P1_OVF_THRESHOLD_BYTES=N — overflow threshold (default page_size/4)
+- P1_RH_COMPACT_DEAD_FRAC, P1_RH_COMPACT_MIN_BYTES — RH page compaction heuristics
+- P1_SHIP_FLUSH_EVERY, P1_SHIP_FLUSH_BYTES — CDC ship batching
+- P1_SHIP_SINCE_INCLUSIVE=1 — CDC since-lsn inclusive mode
+- P1_SHIP_COMPRESS=none|gzip|zstd — CDC ship compression
+- P1_APPLY_DECOMPRESS=none|gzip|zstd — CDC apply decompression
+- P1_DB_GET_OUT=path — write dbget payload to a file
+- P1_SNAP_PERSIST=0|1 — persisted snapshots (keep sidecar + registry)
+- P1_SNAP_DEDUP=0|1 — snapstore dedup (hashindex + refcount)
+- P1_SNAPSTORE_DIR=path — custom snapstore directory (absolute or relative to <root>)
 
 ## On-disk formats (summary)
 
@@ -313,13 +367,11 @@ Builder takes precedence when you use open_with_config/open_ro_with_config; env 
 
 All integers are Little Endian (LE). See docs/format.md for details.
 
-
 ## Platform notes
 
 - Locks: fs2 advisory locks using <root>/LOCK
 - Windows: directory fsync after rename is best-effort (enabled on Unix)
 - Endianness: on-disk integers are little-endian
-
 
 ## Build / Install
 
@@ -337,7 +389,6 @@ QuiverDB = { path = "./QuiverDB" } # or your git path
 
 - FFI (C ABI): see docs/ffi.md
   - Build with feature “ffi”: cdylib + cbindgen header generation
-
 
 ## License
 

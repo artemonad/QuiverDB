@@ -26,27 +26,54 @@ impl Database {
     }
 
     /// Open writer with optional config overrides (kwargs).
-    /// Example: Database.open("./db", wal_coalesce_ms=0, data_fsync=True, page_cache_pages=256)
+    /// Example:
+    ///   Database.open("./db",
+    ///                 wal_coalesce_ms=0,
+    ///                 data_fsync=True,
+    ///                 page_cache_pages=256,
+    ///                 ovf_threshold_bytes=None,
+    ///                 snap_persist=True,
+    ///                 snap_dedup=True,
+    ///                 snapstore_dir="./.snapstore_alt")
     #[staticmethod]
-    #[pyo3(signature = (path, wal_coalesce_ms=None, data_fsync=None, page_cache_pages=None, ovf_threshold_bytes=None))]
+    #[pyo3(signature = (
+        path,
+        wal_coalesce_ms=None,
+        data_fsync=None,
+        page_cache_pages=None,
+        ovf_threshold_bytes=None,
+        snap_persist=None,
+        snap_dedup=None,
+        snapstore_dir=None
+    ))]
     pub fn open(
         path: &str,
         wal_coalesce_ms: Option<u64>,
         data_fsync: Option<bool>,
         page_cache_pages: Option<usize>,
         ovf_threshold_bytes: Option<usize>,
+        snap_persist: Option<bool>,
+        snap_dedup: Option<bool>,
+        snapstore_dir: Option<String>,
     ) -> PyResult<Self> {
         let mut cfg = qdb::config::QuiverConfig::from_env();
         if let Some(v) = wal_coalesce_ms { cfg.wal_coalesce_ms = v; }
         if let Some(v) = data_fsync { cfg.data_fsync = v; }
         if let Some(v) = page_cache_pages { cfg.page_cache_pages = v; }
         if let Some(v) = ovf_threshold_bytes { cfg.ovf_threshold_bytes = Some(v); }
+        if let Some(v) = snap_persist { cfg.snap_persist = v; }
+        if let Some(v) = snap_dedup { cfg.snap_dedup = v; }
+        if let Some(v) = snapstore_dir {
+            if !v.trim().is_empty() {
+                cfg.snapstore_dir = Some(v);
+            }
+        }
 
         let db = qdb::Db::open_with_config(std::path::Path::new(path), cfg).map_err(pyerr)?;
         Ok(Self { inner: db })
     }
 
-    /// Open read-only.
+    /// Open read-only (shared lock). Uses env-derived config (Phase 2 env flags are respected).
     #[staticmethod]
     pub fn open_ro(path: &str) -> PyResult<Self> {
         let cfg = qdb::config::QuiverConfig::from_env();
@@ -59,7 +86,7 @@ impl Database {
         self.inner.put(key, value).map_err(pyerr)
     }
 
-    /// Get key -> Optional[bytes] (pyo3 0.26: PyBytes::new возвращает Bound<'py, PyBytes>).
+    /// Get key -> Optional[bytes].
     pub fn get<'py>(&self, py: Python<'py>, key: &[u8]) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let v = self.inner.get(key).map_err(pyerr)?;
         Ok(v.map(|b| PyBytes::new(py, &b)))

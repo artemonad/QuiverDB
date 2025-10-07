@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{PathBuf};
 
 // Подмодули с реализацией команд
 pub mod admin;   // публичный, чтобы тесты могли вызывать admin::* напрямую
@@ -12,6 +12,9 @@ pub mod cdc;
 pub use cdc::wal_apply_from_stream; // удобный реэкспорт для тестов и внешнего кода
 
 use crate::util::parse_u8_byte;
+
+// Для base64 печати сырых байт реестра при не-UTF8
+use base64::Engine as _; // позволяет вызывать STANDARD.encode(...)
 
 /// RAII-гард, который:
 /// - в begin() ставит clean_shutdown=false (БД «грязная»)
@@ -287,7 +290,7 @@ pub enum Cmd {
         to_lsn: Option<u64>,
     },
 
-    // Snapshot/Backup (Phase 1 — one-shot backup with implicit snapshot)
+    // Snapshot/Backup (Phase 1: one-shot)
     Backup {
         /// DB path
         #[arg(long)]
@@ -338,6 +341,45 @@ pub enum Cmd {
         json: bool,
     },
     MetricsReset,
+
+    // -------- Phase 2: persisted snapshots registry (view) --------
+    /// List persisted snapshots from .snapshots/registry.json (best-effort).
+    Snapshots {
+        /// DB path (root)
+        #[arg(long)]
+        path: PathBuf,
+        /// JSON output (prints registry.json contents as-is if present)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    // -------- Phase 2: remove persisted snapshot (dec_ref + delete sidecar) --------
+    SnapRm {
+        /// DB path (root)
+        #[arg(long)]
+        path: PathBuf,
+        /// Snapshot id (directory name under .snapshots/)
+        #[arg(long)]
+        id: String,
+    },
+
+    // -------- Phase 2: compact snapstore (.snapstore/store.bin) --------
+    SnapCompact {
+        /// DB path (root)
+        #[arg(long)]
+        path: PathBuf,
+        /// JSON output for report
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    // -------- New: WAL checkpoint (manual truncate to header) --------
+    /// Truncate WAL to header (manual checkpoint). Requires data_fsync=true.
+    Checkpoint {
+        /// DB path (root)
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -420,7 +462,7 @@ pub fn run() -> Result<()> {
         Cmd::CdcReplay { path, input, from_lsn, to_lsn } =>
             cdc::cmd_cdc_replay(path, input, from_lsn, to_lsn),
 
-        // ------- Snapshot/Backup (Phase 1: one-shot) -------
+        // ------- Snapshot/Backup -------
         Cmd::Backup { path, out, since_lsn } => {
             use crate::Db;
             let mut db = Db::open(&path)?;
@@ -431,7 +473,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
 
-        // ------- Restore (Phase 1) -------
+        // ------- Restore -------
         Cmd::Restore { path, from, verify } => {
             crate::backup::restore_from_dir(&path, &from)?;
             if verify {
@@ -451,5 +493,181 @@ pub fn run() -> Result<()> {
         // ------- v0.9: metrics -------
         Cmd::Metrics { json } => admin::cmd_metrics_json(json),
         Cmd::MetricsReset => admin::cmd_metrics_reset(),
+
+        // ------- Phase 2: persisted snapshots registry (view) -------
+        Cmd::Snapshots { path, json } => cmd_snapshots_list(path, json),
+
+        // ------- Phase 2: remove persisted snapshot -------
+        Cmd::SnapRm { path, id } => cmd_snapshot_rm(path, id),
+
+        // ------- Phase 2: compact snapstore -------
+        Cmd::SnapCompact { path, json } => cmd_snap_compact(path, json),
+
+        // ------- New: WAL checkpoint -------
+        Cmd::Checkpoint { path } => {
+            use anyhow::anyhow;
+            use crate::Db;
+            // Open writer to ensure exclusive lock and run replay if needed.
+            let db = Db::open(&path)?;
+            if !db.cfg.data_fsync {
+                return Err(anyhow!(
+                    "checkpoint requires data_fsync=true (P1_DATA_FSYNC=1); \
+                     enable it to ensure segments are durable before truncating WAL"
+                ));
+            }
+            let mut wal = crate::wal::Wal::open_for_append(&path)?;
+            wal.truncate_to_header()?;
+            println!("Checkpoint: truncated WAL to header at {}", path.display());
+            drop(db);
+            Ok(())
+        }
     }
+}
+
+// -------- Phase 2 helper: list persisted snapshots registry --------
+
+fn cmd_snapshots_list(path: PathBuf, json: bool) -> Result<()> {
+    let reg_path = path.join(".snapshots").join("registry.json");
+    if !reg_path.exists() {
+        if json {
+            println!("{{\"entries\":[]}}");
+        } else {
+            println!("(no persisted snapshots)");
+        }
+        return Ok(());
+    }
+
+    let bytes = std::fs::read(&reg_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {}", reg_path.display(), e))?;
+
+    if json {
+        // Печатаем как есть
+        match std::str::from_utf8(&bytes) {
+            Ok(s) => println!("{}", s),
+            Err(_) => {
+                // На всякий: если не UTF-8, печатаем безопасно через base64
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                println!("{{\"raw_base64\":\"{}\"}}", b64);
+            }
+        }
+        return Ok(());
+    }
+
+    // Human-readable вывод
+    let v: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse registry.json: {}", e))?;
+
+    let entries = v.get("entries").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    if entries.is_empty() {
+        println!("(no persisted snapshots)");
+        return Ok(());
+    }
+
+    println!("Persisted snapshots ({}):", entries.len());
+    for e in entries {
+        let id = e.get("id").and_then(|x| x.as_str()).unwrap_or("-");
+        let lsn = e.get("lsn").and_then(|x| x.as_u64()).unwrap_or(0);
+        let ended = e.get("ended").and_then(|x| x.as_bool()).unwrap_or(false);
+        let ts = e.get("ts_nanos").and_then(|x| x.as_u64()).unwrap_or(0);
+        println!("  {}  lsn={}  ended={}  ts_nanos={}", id, lsn, ended, ts);
+    }
+    Ok(())
+}
+
+// -------- Phase 2: remove persisted snapshot (dec_ref + delete sidecar) --------
+
+fn cmd_snapshot_rm(path: PathBuf, id: String) -> Result<()> {
+    use anyhow::anyhow;
+    use byteorder::{ByteOrder, LittleEndian};
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom};
+    use crate::snapshots::store::SnapStore;
+    use crate::meta::read_meta;
+
+    // 1) Check sidecar dir
+    let snap_dir = path.join(".snapshots").join(&id);
+    if !snap_dir.exists() {
+        return Err(anyhow!("snapshot sidecar not found: {}", snap_dir.display()));
+    }
+
+    // 2) Parse hashindex.bin -> unique hashes
+    let hash_path = snap_dir.join("hashindex.bin");
+    let mut hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    if hash_path.exists() {
+        let mut f = OpenOptions::new().read(true).open(&hash_path)
+            .map_err(|e| anyhow!("open {}: {}", hash_path.display(), e))?;
+        let len = f.metadata()?.len();
+        const REC: u64 = 8 + 8 + 8; // [page_id u64][hash u64][page_lsn u64]
+        let mut pos = 0u64;
+        let mut buf = vec![0u8; REC as usize];
+        while pos + REC <= len {
+            f.seek(SeekFrom::Start(pos))?;
+            f.read_exact(&mut buf)?;
+            let hash = LittleEndian::read_u64(&buf[8..16]);
+            hashes.insert(hash);
+            pos += REC;
+        }
+    }
+
+    // 3) DecRef in SnapStore (best-effort)
+    if !hashes.is_empty() {
+        let ps = read_meta(&path)?.page_size;
+        if let Ok(mut ss) = SnapStore::open(&path, ps) {
+            for h in hashes {
+                let _ = ss.dec_ref(h);
+            }
+        }
+    }
+
+    // 4) Remove sidecar directory
+    let _ = std::fs::remove_dir_all(&snap_dir);
+
+    // 5) Mark ended in registry.json (best-effort)
+    let reg_path = path.join(".snapshots").join("registry.json");
+    if reg_path.exists() {
+        if let Ok(bytes) = std::fs::read(&reg_path) {
+            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(arr) = v.get_mut("entries").and_then(|x| x.as_array_mut()) {
+                    for ent in arr.iter_mut() {
+                        if ent.get("id").and_then(|x| x.as_str()) == Some(&id) {
+                            ent.as_object_mut().map(|m| m.insert("ended".to_string(), serde_json::Value::Bool(true)));
+                            break;
+                        }
+                    }
+                    if let Ok(s) = serde_json::to_string_pretty(&v) {
+                        let _ = std::fs::write(&reg_path, s.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Removed snapshot '{}' (sidecar deleted, snapstore refs decremented best-effort)", id);
+    Ok(())
+}
+
+// -------- Phase 2: compact snapstore (.snapstore/store.bin) --------
+
+fn cmd_snap_compact(path: PathBuf, json: bool) -> Result<()> {
+    use crate::snapshots::store::SnapStore;
+    use crate::meta::read_meta;
+
+    // Открыть snapstore
+    let ps = read_meta(&path)?.page_size;
+    let mut ss = SnapStore::open(&path, ps)?;
+
+    let rep = ss.compact()?;
+    if json {
+        println!(
+            "{{\"before\":{},\"after\":{},\"kept\":{},\"dropped\":{}}}",
+            rep.before, rep.after, rep.kept, rep.dropped
+        );
+    } else {
+        println!("SnapStore compact:");
+        println!("  before  = {} bytes", rep.before);
+        println!("  after   = {} bytes", rep.after);
+        println!("  kept    = {} frame(s)", rep.kept);
+        println!("  dropped = {} frame(s)", rep.dropped);
+    }
+    Ok(())
 }

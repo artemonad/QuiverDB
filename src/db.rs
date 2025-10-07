@@ -27,7 +27,7 @@ use crate::db_maintenance;
 // New: KV put-in-chain delegation
 use crate::db_kv;
 
-// New: snapshots (Phase 1 scaffold + read path)
+// New: snapshots (Phase 1/2)
 use crate::snapshots::{SnapshotManager, SnapshotHandle};
 
 pub struct Db {
@@ -36,21 +36,21 @@ pub struct Db {
     pub dir: Directory,
     _lock: LockGuard,
     readonly: bool,
-    /// New: runtime configuration (built from env or explicit builder)
+    /// Runtime configuration (built from env or explicit builder)
     pub cfg: QuiverConfig,
-    /// New: in-process subscriptions registry
+    /// In-process subscriptions registry
     pub subs: std::sync::Arc<SubRegistry>,
-    /// New (Phase 1): in-process snapshot manager (writer only)
+    /// Snapshot manager (writer only)
     pub snap_mgr: Option<Arc<Mutex<SnapshotManager>>>,
 }
 
 impl Db {
-    /// New: builder entry point
+    /// Builder entry point
     pub fn builder() -> DbBuilder {
         DbBuilder::new()
     }
 
-    /// New: subscribe for live events by key prefix.
+    /// Subscribe for live events by key prefix.
     /// The callback is called synchronously by writer after successful commit_page.
     pub fn subscribe_prefix<F>(&self, prefix: Vec<u8>, cb: F) -> SubscriptionHandle
     where
@@ -59,22 +59,27 @@ impl Db {
         self.subs.subscribe(prefix, callback(cb))
     }
 
-    /// New: open writer with explicit config (exclusive lock)
+    /// Open writer with explicit config (exclusive lock)
     pub fn open_with_config(root: &std::path::Path, cfg: QuiverConfig) -> Result<Self> {
         let lock = acquire_exclusive_lock(root)?;
         // group-commit settings from config
         Wal::set_group_config(root, WalGroupCfg { coalesce_ms: cfg.wal_coalesce_ms })?;
         wal_replay_if_any(root)?;
 
-        // Открываем пейджер и каталог
+        // Open pager and directory
         let mut pager = Pager::open_with_config(root, &cfg)?;
         let dir = Directory::open(root)?;
 
-        // Writer помечаем как "грязный"
+        // Writer: mark DB as dirty
         set_clean_shutdown(root, false)?;
 
-        // Создаём менеджер снапшотов и передаём его в пейджер
-        let snap_mgr = Arc::new(Mutex::new(SnapshotManager::new(root)));
+        // Create snapshot manager with Phase 2 options from config (incl. snapstore_dir)
+        let snap_mgr = Arc::new(Mutex::new(SnapshotManager::new_with_options(
+            root,
+            cfg.snap_persist,
+            cfg.snap_dedup,
+            cfg.snapstore_dir.clone(),
+        )));
         pager.set_snapshot_manager(Some(snap_mgr.clone()));
 
         Ok(Self {
@@ -89,7 +94,7 @@ impl Db {
         })
     }
 
-    /// New: open reader (shared lock) with explicit config
+    /// Open reader (shared lock) with explicit config
     pub fn open_ro_with_config(root: &std::path::Path, cfg: QuiverConfig) -> Result<Self> {
         let lock = acquire_shared_lock(root)?;
         let pager = Pager::open_with_config(root, &cfg)?;
@@ -102,26 +107,24 @@ impl Db {
             readonly: true,
             cfg,
             subs: SubRegistry::new(),
-            snap_mgr: None, // RO: снапшоты менеджеру writer'а не нужны
+            snap_mgr: None, // RO: no snapshot manager needed
         })
     }
 
-    /// Открыть БД для записи: exclusive lock, wal_replay, clean_shutdown=false.
     /// Backward-compatible: loads config from env.
     pub fn open(root: &std::path::Path) -> Result<Self> {
         let cfg = QuiverConfig::from_env();
         Self::open_with_config(root, cfg)
     }
 
-    /// Открыть БД «только чтение»: shared lock, без replay, без изменения clean_shutdown.
+    /// Open read-only: shared lock, no replay, no clean_shutdown changes.
     /// Backward-compatible: loads config from env.
     pub fn open_ro(root: &std::path::Path) -> Result<Self> {
         let cfg = QuiverConfig::from_env();
         Self::open_ro_with_config(root, cfg)
     }
 
-    /// Phase 1: начать снапшотную сессию (in-process).
-    /// Возвращает SnapshotHandle с зафиксированным snapshot_lsn.
+    /// Begin snapshot (in-process). Returns SnapshotHandle with fixed snapshot_lsn.
     pub fn snapshot_begin(&mut self) -> Result<SnapshotHandle> {
         if self.readonly {
             return Err(anyhow!("Db is read-only; snapshots require a writer handle"));
@@ -134,19 +137,16 @@ impl Db {
         guard.begin(self)
     }
 
-    /// Phase 1: завершить снапшотную сессию.
-    /// Сообщает менеджеру, а затем удаляет sidecar у handle (best-effort).
+    /// End snapshot (Phase 1/2).
     pub fn snapshot_end(&mut self, snap: &mut SnapshotHandle) -> Result<()> {
-        // Менеджер известит об окончании (пересчёт max_snapshot_lsn)
         if let Some(mgr) = &self.snap_mgr {
             let mut g = mgr.lock().unwrap();
-            let _ = g.end(&snap.id); // если уже завершён — ок
+            let _ = g.end(&snap.id);
         }
-        // Удалим sidecar'ы (best-effort)
         snap.end()
     }
 
-    /// Helper: publish put event (writer only)
+    /// Publish put event (writer only)
     fn publish_put_event(&self, key: &[u8], value: &[u8]) {
         if self.readonly {
             return;
@@ -159,7 +159,7 @@ impl Db {
         self.subs.publish(&ev);
     }
 
-    /// Helper: publish delete event (writer only)
+    /// Publish delete event (writer only)
     fn publish_del_event(&self, key: &[u8]) {
         if self.readonly {
             return;
@@ -175,7 +175,7 @@ impl Db {
     pub fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         let ps = self.pager.meta.page_size as usize;
 
-        // New: overflow threshold from config if provided; otherwise default = ps/4
+        // overflow threshold from config if provided; otherwise default = ps/4
         let ovf_threshold = self
             .cfg
             .ovf_threshold_bytes
@@ -214,12 +214,11 @@ impl Db {
 
             self.pager.commit_page(new_pid, &mut buf)?;
             self.dir.set_head(bucket, new_pid)?;
-            // Publish event once after successful commit + head update
             self.publish_put_event(key, val);
             return Ok(());
         }
 
-        // Delegation to db_kv module
+        // Delegation to db_kv
         db_kv::put_in_chain(self, bucket, head, key, val, need_overflow)
     }
 
@@ -231,7 +230,6 @@ impl Db {
         }
         let ps = self.pager.meta.page_size as usize;
 
-        // Возвращаем последнюю встреченную версию по порядку цепочки (tail wins).
         let mut best: Option<Vec<u8>> = None;
 
         while pid != NO_PAGE {
@@ -294,11 +292,9 @@ impl Db {
             let next = h.next_page_id;
 
             if h.used_slots == 0 {
-                // NEW: зафризим KV-страницу перед вырезанием/освобождением,
-                // чтобы снапшоты могли читать "старую" версию цепочки
+                // Freeze KV page before cutting it from chain (for snapshots)
                 if let Some(mgr) = &self.snap_mgr {
                     let mut g = mgr.lock().unwrap();
-                    // buf содержит актуальную страницу h.lsn
                     g.freeze_if_needed(pid, h.lsn, &buf)?;
                 }
 
@@ -322,7 +318,6 @@ impl Db {
 
         self.sweep_orphan_overflow()?;
 
-        // Publish single delete event if the key existed
         if existed_any {
             self.publish_del_event(key);
         }
@@ -332,7 +327,6 @@ impl Db {
 
     fn sweep_orphan_overflow(&self) -> Result<()> {
         if self.readonly {
-            // В RO режиме не трогаем пространство.
             return Ok(());
         }
         db_maintenance::sweep_orphan_overflow_writer(self)

@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "QuiverDB"
-version = "1.2.2"
+version = "1.2.5"
 edition = "2021"
 description = "Embedded KV DB with in-page Robin Hood index, WAL, directory and overflow chains"
 readme = "README.md"
@@ -39,12 +39,14 @@ fs2 = "0.4"
 # CDC compression
 flate2 = "1"        # gzip encoder/decoder
 zstd = "0.13"       # zstd encoder/decoder
-# FFI JSON config (используются в ffi.rs; можно оставить общими)
+# FFI JSON config (используются в ffi.rs и snapshots/registry.rs)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Логирование (lib + инициализация в CLI)
 log = "0.4"
 env_logger = "0.11"
+# Base64 для CLI вывода реестра при не-UTF8
+base64 = "0.21"
 
 [dev-dependencies]
 oorandom = "11"

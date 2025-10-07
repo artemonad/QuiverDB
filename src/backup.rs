@@ -1,4 +1,4 @@
-//! Incremental/Full backup (Phase 1).
+//! Incremental/Full backup (Phase 1 + Phase 2 dedup best-effort).
 //!
 //! Идея: делаем бэкап "как есть" на момент снапшота S (snapshot_lsn = S).
 //! Для каждой страницы page_id:
@@ -13,7 +13,10 @@
 //! - dir.bin: копия файла каталога <root>/dir (если присутствует)
 //! - manifest.json: минимальная сводка (snapshot_lsn, since_lsn, page_size, pages_emitted, bytes_emitted, dir_present, dir_bytes)
 //!
-//! Примечание: Phase 1 — без дедупликации. В Phase 2 будет manifest с хэшами и blobs.
+//! Phase 2 (подготовка, без ломки форматов):
+//! - Если включён дедуп (cfg.snap_dedup = true), для каждого выбранного кадра снова кладём payload в SnapStore
+//!   (content-addressed, best-effort). Это не влияет на pages.bin и restore; чтение из SnapStore будет
+//!   добавлено позже вместе с persisted snapshot registry/GC.
 
 use anyhow::{anyhow, Context, Result};
 use byteorder::{ByteOrder, LittleEndian};
@@ -31,6 +34,9 @@ use crate::pager::Pager;
 use crate::snapshots::SnapshotHandle;
 use crate::util::v2_page_lsn;
 use crate::metrics::{record_backup_page_emitted, record_restore_page_written};
+
+// Phase 2: SnapStore (content-addressed dedup best-effort on backup)
+use crate::snapshots::store::SnapStore;
 
 /// Бэкап в директорию out_dir (создаётся при необходимости).
 /// Если since_lsn=None — full backup (все страницы как на S).
@@ -75,6 +81,20 @@ pub fn backup_to_dir(
     // Будем обновлять его по мере необходимости (retry) при промахах.
     let mut freeze_index = build_freeze_index(snap)?;
 
+    // Phase 2: лениво откроем SnapStore, если включён дедуп в конфиге.
+    let mut snapstore: Option<SnapStore> = if db.cfg.snap_dedup {
+        match SnapStore::open(&db.root, db.pager.meta.page_size) {
+            Ok(ss) => Some(ss),
+            Err(e) => {
+                // Не валим бэкап — просто логируем предупреждение.
+                warn!("backup: snapstore open failed (dedup disabled for this run): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Пройдём все page_id
     let total_pages = db.pager.meta.next_page_id;
     debug!(
@@ -103,6 +123,11 @@ pub fn backup_to_dir(
             if !(lsn_used > since && lsn_used <= snapshot_lsn) {
                 continue;
             }
+        }
+
+        // Phase 2: best-effort дедуп — сохранить кадр в SnapStore.
+        if let Some(ss) = snapstore.as_mut() {
+            let _ = ss.put(&payload);
         }
 
         // Header: [page_id u64][page_lsn u64][page_len u32][crc32 u32]

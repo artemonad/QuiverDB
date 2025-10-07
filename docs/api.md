@@ -1,13 +1,15 @@
-# QuiverDB API Guide (v1.2, Phase 1)
+# QuiverDB API Guide (v1.2.x, Phase 1 + Phase 2)
 
 Audience: Rust developers embedding QuiverDB or building tooling around it.  
-Status: v1.2 (Phase 1 snapshots/backup); on-disk formats remain frozen: meta v3, page v2, WAL v1.
+Status: v1.2.x — on-disk formats remain frozen: meta v3, page v2, WAL v1.  
+Phase 1: in-process snapshots and backup/restore.  
+Phase 2: persisted snapshots registry + SnapStore (content-addressed dedup).
 
-Links:
+Links
 - CDC guide: docs/cdc.md
 - On-disk format: docs/format.md
 - FFI (C ABI): docs/ffi.md
-- Snapshots/Backup details: docs/snapshots.md
+- Snapshots (Phase 1 + Phase 2): docs/snapshots.md
 
 Table of contents
 - 1) Concepts
@@ -32,31 +34,45 @@ Table of contents
 - Single-writer, multi-reader:
   - Writer opens with an exclusive lock and may modify files.
   - Readers open with a shared lock and never mutate files or meta.
+
 - Crash safety via WAL:
   - All writes append page images to WAL (CRC-protected, monotonic LSN).
-  - Replay is tolerant to partial tails and unknown record types.
+  - Replay tolerates partial tails and unknown record types.
   - v2 pages (KV_RH/OVERFLOW) are applied only when wal_lsn > page_lsn (LSN-gating).
-- Pages:
-  - v2 pages have a 64-byte header: MAGIC, version=2, type (KV_RH=2 | OVERFLOW=3), page_id, next_page_id, lsn, crc32.
+
+- Pages (v2):
+  - 64-byte header: MAGIC, version=2, type (KV_RH=2 | OVERFLOW=3), page_id, next_page_id, lsn, crc32.
   - KV_RH stores key/value pairs with a Robin Hood index.
-  - OVERFLOW stores large values in chains referenced from KV as a fixed 18-byte placeholder.
+  - OVERFLOW stores large values in chains referenced from KV by an 18-byte placeholder.
+
 - Directory (dir file):
   - Array of bucket heads; KV pages form chains (head → next → …).
-  - Updates are atomic (tmp+rename) and protect with header CRC.
+  - Updates are atomic (tmp+rename) and protected with a header CRC.
+
 - Free-list:
   - Tracks freed page IDs for reuse.
-- Tail-wins semantics within a chain:
-  - If multiple versions of a key exist along a bucket chain, the last one (closer to the tail) is authoritative.
 
-New in v1.2 (Phase 1)
-- Snapshot isolation for reads by LSN:
-  - In-process snapshots (not persisted across restarts).
+- Tail-wins semantics:
+  - If multiple versions of a key exist along a bucket chain, the last one (closer to the tail) wins.
+
+New in Phase 1
+- Snapshot isolation for reads by LSN (in-process):
   - Page-level copy-on-write (COW) via “freeze” before overwrite/free.
-  - Snapshot reads choose live or frozen page “as of” snapshot_lsn (see docs/snapshots.md).
+  - Snapshot reads choose live or frozen page “as of” snapshot_lsn.
+
 - Backup/Restore on top of snapshots:
   - Full and incremental backup (since_lsn).
-  - Restore with CRC checks, sets clean_shutdown=true.
-  - No dedup in Phase 1 (Phase 2 adds content-hash dedup).
+  - Restore with CRC checks; sets clean_shutdown=true.
+
+New in Phase 2
+- Persisted snapshots:
+  - Registry at <root>/.snapshots/registry.json (best-effort).
+  - Sidecar retains freeze assets beyond process lifetime.
+
+- SnapStore (content-addressed dedup):
+  - Shared store under <root>/.snapstore (configurable) with refcounted frames by hash.
+  - Sidecar adds hashindex.bin for fallback reads when freeze.bin is absent.
+  - snapcompact reclaims frames with refcnt=0.
 
 ---
 
@@ -83,19 +99,24 @@ Lock file path: <root>/LOCK. On Windows, advisory locks are best-effort and guar
 
 QuiverDB uses a central config object with a builder. Backward compatibility with environment variables is preserved.
 
-Fields:
-- wal_coalesce_ms: u64 — group-commit fsync coalescing window (ms). Default: 3.
+Fields (core):
+- wal_coalesce_ms: u64 — WAL fsync coalescing window (ms). Default: 3.
 - data_fsync: bool — fsync data segments on commit. Default: true.
 - page_cache_pages: usize — page cache size (0 disables). Default: 0.
 - ovf_threshold_bytes: Option<usize> — overflow threshold:
   - None → page_size/4.
 
+Phase 2 fields:
+- snap_persist: bool — enable persisted snapshots registry/sidecars. Default: false.
+- snapstore_dir: Option<String> — custom SnapStore directory (default <root>/.snapstore).
+- snap_dedup: bool — enable SnapStore (dedup + hashindex). Default: false.
+
 Sources:
-- By default, Db::open/open_ro read env vars into QuiverConfig (old behavior).
-- Explicit config via Db::open_with_config/open_ro_with_config overrides env.
+- By default, Db::open/open_ro read env vars into QuiverConfig (legacy behavior).
+- Explicit config via Db::open_with_config/open_ro_with_config overrides env values (core).
+- SnapStore directory is resolved via env (P1_SNAPSTORE_DIR).
 
 Example:
-
 ```rust
 use anyhow::Result;
 use QuiverDB::{Db, Directory, init_db};
@@ -113,15 +134,15 @@ fn main() -> Result<()> {
         .data_fsync(true)
         .page_cache_pages(256)
         .ovf_threshold_bytes(None)
+        .snap_persist(true)
+        .snap_dedup(true)
         .build();
 
-    // Writer
     {
         let mut db = Db::open_with_config(root, cfg.clone())?;
         db.put(b"alpha", b"1")?;
     }
 
-    // Reader
     {
         let db_ro = Db::open_ro_with_config(root, cfg)?;
         assert_eq!(db_ro.get(b"alpha")?.as_deref(), Some(b"1".as_ref()));
@@ -141,7 +162,7 @@ Notes:
 
 Commit sequence for a page write:
 1. Compute new LSN = meta.last_lsn + 1.
-2. Snapshot COW: if there are active snapshots that may need the current page (snapshot_lsn ≥ current_page_lsn), freeze the current page bytes before overwrite (append to freeze.bin and index.bin).
+2. Snapshot COW: if there are active snapshots that may need the current page (snapshot_lsn ≥ current_page_lsn), freeze the current page bytes before overwrite/free.
 3. If page is v2, write lsn into header and update page CRC.
 4. Append WAL record (header + payload), fsync WAL (group-commit).
 5. Write data page to its segment file (fsync controlled by data_fsync).
@@ -162,7 +183,7 @@ Replay (writer only):
 Partial tails:
 - A short read for a record header or payload is treated as normal EOF.
 
-Optimization (v1.2):
+Optimization:
 - WAL replay performs LSN-gating before ensure_allocated to avoid unnecessary allocations.
 
 ---
@@ -189,26 +210,31 @@ Subscriptions (in-process):
   - Synchronous callbacks on writer thread after successful commit.
   - Event: { key: Vec<u8>, value: Option<Vec<u8>>, lsn: u64 }.
 
-Snapshot Isolation (Phase 1):
+Snapshot Isolation (Phase 1 + 2):
 - Db::snapshot_begin() -> Result<SnapshotHandle>
   - SnapshotHandle:
     - lsn() -> u64
     - get(key: &[u8]) -> Result<Option<Vec<u8>>> — consistent at snapshot_lsn
     - scan_all()/scan_prefix() — consistent at snapshot_lsn
-    - end() — drop sidecar (freeze/index)
-- Details:
-  - Snapshot reads choose live vs frozen page for each page_id (as-of snapshot LSN).
-  - Overflow chains resolved per-page the same way (as-of snapshot).
-  - Fallback scan (rare) reconstructs tail-wins if chain head moved after snapshot.
+    - end() — end and optionally remove sidecar (Phase 1) or keep for persisted snapshots
+
+- Reading rules (short):
+  - For each page_id, select live if page_lsn ≤ snapshot_lsn, otherwise frozen; Phase 2 may fallback to SnapStore by hash if sidecar is missing.
+  - Overflow chains are resolved per page with the same rule.
 
 Backup/Restore (Phase 1):
 - backup::backup_to_dir(&db, &snap, out_dir, since_lsn: Option<u64>)
   - Full: since_lsn=None, includes all pages as-of snapshot_lsn.
   - Incremental: since_lsn=Some(N), includes pages with page_lsn ∈ (N, S].
   - Output: pages.bin (frames), dir.bin (optional), manifest.json (summary).
-  - Retries index refresh for frozen pages (hot backup robustness).
-- backup::restore_from_dir(dst_root, backup_dir)
-  - Writes pages to dst_root, installs dir.bin if present, updates last_lsn and clean_shutdown.
+
+Persisted snapshots and SnapStore (Phase 2):
+- Sidecar retains freeze.bin/index.bin across process lifetime.
+- hashindex.bin in sidecar: page_id → hash for fallback.
+- SnapStore under <root>/.snapstore (or P1_SNAPSTORE_DIR):
+  - store.bin: frames [hash u64][len u32][crc32 u32] + payload(page_size)
+  - index.bin: mapping hash → (offset, refcnt)
+- CLI management: snapshots list, snaprm (dec_ref + delete sidecar), snapcompact.
 
 Page cache:
 - Enabled when page_cache_pages > 0.
@@ -223,7 +249,7 @@ For tooling/testing (bypasses the KV layer). Use with care.
 - Pager::open(root) / Pager::open_with_config(root, &cfg)
 - allocate_pages(n) -> start_id
 - allocate_one_page() -> page_id (reuses from free-list when possible)
-- ensure_allocated(page_id) — ensure underlying segment exists and covers the page
+- ensure_allocated(page_id)
 - write_page_raw(page_id, &buf) — writes page without WAL (used by replay/restore)
 - commit_page(page_id, &mut buf) — WAL + fsync (commit sequence above)
 - read_page(page_id, &mut buf)
@@ -255,6 +281,7 @@ Most users should not use WAL directly. Advanced APIs:
 - wal::Wal::append_page_image(lsn, page_id, payload)
 - wal::Wal::fsync()
 - wal::Wal::maybe_truncate()
+- wal::Wal::truncate_to_header()
 - wal_replay_if_any(root) — writer-only startup recovery
 
 CDC tooling (see docs/cdc.md):
@@ -277,7 +304,6 @@ Wire format (v1):
 Core:
 - P1_WAL_COALESCE_MS = integer (default 3) — WAL fsync coalescing (ms)
 - P1_DATA_FSYNC = 0|1 (default 1) — fsync data segments per commit
-  - When 0: WAL is not truncated at commit; truncated on replay.
 - P1_PAGE_CACHE_PAGES = N — read cache size (0 disables)
 - P1_OVF_THRESHOLD_BYTES = N — overflow threshold (default: page_size/4)
 
@@ -290,8 +316,13 @@ CDC (ship/apply):
 - P1_SHIP_COMPRESS = none|gzip|zstd
 - P1_APPLY_DECOMPRESS = none|gzip|zstd
 
+Phase 2 (snapshots/snapstore):
+- P1_SNAP_PERSIST = 0|1
+- P1_SNAP_DEDUP = 0|1
+- P1_SNAPSTORE_DIR = path (absolute or relative to <root>)
+
 CLI helper:
-- P1_DB_GET_OUT = path — write raw value to a file in dbget
+- P1_DB_GET_OUT = path — write dbget payload to a file
 
 ---
 
@@ -318,7 +349,14 @@ High-level DB:
 Snapshots/Backup:
 - backup --path ./db --out ./backup [--since-lsn N]
 - restore --path ./dst --from ./backup [--verify]
-  - verify runs strict check after restore
+
+Phase 2 snapshots/snapstore:
+- snapshots --path ./db [--json]
+- snaprm --path ./db --id <snapshot_id>
+- snapcompact --path ./db [--json]
+
+WAL:
+- checkpoint --path ./db (truncate WAL to header; requires data_fsync=true)
 
 Integrity/maintenance:
 - check [--strict] [--json], repair
@@ -375,7 +413,6 @@ WAL (v1) — <root>/wal-000001.log:
 ## 14) Practical examples
 
 Initialize, create directory, basic ops:
-
 ```bash
 quiverdb init --path ./db --page-size 4096
 quiverdb dbinit --path ./db --page-size 4096 --buckets 128
@@ -386,7 +423,6 @@ quiverdb dbstats --path ./db
 ```
 
 Scan and CDC snippets:
-
 ```bash
 # Scan all / by prefix (JSON)
 quiverdb dbscan --path ./db --json
@@ -401,8 +437,7 @@ quiverdb cdc record --path ./leader --out ./slice.bin --from-lsn 100 --to-lsn 20
 quiverdb cdc replay --path ./follower --input ./slice.bin --from-lsn 100 --to-lsn 200
 ```
 
-Snapshots/Backup:
-
+Snapshots/Backup/Phase 2:
 ```bash
 # Full backup at snapshot
 quiverdb backup --path ./db --out ./backup
@@ -412,33 +447,36 @@ quiverdb backup --path ./db --out ./backup_incr --since-lsn 12345
 
 # Restore (optional verify)
 quiverdb restore --path ./db_restored --from ./backup --verify
+
+# Persisted snapshots and snapstore management
+quiverdb snapshots --path ./db --json
+quiverdb snaprm --path ./db --id <snapshot_id>
+quiverdb snapcompact --path ./db --json
+
+# WAL checkpoint
+quiverdb checkpoint --path ./db
 ```
 
 Rust (snapshot isolation):
-
 ```rust
 use anyhow::Result;
 use QuiverDB::{Db, Directory, init_db};
 
 fn main() -> Result<()> {
-    let root = std::path::Path::new("./db");
-    if !root.exists() {
-        init_db(root, 4096)?;
-        Directory::create(root, 128)?;
-    }
+  let root = std::path::Path::new("./db");
+  if !root.exists() {
+    init_db(root, 4096)?;
+    Directory::create(root, 128)?;
+  }
 
-    let mut db = Db::open(root)?;
-    db.put(b"k", b"v0")?;
+  let mut db = Db::open(root)?;
+  db.put(b"k", b"v0")?;
 
-    let mut s = db.snapshot_begin()?;
-    db.put(b"k", b"v1")?;
+  let mut s = db.snapshot_begin()?;
+  db.put(b"k", b"v1")?;
 
-    assert_eq!(s.get(b"k")?.as_deref(), Some(b"v0".as_ref()));
-    db.snapshot_end(&mut s)?;
-    Ok(())
+  assert_eq!(s.get(b"k")?.as_deref(), Some(b"v0".as_ref()));
+  db.snapshot_end(&mut s)?;
+  Ok(())
 }
 ```
-
----
-
-This API guide summarizes v1.2 Phase 1: in-process snapshot isolation and backup/restore without changing frozen on-disk formats, plus the existing WAL/CDC, directory, and KV APIs.

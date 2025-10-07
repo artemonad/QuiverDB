@@ -8,6 +8,45 @@ On-disk formats remain frozen across 1.x:
 Dates use ISO format (YYYY-MM-DD).
 
 
+## [1.2.5] – 2025-10-07
+
+Phase 2 finalized (persisted snapshots + SnapStore), polish, and release readiness.
+
+Added
+- SnapStore directory override
+  - P1_SNAPSTORE_DIR supports absolute paths or relative-to-DB-root paths.
+  - SnapStore exposes dir_path() for diagnostics/tests.
+- CLI: checkpoint
+  - quiverdb checkpoint — manually truncates WAL to header (requires data_fsync=true).
+  - Under the hood uses Wal::truncate_to_header().
+- Tests
+  - snapstore_custom_dir: validates P1_SNAPSTORE_DIR (relative and absolute).
+  - checkpoint: validates WAL manual truncate-to-header.
+
+Changed/Improved
+- SnapshotManager::new_with_flags(root, snap_persist, snap_dedup)
+  - Phase 2 flags (persist/dedup) now can be provided via config (preferred).
+  - SnapshotManager::new(root) kept for backward compatibility (reads ENV).
+- Db::open_with_config now uses SnapshotManager::new_with_flags(...) to honor QuiverConfig flags.
+- Docs
+  - README updated (Phase 2 overview).
+  - docs/snapshots.md rewritten in English (Phase 1 + Phase 2).
+  - API guide updated with Wal::truncate_to_header().
+
+Fixed
+- SnapStore refcount when the same content is frozen for multiple snapshots in one operation
+  - First ss.put(page_bytes) increments to 1; additional snapshots call ss.add_ref(hash).
+  - Prevents accidental frame loss on compact after removing only one of multiple referencing snapshots.
+
+Compatibility
+- On-disk formats unchanged (meta v3, page v2, WAL v1).
+- CLI/API additions are backward-compatible; existing tooling continues to work.
+
+Upgrade notes
+- If you plan to keep persisted snapshots and use SnapStore, consider setting P1_SNAP_DEDUP=1 and (optionally) P1_SNAPSTORE_DIR.
+- checkpoint should be used only when data_fsync=true to ensure safety.
+
+
 ## [1.2.2] – 2025-10-06
 
 Hardening and polish for Phase 1 snapshots and startup replay. Formats unchanged.
@@ -53,14 +92,14 @@ Added
   - SnapshotHandle::get/scan_all/scan_prefix — consistent view at snapshot_lsn
   - SnapshotHandle::end() — drops sidecar
 - Page-level COW (freeze store)
-  - Before overwriting/freeing a v2 page whose LSN may be needed by a live snapshot, the current image is copied into sidecar
+  - Before overwriting/freeing a v2 page whose LSN may be needed by a live snapshot, the current image is frozen into a sidecar store
   - Sidecar: <root>/.snapshots/<id> with:
     - freeze.bin: frames [page_id u64][page_lsn u64][page_len u32][crc32 u32] + payload(page_size)
     - index.bin: [page_id u64][offset u64][page_lsn u64]
 - Backup/Restore (on top of snapshots)
-  - Full backup (all pages as-of snapshot_lsn)
-  - Incremental backup (pages with page_lsn in (since_lsn, snapshot_lsn])
-  - Restore writes pages back, installs dir.bin (if present), sets last_lsn and clean_shutdown=true
+  - Full and incremental backup (pages with page_lsn in (since_lsn, snapshot_lsn])
+  - Archive layout: pages.bin (frames), dir.bin (optional), manifest.json (summary)
+  - Restore writes pages back, installs dir.bin (if present), sets last_lsn and clean_shutdown
   - CLI:
     - quiverdb backup --path ./db --out ./backup [--since-lsn N]
     - quiverdb restore --path ./dst --from ./backup [--verify]
@@ -90,7 +129,6 @@ Compatibility
 Upgrade notes
 - Phase 1 snapshots are in-process only (not persisted across restarts)
 - Backup deduplication and persisted snapshot registry are planned in a later phase
-- For CDC streams, ensure wal-apply uses matching decompression when wal-ship compresses (gzip/zstd)
 
 
 ## [1.1.5] – 2025-10-05
@@ -175,3 +213,5 @@ Initial 1.x with frozen formats (meta v3, page v2, WAL v1).
   - WAL group-commit (fsync coalescing), P1_DATA_FSYNC option, page cache (optional)
 - CDC
   - wal-tail (JSONL), wal-ship (binary), wal-apply (idempotent apply with LSN gating)
+
+MIT License
