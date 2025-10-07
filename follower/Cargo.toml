@@ -1,0 +1,25 @@
+[package]
+name = "quiverdb-follower"
+version = "1.3.0-alpha.0"
+edition = "2021"
+license = "MIT"
+description = "Minimal follower/applier daemon for QuiverDB WAL streaming"
+repository = "https://github.com/artemonad/QuiverDB"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+flate2 = "1"        # gzip decoder
+zstd = "0.13"       # zstd decoder
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# TLS
+rustls = { version = "0.22", default-features = false, features = ["ring"] }
+rustls-pemfile = "1"
+QuiverDB = { path = "..", package = "QuiverDB" }
+
+[[bin]]
+name = "quiverdb-follower"
+path = "src/main.rs"

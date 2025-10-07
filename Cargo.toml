@@ -2,6 +2,7 @@
 members = [
     ".",                # корневой крейт QuiverDB (lib+bin)
     "python/quiverdb",  # PyO3-обёртка для Python (cdylib)
+    "follower"
 ]
 
 [package]
