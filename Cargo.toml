@@ -1,0 +1,70 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "QuiverDB"
+version = "2.0.0"
+edition = "2021"
+description = "Embedded KV DB with in-page Robin Hood index, WAL, directory and overflow chains"
+readme = "README.md"
+repository = "https://github.com/artemonad/QuiverDB"
+license = "MIT"
+keywords = ["database", "embedded", "kv", "wal", "robin-hood"]
+categories = ["database", "embedded"]
+authors = ["Федорчук Артем (artemonад)"]
+
+[lib]
+name = "QuiverDB"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "quiverdb"
+path = "src/bin/quiverdb/main.rs"
+
+[[bin]]
+name = "quiverdb_metrics"
+path = "src/bin/quiverdb_metrics.rs"
+
+[[bin]]
+name = "quiverdb_bench"
+path = "src/bin/quiverdb_bench.rs"
+
+[features]
+default = []
+ffi = []
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+byteorder = "1.5"
+crc32fast = "1"
+crc32c = "0.6"
+twox-hash = "1"
+fs2 = "0.4"
+flate2 = "1"
+zstd = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+base64 = "0.21"
+tiny_http = "0.12"
+# TDE (AES-GCM tag)
+aes-gcm = "0.10"
+# CDC PSK (HMAC-SHA256)
+hmac = "0.12"
+sha2 = "0.10"
+# NEW TLS (native-tls) + PEM parser
+native-tls = "0.2"
+pem = "3"
+# Zeroize секретов (TDE/KMS)
+zeroize = "1"
+# NEW: генерация nonce/случайных байтов для KMS wrap/unwrap
+rand = "0.8"
+# NEW: mmap для Bloom sidecar
+memmap2 = "0.9"
+
+[dev-dependencies]
+oorandom = "11"
