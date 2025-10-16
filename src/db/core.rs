@@ -3,7 +3,7 @@
 //! Дополнено:
 //! - impl Drop for Db: в writer-режиме при закрытии усечёт WAL до заголовка и
 //!   сохранит актуальную meta (last_lsn/next_page_id + clean_shutdown=true) через write_meta_overwrite.
-//! - In‑memory keydir (per‑bucket key -> page_id) для ускорения get()/exists/scan без изменения форматов.
+//! - In‑memory keydir (per‑bucket key -> (page_id, off)) для ускорения get()/exists/scan без изменения форматов.
 //! - Writer-only обёртки для обновления голов каталога:
 //!   Db::set_dir_head / Db::set_dir_heads_bulk (используйте в тестах/админ‑скриптах).
 //!   Прямой вызов Directory::set_head/set_heads_bulk теперь закрыт во внешнем API (pub(crate)).
@@ -34,13 +34,21 @@ pub(crate) fn open_lock_file(root: &Path) -> Result<std::fs::File> {
     Ok(f)
 }
 
-/// Простой in‑memory keydir: per‑bucket map key -> page_id.
+/// Локация ключа для in‑memory keydir: (page_id, off).
+/// pid = NO_PAGE означает tombstone (ключ отсутствует).
+#[derive(Clone, Copy, Debug)]
+pub struct MemKeyLoc {
+    pub pid: u64,
+    pub off: u32,
+}
+
+/// Простой in‑memory keydir: per‑bucket map key -> (page_id, off).
 /// Назначение: ускорить get()/exists/scan без изменения форматов.
 /// Построение выполняется отдельно (на этапе открытия RO/по команде).
 #[derive(Debug, Default)]
 pub struct MemKeyDir {
     // buckets == maps.len()
-    maps: Vec<HashMap<Vec<u8>, u64>>,
+    maps: Vec<HashMap<Vec<u8>, MemKeyLoc>>,
 }
 
 impl MemKeyDir {
@@ -57,20 +65,34 @@ impl MemKeyDir {
         self.maps.len() as u32
     }
 
+    /// Вставка локации: (pid, off). pid=NO_PAGE означает tombstone.
     #[inline]
-    pub fn insert(&mut self, bucket: u32, key: &[u8], page_id: u64) {
+    pub fn insert_loc(&mut self, bucket: u32, key: &[u8], loc: MemKeyLoc) {
         if (bucket as usize) < self.maps.len() {
-            self.maps[bucket as usize].insert(key.to_vec(), page_id);
+            self.maps[bucket as usize].insert(key.to_vec(), loc);
         }
     }
 
+    /// Вставка совместимости: только pid (off=0).
     #[inline]
-    pub fn get(&self, bucket: u32, key: &[u8]) -> Option<u64> {
+    pub fn insert(&mut self, bucket: u32, key: &[u8], page_id: u64) {
+        self.insert_loc(bucket, key, MemKeyLoc { pid: page_id, off: 0 });
+    }
+
+    /// Получить локацию (pid, off).
+    #[inline]
+    pub fn get_loc(&self, bucket: u32, key: &[u8]) -> Option<MemKeyLoc> {
         if (bucket as usize) < self.maps.len() {
             self.maps[bucket as usize].get(key).copied()
         } else {
             None
         }
+    }
+
+    /// Совместимый геттер: вернуть только pid (или None).
+    #[inline]
+    pub fn get(&self, bucket: u32, key: &[u8]) -> Option<u64> {
+        self.get_loc(bucket, key).map(|l| l.pid)
     }
 
     #[inline]
@@ -80,25 +102,49 @@ impl MemKeyDir {
         }
     }
 
-    /// Внутренний помощник: обойти все пары (bucket, key, pid).
+    /// Обход всех пар (bucket, key, pid). NO_PAGE не фильтруется — решает вызывающий код.
     #[inline]
     pub fn for_each<F: FnMut(u32, &[u8], u64)>(&self, mut f: F) {
         for (b, map) in self.maps.iter().enumerate() {
             let b = b as u32;
-            for (k, pid) in map.iter() {
-                f(b, k.as_slice(), *pid);
+            for (k, loc) in map.iter() {
+                f(b, k.as_slice(), loc.pid);
             }
         }
     }
 
-    /// Внутренний помощник: обойти пары (bucket, key, pid) по префиксу.
+    /// Обход по префиксу (bucket, key, pid).
     #[inline]
     pub fn for_each_prefix<F: FnMut(u32, &[u8], u64)>(&self, prefix: &[u8], mut f: F) {
         for (b, map) in self.maps.iter().enumerate() {
             let b = b as u32;
-            for (k, pid) in map.iter() {
+            for (k, loc) in map.iter() {
                 if k.as_slice().starts_with(prefix) {
-                    f(b, k.as_slice(), *pid);
+                    f(b, k.as_slice(), loc.pid);
+                }
+            }
+        }
+    }
+
+    /// Обход всех пар (bucket, key, pid, off).
+    #[inline]
+    pub fn for_each_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(&self, mut f: F) {
+        for (b, map) in self.maps.iter().enumerate() {
+            let b = b as u32;
+            for (k, loc) in map.iter() {
+                f(b, k.as_slice(), *loc);
+            }
+        }
+    }
+
+    /// Обход по префиксу (bucket, key, pid, off).
+    #[inline]
+    pub fn for_each_prefix_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(&self, prefix: &[u8], mut f: F) {
+        for (b, map) in self.maps.iter().enumerate() {
+            let b = b as u32;
+            for (k, loc) in map.iter() {
+                if k.as_slice().starts_with(prefix) {
+                    f(b, k.as_slice(), *loc);
                 }
             }
         }
@@ -153,15 +199,17 @@ impl Db {
         self.mem_keydir.is_some()
     }
 
+    /// Новый быстрый путь: получить локацию (pid, off).
     #[inline]
-    pub(crate) fn mem_keydir_get(&self, bucket: u32, key: &[u8]) -> Option<u64> {
-        self.mem_keydir.as_ref().and_then(|kd| kd.get(bucket, key))
+    pub(crate) fn mem_keydir_get_loc(&self, bucket: u32, key: &[u8]) -> Option<MemKeyLoc> {
+        self.mem_keydir.as_ref().and_then(|kd| kd.get_loc(bucket, key))
     }
 
+    /// Вставка локации (pid, off) — используется строителем keydir.
     #[inline]
-    pub(crate) fn mem_keydir_insert(&mut self, bucket: u32, key: &[u8], pid: u64) {
+    pub(crate) fn mem_keydir_insert_loc(&mut self, bucket: u32, key: &[u8], loc: MemKeyLoc) {
         if let Some(kd) = self.mem_keydir.as_mut() {
-            kd.insert(bucket, key, pid);
+            kd.insert_loc(bucket, key, loc);
         }
     }
 
@@ -172,7 +220,7 @@ impl Db {
         }
     }
 
-    /// Обход всех пар (bucket, key, pid) из keydir. NO_PAGE не фильтруется — решает вызывающий код.
+    /// Обход всех пар (bucket, key, pid). NO_PAGE не фильтруется — решает вызывающий код.
     #[inline]
     pub(crate) fn mem_keydir_for_each<F: FnMut(u32, &[u8], u64)>(&self, f: F) {
         if let Some(kd) = self.mem_keydir.as_ref() {
@@ -180,11 +228,29 @@ impl Db {
         }
     }
 
-    /// Обход по префиксу (bucket, key, pid) из keydir.
+    /// Обход по префиксу (bucket, key, pid).
     #[inline]
     pub(crate) fn mem_keydir_for_each_prefix<F: FnMut(u32, &[u8], u64)>(&self, prefix: &[u8], f: F) {
         if let Some(kd) = self.mem_keydir.as_ref() {
             kd.for_each_prefix(prefix, f);
+        }
+    }
+
+    /// Обход с оффсетами (bucket, key, MemKeyLoc).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn mem_keydir_for_each_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(&self, f: F) {
+        if let Some(kd) = self.mem_keydir.as_ref() {
+            kd.for_each_with_off(f);
+        }
+    }
+
+    /// Обход по префиксу с оффсетами (bucket, key, MemKeyLoc).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn mem_keydir_for_each_prefix_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(&self, prefix: &[u8], f: F) {
+        if let Some(kd) = self.mem_keydir.as_ref() {
+            kd.for_each_prefix_with_off(prefix, f);
         }
     }
 

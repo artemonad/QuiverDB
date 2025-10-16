@@ -16,11 +16,6 @@
 //!   P1_TLS_CA_FILE             — PEM‑файл c CA (поддерживаются блоки CERTIFICATE/TRUSTED CERTIFICATE)
 //!   P1_TLS_CLIENT_PFX          — путь к PFX/PKCS#12 (mTLS; опц.)
 //!   P1_TLS_CLIENT_PFX_PASSWORD — пароль к PFX (mTLS; опц.)
-//!
-//! Изменения:
-//! - Убран доступ к приватным полям pem::Pem (tag/contents). Реализован свой
-//!   parser PEM‑сертификатов (parse_pem_certs) → DER → native_tls::Certificate.
-//! - Введена проверка минимальной длины PSK (>=16 байт).
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
@@ -268,7 +263,7 @@ pub fn open_tls_psk_stream(addr: &str) -> Result<IoStream> {
     Ok(IoStream::Tls(tls))
 }
 
-/// Простейший разбор PEM-файла с извлечением всех сертификатов DER.
+/// Простейший разбор PEM‑файла с извлечением всех сертификатов DER.
 /// Поддерживаются блоки:
 ///   -----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----
 ///   -----BEGIN TRUSTED CERTIFICATE----- ... -----END TRUSTED CERTIFICATE-----

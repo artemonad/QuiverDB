@@ -234,20 +234,17 @@ impl<'a> Batch<'a> {
             self.db.dir.set_heads_bulk(&updates)?;
         }
 
-        // 6) NEW: Bloom delta-update (best-effort, не ломает коммит)
+        // 6) NEW: Bloom delta-update (best-effort) — без двойного учёта метрик
         if !updates.is_empty() {
             if !bloom_keys.is_empty() {
                 if let Ok(mut sidecar) = BloomSidecar::open_or_create_for_db(&self.db, 4096, 6) {
                     let new_lsn = self.db.pager.meta.last_lsn;
-                    let bpb = sidecar.bytes_per_bucket() as u64;
 
                     for (bucket, keys_vec) in bloom_keys.into_iter() {
                         // соберём &[&[u8]]
                         let key_slices: Vec<&[u8]> = keys_vec.iter().map(|k| k.as_slice()).collect();
-                        if sidecar.update_bucket_bits(bucket, &key_slices, new_lsn).is_ok() {
-                            // учёт метрик
-                            record_bloom_update(bpb);
-                        }
+                        // Метрика record_bloom_update(..) уже учитывается внутри update_bucket_bits()
+                        let _ = sidecar.update_bucket_bits(bucket, &key_slices, new_lsn);
                     }
                 }
             } else {

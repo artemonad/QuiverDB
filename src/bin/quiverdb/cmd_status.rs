@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result};
 use std::path::PathBuf;
 
 use QuiverDB::db::Db;
@@ -7,7 +7,7 @@ use QuiverDB::meta::read_meta;
 // Bloom side-car status + cache counters (через реэкспорт)
 use QuiverDB::bloom::{BloomSidecar, bloom_cache_stats, bloom_cache_counters};
 // Page cache diagnostics
-use QuiverDB::pager::cache::{page_cache_len, page_cache_evictions_total};
+use QuiverDB::pager::cache::{page_cache_len, page_cache_evictions_total, page_cache_invalidations_total};
 // metrics snapshot
 use QuiverDB::metrics;
 // Key journal (TDE epochs)
@@ -40,9 +40,10 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
     let mem_keydir_present = db.has_mem_keydir();
 
     // Bloom status + meta + cache stats
+    let bloom_sidecar_ro = BloomSidecar::open_ro(&path);
     let (bloom_present, bloom_buckets, bloom_fresh, bloom_bpb, bloom_k, bloom_last_lsn) =
-        match BloomSidecar::open_ro(&path) {
-            Ok(sidecar) => (
+        match bloom_sidecar_ro {
+            Ok(ref sidecar) => (
                 true,
                 Some(sidecar.buckets()),
                 Some(sidecar.is_fresh_for_db(&db)),
@@ -55,6 +56,25 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
     let (bloom_cache_cap, bloom_cache_entries) = bloom_cache_stats();
     let (bloom_cache_hits, bloom_cache_misses) = bloom_cache_counters();
 
+    // Bloom stale reason
+    let bloom_reason = if !bloom_present {
+        "absent".to_string()
+    } else if let Some(b) = bloom_buckets {
+        if b != dir.bucket_count {
+            "buckets_mismatch".to_string()
+        } else if let Some(lsn) = bloom_last_lsn {
+            if lsn != db.pager.meta.last_lsn {
+                "stale_last_lsn".to_string()
+            } else {
+                "fresh".to_string()
+            }
+        } else {
+            "stale_last_lsn".to_string()
+        }
+    } else {
+        "absent".to_string()
+    };
+
     if json {
         // Metrics snapshot
         let ms = metrics::snapshot();
@@ -62,6 +82,7 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
         // Page cache diagnostics (live)
         let pc_len = page_cache_len() as u64;
         let pc_ev = page_cache_evictions_total();
+        let pc_inv = page_cache_invalidations_total();
 
         print!("{{");
         // meta
@@ -137,6 +158,12 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
         // new: bloom cache counters
         print!(",\"cache_hits\":{}", bloom_cache_hits);
         print!(",\"cache_misses\":{}", bloom_cache_misses);
+
+        // NEW: stale reason and expectations
+        print!(",\"reason\":\"{}\"", bloom_reason);
+        print!(",\"expected_buckets\":{}", dir.bucket_count);
+        print!(",\"expected_last_lsn\":{}", db.pager.meta.last_lsn);
+
         print!("}},"); // bloom
 
         // directory summary
@@ -161,6 +188,7 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
         // NEW: page cache diagnostics
         print!("\"page_cache_len\":{},", pc_len);
         print!("\"page_cache_evictions_total\":{},", pc_ev);
+        print!("\"page_cache_invalidations_total\":{},", pc_inv);
 
         // NEW: keydir fast-path
         print!("\"keydir_hits\":{},", ms.keydir_hits);
@@ -177,7 +205,6 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
         print!("\"snapshots_active\":{},", ms.snapshots_active);
         print!("\"snapshot_freeze_frames\":{},", ms.snapshot_freeze_frames);
         print!("\"snapshot_freeze_bytes\":{},", ms.snapshot_freeze_bytes);
-
         print!("\"backup_pages_emitted\":{},", ms.backup_pages_emitted);
         print!("\"backup_bytes_emitted\":{},", ms.backup_bytes_emitted);
         print!("\"restore_pages_written\":{},", ms.restore_pages_written);
@@ -253,30 +280,32 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
         println!("  present          = true");
         println!("  buckets          = {}", bloom_buckets.unwrap_or(0));
         println!("  fresh            = {}", bloom_fresh.unwrap_or(false));
-        // meta
+        if let Some(lsn) = bloom_last_lsn {
+            println!("  last_lsn         = {}", lsn);
+        }
+        println!("  reason           = {}", bloom_reason);
+        println!("  expected_buckets = {}", dir.bucket_count);
+        println!("  expected_last_lsn= {}", db.pager.meta.last_lsn);
         if let Some(bpb) = bloom_bpb {
             println!("  bytes_per_bucket = {}", bpb);
         }
         if let Some(k) = bloom_k {
             println!("  k_hashes         = {}", k);
         }
-        if let Some(lsn) = bloom_last_lsn {
-            println!("  last_lsn         = {}", lsn);
-        }
     } else {
         println!("  present          = false");
+        println!("  reason           = absent");
+        println!("  expected_buckets = {}", dir.bucket_count);
+        println!("  expected_last_lsn= {}", db.pager.meta.last_lsn);
     }
     // cache stats
     println!("  cache_cap        = {}", bloom_cache_cap);
     println!("  cache_entries    = {}", bloom_cache_entries);
-    // new: counters
     println!("  cache_hits       = {}", bloom_cache_hits);
     println!("  cache_misses     = {}", bloom_cache_misses);
 
-    // NEW: Bloom updates (delta)
-    let ms = metrics::snapshot();
-
     // Metrics snapshot (human)
+    let ms = metrics::snapshot();
     println!("Metrics snapshot:");
     println!("  wal_appends_total       = {}", ms.wal_appends_total);
     println!("  wal_bytes_written       = {}", ms.wal_bytes_written);
@@ -289,14 +318,10 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
     println!("  page_cache_hits         = {}", ms.page_cache_hits);
     println!("  page_cache_misses       = {}", ms.page_cache_misses);
     println!("  page_cache_hit_ratio    = {:.2}%", ms.cache_hit_ratio() * 100.0);
-    // NEW: diagnostics
     println!("  page_cache_len          = {}", page_cache_len());
-    println!(
-        "  page_cache_evictions    = {}",
-        page_cache_evictions_total()
-    );
+    println!("  page_cache_evictions    = {}", page_cache_evictions_total());
+    println!("  page_cache_invalidations= {}", page_cache_invalidations_total());
 
-    // NEW: keydir fast-path
     println!("  keydir_hits             = {}", ms.keydir_hits);
     println!("  keydir_misses           = {}", ms.keydir_misses);
     println!("  keydir_hit_ratio        = {:.2}%", ms.keydir_hit_ratio() * 100.0);
@@ -323,13 +348,11 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
         "  bloom tests/neg/pos/skip= {}/{}/{}/{}",
         ms.bloom_tests, ms.bloom_negative, ms.bloom_positive, ms.bloom_skipped_stale
     );
-    // NEW: packing metrics
     println!("  pack_pages              = {}", ms.pack_pages);
     println!("  pack_records            = {}", ms.pack_records);
     println!("  pack_pages_single       = {}", ms.pack_pages_single);
     println!("  pack_avg_records/page   = {:.2}", ms.avg_pack_records_per_page());
 
-    // NEW: lazy compact metrics
     println!("  lazy_compact_runs       = {}", ms.lazy_compact_runs);
     println!("  lazy_compact_pages_written = {}", ms.lazy_compact_pages_written);
 

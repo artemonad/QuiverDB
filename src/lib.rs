@@ -22,6 +22,10 @@ pub mod bloom;  // src/bloom/mod.rs
 // Утилиты (now_secs, decode_ovf_placeholder_v3, ...)
 pub mod util;   // src/util/mod.rs
 
+// NEW: FFI (C ABI) — включается фичей "ffi"
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 // Удобные реэкспорты
 pub use db::Db;
 pub use dir::Directory;

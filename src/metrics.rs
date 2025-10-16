@@ -15,6 +15,7 @@
 //! - Bloom delta-update — учёт обновлений bloom.bin из batch
 //! - NEW: Lazy compaction — срабатывания и переписанные страницы
 //! - NEW: WAL threshold flush — счётчики пороговых fsync вне явного батча
+//! - NEW: Compaction totals — итоговые счётчики выбранных/удалённых ключей и упакованных страниц
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -86,6 +87,11 @@ static PACK_PAGES_SINGLE: AtomicU64 = AtomicU64::new(0);
 static LAZY_COMPACT_RUNS: AtomicU64 = AtomicU64::new(0);
 static LAZY_COMPACT_PAGES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
+// NEW: Compaction totals (single-scan compaction)
+static COMPACTION_KEYS_SELECTED: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_KEYS_DELETED: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_PAGES_PACKED: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     // WAL
@@ -107,6 +113,9 @@ pub struct MetricsSnapshot {
     // Page cache
     pub page_cache_hits: u64,
     pub page_cache_misses: u64,
+
+    // NEW: page cache explicit invalidations (LIVE, из кэша)
+    pub page_cache_invalidations_total: u64,
 
     // NEW: in-memory keydir fast-path
     pub keydir_hits: u64,
@@ -131,7 +140,7 @@ pub struct MetricsSnapshot {
     pub restore_pages_written: u64,
     pub restore_bytes_written: u64,
 
-    // NEW: fallback-сканы под снапшотами
+    // NEW: fallback-сканы под снапшотом
     pub snapshot_fallback_scans: u64,
 
     // NEW: TTL read-side
@@ -155,6 +164,11 @@ pub struct MetricsSnapshot {
     // NEW: Lazy compaction
     pub lazy_compact_runs: u64,
     pub lazy_compact_pages_written: u64,
+
+    // NEW: Compaction totals
+    pub compaction_keys_selected: u64,
+    pub compaction_keys_deleted: u64,
+    pub compaction_pages_packed: u64,
 }
 
 impl MetricsSnapshot {
@@ -352,6 +366,17 @@ pub fn record_lazy_compact_run(pages_written: u64) {
     LAZY_COMPACT_PAGES_WRITTEN.fetch_add(pages_written, Ordering::Relaxed);
 }
 
+// ----- Recorders (Compaction totals) -----
+pub fn record_compaction_keys_selected(n: u64) {
+    COMPACTION_KEYS_SELECTED.fetch_add(n, Ordering::Relaxed);
+}
+pub fn record_compaction_keys_deleted(n: u64) {
+    COMPACTION_KEYS_DELETED.fetch_add(n, Ordering::Relaxed);
+}
+pub fn record_compaction_pages_packed(n: u64) {
+    COMPACTION_PAGES_PACKED.fetch_add(n, Ordering::Relaxed);
+}
+
 // ----- Snapshot / Reset -----
 pub fn snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
@@ -372,6 +397,9 @@ pub fn snapshot() -> MetricsSnapshot {
 
         page_cache_hits: PAGE_CACHE_HITS.load(Ordering::Relaxed),
         page_cache_misses: PAGE_CACHE_MISSES.load(Ordering::Relaxed),
+
+        // NEW: explicit invalidations (берём live из кэша)
+        page_cache_invalidations_total: crate::pager::cache::page_cache_invalidations_total(),
 
         // NEW
         keydir_hits: KEYDIR_HITS.load(Ordering::Relaxed),
@@ -413,6 +441,11 @@ pub fn snapshot() -> MetricsSnapshot {
         // NEW: lazy compact
         lazy_compact_runs: LAZY_COMPACT_RUNS.load(Ordering::Relaxed),
         lazy_compact_pages_written: LAZY_COMPACT_PAGES_WRITTEN.load(Ordering::Relaxed),
+
+        // NEW: compaction totals
+        compaction_keys_selected: COMPACTION_KEYS_SELECTED.load(Ordering::Relaxed),
+        compaction_keys_deleted: COMPACTION_KEYS_DELETED.load(Ordering::Relaxed),
+        compaction_pages_packed: COMPACTION_PAGES_PACKED.load(Ordering::Relaxed),
     }
 }
 
@@ -475,4 +508,9 @@ pub fn reset() {
     // NEW: lazy compact
     LAZY_COMPACT_RUNS.store(0, Ordering::Relaxed);
     LAZY_COMPACT_PAGES_WRITTEN.store(0, Ordering::Relaxed);
+
+    // NEW: compaction totals
+    COMPACTION_KEYS_SELECTED.store(0, Ordering::Relaxed);
+    COMPACTION_KEYS_DELETED.store(0, Ordering::Relaxed);
+    COMPACTION_PAGES_PACKED.store(0, Ordering::Relaxed);
 }

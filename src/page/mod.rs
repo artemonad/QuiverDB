@@ -44,7 +44,8 @@ pub use kv::{
     kv_init_v3,
     kv_header_read_v3,
     kv_header_write_v3,
-    kv_read_record,
+    // Устаревший kv_read_record больше не реэкспортируем, используйте безопасные хелперы из kv::
+    // kv_read_record_at_checked, kv_for_each_record, kv_for_each_record_with_off, kv_find_record_by_key, ...
 };
 
 pub use ovf::{

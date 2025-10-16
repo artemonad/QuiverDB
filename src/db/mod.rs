@@ -11,6 +11,7 @@
 //! - doctor.rs      — doctor-скан (CRC/IO) с JSON-отчётом
 //! - compaction.rs  — онлайн-компактация цепочек (bucket/all)
 //! - vacuum.rs      — вакуум: compaction_all + sweep_orphan_overflow
+//! - read_page.rs   — общие хелперы per‑page чтения (newest→oldest, TTL/tombstone/placeholder)
 
 pub mod core;
 pub mod open;
@@ -22,5 +23,7 @@ pub mod maintenance;
 pub mod doctor;
 pub mod compaction;
 pub mod vacuum;
+// NEW: общие хелперы per‑page чтения (используются get/exists)
+pub mod read_page;
 
 pub use core::Db;

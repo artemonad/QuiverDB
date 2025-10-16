@@ -21,11 +21,15 @@
 //! NEW (2.3): пороговые fsync'и WAL (P1_WAL_FLUSH_EVERY / P1_WAL_FLUSH_BYTES) не должны срабатывать
 //! внутри батча. Для этого мы явно оборачиваем последовательность BEGIN..COMMIT в
 //! wal.start_batch() / wal.end_batch() — см. writer.rs.
+//!
+//! NEW (perf/env): размер буфера записи сегмента настраивается через ENV P1_SEG_WRITE_BUF_MB
+//! (по умолчанию 16 MiB).
 
 use anyhow::{anyhow, Result};
 use byteorder::{ByteOrder, LittleEndian};
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
+use std::sync::OnceLock;
 
 use crate::page::{
     kv_header_read_v3, kv_header_write_v3, ovf_header_read_v3, ovf_header_write_v3,
@@ -212,13 +216,15 @@ fn write_pages_grouped_by_segment(pager: &mut Pager, pages: &mut [(u64, &mut [u8
         groups.entry(seg_no).or_default().push((off, idx));
     }
 
+    let buf_cap = seg_write_buf_bytes();
+
     for (seg_no, mut entries) in groups {
         // Отсортируем по off
         entries.sort_unstable_by_key(|e| e.0);
 
         // Откроем сегмент 1 раз и обернём BufWriter’ом
         let file = pager.open_seg_rw(seg_no, false)?;
-        let mut bw = BufWriter::with_capacity(16 * 1024 * 1024, file);
+        let mut bw = BufWriter::with_capacity(buf_cap, file);
 
         // Пишем все страницы этого сегмента последовательно
         let mut cur_pos: Option<u64> = None;
@@ -280,4 +286,20 @@ fn v3_page_lsn(buf: &[u8]) -> Option<u64> {
         t if t == PAGE_TYPE_OVERFLOW3 => Some(LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8])),
         _ => None,
     }
+}
+
+/// Размер буфера записи сегментов (байт), настраиваемый через ENV.
+/// P1_SEG_WRITE_BUF_MB — мегабайты (целое, по умолчанию 16).
+fn seg_write_buf_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb = std::env::var("P1_SEG_WRITE_BUF_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(16);
+        // ограничим от 1 до 1024 MiB на всякий случай
+        let mb = mb.min(1024).max(1);
+        mb * 1024 * 1024
+    })
 }

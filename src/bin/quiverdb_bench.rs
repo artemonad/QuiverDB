@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use QuiverDB::bloom::BloomSidecar;
 use QuiverDB::db::Db;
 use QuiverDB::dir::Directory;
-use QuiverDB::meta::read_meta;
+use QuiverDB::meta::{read_meta, init_meta_v4, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32C};
 
 /// Простой детерминированный PRNG (SplitMix64).
 /// Достаточен для бенчей; не криптостойкий.
@@ -74,6 +74,12 @@ enum Profile {
     Strict,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CodecChoice {
+    None,
+    Zstd,
+}
+
 /// QuiverDB micro-benchmark CLI
 ///
 /// Примеры:
@@ -101,6 +107,10 @@ struct Opt {
     /// Buckets count for init (уменьшено по умолчанию, чтобы packing был эффективным)
     #[arg(long, default_value_t = 32)]
     buckets: u32,
+
+    /// Optional default codec for OVERFLOW (none|zstd). If set, used on init.
+    #[arg(long, value_enum)]
+    codec: Option<CodecChoice>,
 
     /// Total operations for point tests (load, gets, exists)
     #[arg(long, default_value_t = 100_000)]
@@ -130,6 +140,10 @@ struct Opt {
     /// Number of big values to write/read
     #[arg(long, default_value_t = 256)]
     big_n: u64,
+
+    /// Batch size for big values (0 = single puts; >0 = batched big_put)
+    #[arg(long, default_value_t = 0)]
+    big_batch_size: usize,
 
     /// Random seed
     #[arg(long, default_value_t = 0xA1B2_C3D4_E5F6_7788)]
@@ -275,8 +289,13 @@ fn run() -> Result<()> {
 
     // Phase E: big values (OVERFLOW)
     let big_size = opt.big_size.unwrap_or((opt.page_size as usize) * 2);
-    println!("==> Phase: big_put ({} items, size={} B)", opt.big_n, big_size);
-    phases.push(phase_big_put(&opt, big_size)?);
+    if opt.big_batch_size > 0 {
+        println!("==> Phase: big_put ({} items, size={} B, batched={})", opt.big_n, big_size, opt.big_batch_size);
+        phases.push(phase_big_put_batched(&opt, big_size)?);
+    } else {
+        println!("==> Phase: big_put ({} items, size={} B)", opt.big_n, big_size);
+        phases.push(phase_big_put(&opt, big_size)?);
+    }
     println!("==> Phase: big_get ({} items)", opt.big_n);
     phases.push(phase_big_get(&opt, big_size)?);
 
@@ -321,6 +340,13 @@ fn apply_profile_env(profile: Profile) {
             std::env::set_var("P1_PAGE_CHECKSUM", "0");
             if std::env::var("P1_PAGE_CACHE_PAGES").is_err() {
                 std::env::set_var("P1_PAGE_CACHE_PAGES", "8192");
+            }
+            // NEW: для big путей
+            if std::env::var("P1_PAGE_CACHE_OVF").is_err() {
+                std::env::set_var("P1_PAGE_CACHE_OVF", "1");
+            }
+            if std::env::var("P1_PREALLOC_PAGES").is_err() {
+                std::env::set_var("P1_PREALLOC_PAGES", "16384");
             }
         }
         Profile::Balanced => {
@@ -520,6 +546,35 @@ fn phase_big_put(opt: &Opt, big_size: usize) -> Result<PhaseStats> {
     Ok(stats)
 }
 
+fn phase_big_put_batched(opt: &Opt, big_size: usize) -> Result<PhaseStats> {
+    let mut db = Db::open(&opt.path)?;
+    let mut lat = Vec::new();
+    let bs = opt.big_batch_size.max(1);
+    let total = opt.big_n as usize;
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(total);
+    for i in 0..total {
+        keys.push(format!("big-{:08x}", i as u64).into_bytes());
+    }
+    let mut prog = Progress::new("big_put", total, opt.progress);
+    let start = Instant::now();
+    for (i, chunk) in keys.chunks(bs).enumerate() {
+        let t0 = Instant::now();
+        db.batch(|b| {
+            for k in chunk {
+                let val = vec![0xCD; big_size];
+                b.put(k, &val)?;
+            }
+            Ok(())
+        })?;
+        lat.push(t0.elapsed());
+        prog.bump(std::cmp::min((i + 1) * bs, total));
+    }
+    let elapsed = start.elapsed();
+    let stats = stats("big_put", opt.big_n, elapsed, &mut lat);
+    print_phase_summary(&stats);
+    Ok(stats)
+}
+
 fn phase_big_get(opt: &Opt, _big_size: usize) -> Result<PhaseStats> {
     let db = Db::open_ro(&opt.path)?;
     let mut lat = Vec::with_capacity(opt.big_n as usize);
@@ -602,7 +657,7 @@ fn sizes(root: &Path) -> Result<(u64, u64)> {
 
 fn prepare_db(opt: &Opt) -> Result<()> {
     if opt.clean && opt.path.exists() {
-        fs::remove_dir_all(&opt.path).with_context(|| format!("remove {}", opt.path.display()))?;
+        fs::remove_dir_all(&opt.path)?;
     }
     if !opt.reuse {
         if !opt.path.exists() {
@@ -611,7 +666,15 @@ fn prepare_db(opt: &Opt) -> Result<()> {
         // init only if meta not present
         let meta_path = opt.path.join("meta");
         if !meta_path.exists() {
-            QuiverDB::Db::init(&opt.path, opt.page_size, opt.buckets)?;
+            match opt.codec {
+                Some(CodecChoice::Zstd) => {
+                    init_meta_v4(&opt.path, opt.page_size, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32C)?;
+                    Directory::create(&opt.path, opt.buckets)?;
+                }
+                _ => {
+                    QuiverDB::Db::init(&opt.path, opt.page_size, opt.buckets)?;
+                }
+            }
         }
     }
     Ok(())

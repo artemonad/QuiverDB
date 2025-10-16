@@ -8,7 +8,11 @@ use QuiverDB::{dir::Directory, meta::read_meta, metrics};
 // Bloom side-car + cache (только верхнеуровневые реэкспорты)
 use QuiverDB::bloom::{bloom_cache_stats, bloom_cache_counters};
 // Page cache diagnostics
-use QuiverDB::pager::cache::{page_cache_evictions_total, page_cache_len};
+use QuiverDB::pager::cache::{
+    page_cache_evictions_total,
+    page_cache_invalidations_total,  // NEW
+    page_cache_len
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -141,6 +145,7 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
 
     let pc_len = page_cache_len() as u64;
     let pc_ev = page_cache_evictions_total();
+    let pc_inv = page_cache_invalidations_total(); // NEW
 
     out.push_str("# HELP quiverdb_page_cache_len Current number of pages cached.\n");
     out.push_str("# TYPE quiverdb_page_cache_len gauge\n");
@@ -149,6 +154,11 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
     out.push_str("# HELP quiverdb_page_cache_evictions_total Evicted pages from page cache since start (or last reconfigure/clear).\n");
     out.push_str("# TYPE quiverdb_page_cache_evictions_total counter\n");
     out.push_str(&format!("quiverdb_page_cache_evictions_total {}\n", pc_ev));
+
+    // NEW: invalidations metric
+    out.push_str("# HELP quiverdb_page_cache_invalidations_total Explicit invalidations of page cache entries since start (or last reconfigure/clear).\n");
+    out.push_str("# TYPE quiverdb_page_cache_invalidations_total counter\n");
+    out.push_str(&format!("quiverdb_page_cache_invalidations_total {}\n", pc_inv));
 
     // --- Keydir fast-path ---
     out.push_str("# HELP quiverdb_keydir_hits In-memory keydir fast-path hits.\n");

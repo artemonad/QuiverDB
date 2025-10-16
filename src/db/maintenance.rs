@@ -24,10 +24,12 @@ use crate::page::{
 use crate::page::kv::kv_for_each_record;
 // util: общий парсер OVERFLOW placeholder (TLV 0x01, len=16)
 use crate::util::decode_ovf_placeholder_v3;
+// NEW: единый guard‑лимит для длины OVERFLOW‑цепочек
+use crate::page::ovf::chain::OVF_MAX_CHAIN_PAGES_GUARD;
 
 use super::core::Db;
 // отчёты компактора
-use super::compaction::{CompactBucketReport};
+use super::compaction::CompactBucketReport;
 
 impl Db {
     /// Печать сводки по БД. JSON-вариант включается ENV P1_DBSTATS_JSON=1|true|yes|on.
@@ -228,7 +230,7 @@ impl Db {
                         let mut guard = 0usize;
                         while cur != NO_PAGE {
                             guard += 1;
-                            if guard > 1_000_000 {
+                            if guard > OVF_MAX_CHAIN_PAGES_GUARD {
                                 break;
                             }
                             if !marked.insert(cur) {

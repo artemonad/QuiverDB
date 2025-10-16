@@ -8,6 +8,11 @@
 //! - Ключ кэша теперь использует u64 для db_id (раньше был usize, что приводило к усечению на 32‑битных платформах).
 //!   Это устраняет риск коллизий между БД при одинаковых page_id.
 //!
+//! Новое:
+//! - Разведены метрики:
+//!     * evictions_total — только реальные вытеснения алгоритмом second‑chance;
+//!     * invalidations_total — явные инвалидации по записи страницы (invalidate()).
+//!
 //! API (процесс-широкий, thread-safe):
 //! - page_cache_configure(page_size, cap_pages) — задать размер страницы и ёмкость (страниц). 0 — выключить.
 //! - page_cache_clear() — очистить содержимое, сохранив настройки.
@@ -15,6 +20,7 @@
 //! - page_cache_put(db_id: u64, page_id: u64, buf) — положить страницу (копия).
 //! - page_cache_invalidate(db_id: u64, page_id: u64) — инвалидация конкретного ключа.
 //! - page_cache_evictions_total() -> u64 — число выселений (диагностика).
+//! - page_cache_invalidations_total() -> u64 — число инвалидаций (диагностика).
 //! - page_cache_len() -> usize — текущее число страниц в кэше.
 //!
 //! Примечание:
@@ -50,8 +56,9 @@ struct GlobalCache {
     inited: bool,
     // Был ли кэш явно сконфигурирован приложением (через API), а не через ENV
     configured: bool,
-    // Счётчик выселений (диагностика)
-    evictions_total: u64,
+    // Счётчики (для метрик)
+    evictions_total: u64,       // только реальные вытеснения алгоритмом
+    invalidations_total: u64,   // явные инвалидации по записи
 }
 
 impl GlobalCache {
@@ -64,6 +71,7 @@ impl GlobalCache {
             inited: false,
             configured: false,
             evictions_total: 0,
+            invalidations_total: 0,
         }
     }
 
@@ -73,8 +81,9 @@ impl GlobalCache {
                 // Смена геометрии — сбросим содержимое, сохранив активную конфигурацию.
                 self.q.clear();
                 self.map.clear();
-                self.page_size = page_size;
                 self.evictions_total = 0;
+                self.invalidations_total = 0;
+                self.page_size = page_size;
             } else if self.page_size == 0 {
                 self.page_size = page_size;
             }
@@ -171,7 +180,7 @@ impl GlobalCache {
         let present = self.map.remove(key).is_some();
         if present {
             // Очередь чистим лениво (remove из map достаточно для корректности second-chance)
-            self.evictions_total = self.evictions_total.saturating_add(1);
+            self.invalidations_total = self.invalidations_total.saturating_add(1);
         }
     }
 
@@ -181,6 +190,7 @@ impl GlobalCache {
             self.q.clear();
             self.map.clear();
             self.evictions_total = 0;
+            self.invalidations_total = 0;
         }
         self.page_size = page_size;
         self.cap_pages = cap_pages;
@@ -191,6 +201,7 @@ impl GlobalCache {
             self.q.clear();
             self.map.clear();
             self.evictions_total = 0;
+            self.invalidations_total = 0;
         } else {
             // Если новая ёмкость меньше текущей — принудительно выселим лишние.
             while self.map.len() > self.cap_pages {
@@ -205,6 +216,7 @@ impl GlobalCache {
         self.q.clear();
         self.map.clear();
         self.evictions_total = 0;
+        self.invalidations_total = 0;
     }
 }
 
@@ -216,7 +228,7 @@ fn cache_lock() -> &'static Mutex<GlobalCache> {
 }
 
 /// Programmatic configuration of the global page cache (process-wide).
-/// Safe to call multiple times; switching page_size resets cache contents.
+/// Safe to call multiple times; switching page_size resets the cache contents.
 /// Setting cap_pages=0 disables the cache.
 pub fn page_cache_configure(page_size: usize, cap_pages: usize) {
     let mut cg = cache_lock().lock().unwrap();
@@ -262,6 +274,14 @@ pub fn page_cache_invalidate(db_id: u64, page_id: u64, page_size: usize) {
 pub fn page_cache_evictions_total() -> u64 {
     if let Ok(cg) = cache_lock().lock() {
         return cg.evictions_total;
+    }
+    0
+}
+
+/// Diagnostics: total number of explicit invalidations since start (or last reconfigure/clear).
+pub fn page_cache_invalidations_total() -> u64 {
+    if let Ok(cg) = cache_lock().lock() {
+        return cg.invalidations_total;
     }
     0
 }

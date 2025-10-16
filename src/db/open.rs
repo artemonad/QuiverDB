@@ -14,12 +14,12 @@ use crate::meta::set_clean_shutdown;
 // программная конфигурация процессного page cache
 use crate::pager::io::page_cache_configure;
 
-use super::core::{open_lock_file, Db, LOCK_FILE};
+use super::core::{open_lock_file, Db, LOCK_FILE, MemKeyLoc};
 
 use byteorder::{ByteOrder, LittleEndian};
 use crate::page::{kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3};
-// packed-aware helpers
-use crate::page::kv::kv_for_each_record;
+// packed-aware helpers (с оффсетами)
+use crate::page::kv::kv_for_each_record_with_off;
 // Bloom sidecar
 use crate::bloom::BloomSidecar;
 use crate::util::now_secs;
@@ -129,11 +129,10 @@ impl Db {
 
     /// Перестроить keydir в один проход по цепочке (head→tail).
     /// Логика:
-    /// - Обход каждой страницы в порядке “новые→старые” (kv_for_each_record).
+    /// - Обход каждой страницы в порядке “новые→старые” (kv_for_each_record_with_off).
     /// - Если по ключу уже принято решение — дальше его игнорируем.
-    /// - Tombstone → записать NO_PAGE в keydir (ускоритель отрицательных результатов).
-    /// - Валидная запись (TTL ок) → считаем ключ решённым, но в keydir ничего не пишем
-    ///   (ускоритель оставляет “miss” для присутствующих ключей).
+    /// - Tombstone → записать (pid=NO_PAGE, off=0) в keydir (ускоритель отрицательных результатов).
+    /// - Валидная запись (TTL ок) → записать (pid текущей страницы, off смещение записи) в keydir.
     fn rebuild_mem_keydir(&mut self) -> Result<()> {
         use std::collections::HashSet;
 
@@ -165,22 +164,26 @@ impl Db {
                 }
                 let hdr = kv_header_read_v3(&page)?;
 
-                // Обход “новые→старые” внутри страницы
-                kv_for_each_record(&page, |k, _v, expires_at_sec, vflags| {
+                // Обход “новые→старые” внутри страницы, с оффсетами
+                let bucket = b;
+                let cur_pid = pid;
+                kv_for_each_record_with_off(&page, |off_usize, k, _v, expires_at_sec, vflags| {
                     if decided.contains(k) {
                         return;
                     }
                     let is_tomb = (vflags & 0x1) == 1;
                     if is_tomb {
                         // Tombstone: фиксируем отрицательный ускоритель и отмечаем ключ решённым
-                        self.mem_keydir_insert(b, k, NO_PAGE);
+                        self.mem_keydir_insert_loc(bucket, k, MemKeyLoc { pid: NO_PAGE, off: 0 });
                         decided.insert(k.to_vec());
                         return;
                     }
                     // TTL: 0 — бессрочно; истёкшие записи пропускаем (ищем глубже)
                     let ttl_ok = expires_at_sec == 0 || now < expires_at_sec;
                     if ttl_ok {
-                        // Present: отмечаем ключ решённым, но в keydir не пишем PID (оставляем “miss”)
+                        // Present: записываем (pid, off) страницы с валидной записью
+                        let off_u32 = (off_usize as u64).min(u32::MAX as u64) as u32;
+                        self.mem_keydir_insert_loc(bucket, k, MemKeyLoc { pid: cur_pid, off: off_u32 });
                         decided.insert(k.to_vec());
                     }
                 });

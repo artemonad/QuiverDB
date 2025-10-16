@@ -5,14 +5,18 @@ use crate::page::common::{
 };
 use super::header::{KvHeaderV3, kv_header_read_v3};
 
-/// Прочитать запись данных по смещению `off`.
+/// Прочитать запись данных по смещению `off` БЕЗ учёта верхней границы data‑area.
 /// Формат: [klen u16][vlen u32][expires_at_sec u32][vflags u8][key][value].
-/// Возвращает None при выходе за пределы страницы.
 ///
-/// ВНИМАНИЕ: этот хелпер не проверяет границы data‑area (до slot‑таблицы). Для безопасного
-/// обхода packed‑страниц используйте kv_find_record_by_key/kv_for_each_record, которые учитывают
-/// data_end и не читают за пределы области данных.
-pub fn kv_read_record<'a>(
+/// ВНИМАНИЕ:
+/// - Этот helper НЕ проверяет границы до slot‑таблицы (data_end) и безопасен
+///   только на страницах без слотов (table_slots == 0), либо если вызывающий код
+///   гарантирует корректный off и что запись целиком лежит в data‑области.
+/// - Для packed‑страниц используйте kv_find_record_by_key/kv_for_each_record/kv_for_each_record_with_off
+///   или kv_read_record_at_checked(..), которые учитывают data_end.
+///
+/// Возвращает None при выходе за пределы буфера страницы.
+pub fn kv_read_record_unchecked<'a>(
     page: &'a [u8],
     off: usize,
 ) -> Option<(&'a [u8], &'a [u8], u32 /*expires_at_sec*/, u8 /*vflags*/)> {
@@ -35,6 +39,21 @@ pub fn kv_read_record<'a>(
     Some((key, val, expires_at_sec, vflags))
 }
 
+/// УСТАРЕВШЕ: используйте kv_read_record_unchecked или, что предпочтительнее,
+/// безопасные kv_find_record_by_key/kv_for_each_record/kv_for_each_record_with_off/kv_read_record_at_checked.
+///
+/// Оставлено как совместимая обёртка для внутреннего кода и тестов.
+#[deprecated(
+    note = "Use kv_find_record_by_key/kv_for_each_record/kv_for_each_record_with_off or kv_read_record_at_checked; \
+this function does not guard against slot-table bounds and may read beyond data area on packed pages."
+)]
+pub fn kv_read_record<'a>(
+    page: &'a [u8],
+    off: usize,
+) -> Option<(&'a [u8], &'a [u8], u32, u8)> {
+    kv_read_record_unchecked(page, off)
+}
+
 // ------------------------------------------------------------------------------------
 // Helpers for KV‑packing (slot table). Backward compatible with single-record.
 // ------------------------------------------------------------------------------------
@@ -49,6 +68,33 @@ fn data_end_for_page(hdr: &KvHeaderV3, ps: usize) -> Option<usize> {
     } else {
         ps.checked_sub(TRAILER_LEN + (hdr.table_slots as usize) * KV_SLOT_SIZE)
     }
+}
+
+/// Публичный безопасный ридер записи по смещению с учётом границы data_end.
+/// Возвращает None, если запись целиком не помещается в data‑area.
+#[inline]
+pub fn kv_read_record_at_checked<'a>(
+    page: &'a [u8],
+    off: usize,
+    data_end: usize,
+) -> Option<(&'a [u8], &'a [u8], u32, u8)> {
+    // Минимальная “шапка” записи
+    if off.checked_add(11)? > data_end {
+        return None;
+    }
+    let klen = LittleEndian::read_u16(&page[off..off + 2]) as usize;
+    let vlen = LittleEndian::read_u32(&page[off + 2..off + 6]) as usize;
+    let expires_at_sec = LittleEndian::read_u32(&page[off + 6..off + 10]);
+    let vflags = page[off + 10];
+
+    let base = off + 11;
+    let end = base.checked_add(klen)?.checked_add(vlen)?;
+    if end > data_end {
+        return None;
+    }
+    let key = &page[base..base + klen];
+    let val = &page[base + klen..base + klen + vlen];
+    Some((key, val, expires_at_sec, vflags))
 }
 
 /// Лёгкий 1‑байтовый fingerprint ключа (xxhash64(seed=0) low‑8).
@@ -67,10 +113,6 @@ pub fn kv_fp8(key: &[u8]) -> u8 {
 ///
 /// Порядок обхода слотов: ОБРАТНЫЙ (новые → старые), чтобы внутри одной страницы
 /// при наличии нескольких версий ключа побеждала самая новая (tail‑wins).
-///
-/// Ускорение:
-/// - Если в слоте fp!=0 и он не совпадает с kv_fp8(key), слот пропускается без чтения записи.
-/// - Если fp==0 (старые страницы/слоты без отпечатка) — проверка отпечатка игнорируется.
 pub fn kv_find_record_by_key<'a>(
     page: &'a [u8],
     key: &[u8],
@@ -83,7 +125,7 @@ pub fn kv_find_record_by_key<'a>(
 
     if hdr.table_slots == 0 {
         // Одиночная запись — проверим, что помещается и что ключ совпадает.
-        if let Some((k, v, e, f)) = read_record_at_checked(page, KV_HDR_MIN, data_end) {
+        if let Some((k, v, e, f)) = kv_read_record_at_checked(page, KV_HDR_MIN, data_end) {
             if k == key {
                 return Some((k, v, e, f));
             }
@@ -99,9 +141,6 @@ pub fn kv_find_record_by_key<'a>(
     let want_fp = kv_fp8(key);
 
     // Обходим слоты в обратном порядке (новее → старее)
-    use std::collections::HashSet;
-    let mut seen_off: HashSet<u32> = HashSet::new();
-
     for i in (0..table_slots).rev() {
         let slot_off = table_start + i * KV_SLOT_SIZE;
         if slot_off + KV_SLOT_SIZE > ps.saturating_sub(TRAILER_LEN) {
@@ -109,7 +148,7 @@ pub fn kv_find_record_by_key<'a>(
         }
 
         let off = LittleEndian::read_u32(&page[slot_off..slot_off + 4]);
-        if off == KV_EMPTY_OFF || !seen_off.insert(off) {
+        if off == KV_EMPTY_OFF {
             continue;
         }
 
@@ -120,7 +159,7 @@ pub fn kv_find_record_by_key<'a>(
         }
 
         let off_usize = off as usize;
-        if let Some((k, v, e, f)) = read_record_at_checked(page, off_usize, data_end) {
+        if let Some((k, v, e, f)) = kv_read_record_at_checked(page, off_usize, data_end) {
             if k == key {
                 return Some((k, v, e, f));
             }
@@ -129,7 +168,7 @@ pub fn kv_find_record_by_key<'a>(
 
     // На всякий случай проверим одиночную запись (совместимость со старыми страницами),
     // но только если ключ совпадает.
-    if let Some((k, v, e, f)) = read_record_at_checked(page, KV_HDR_MIN, data_end) {
+    if let Some((k, v, e, f)) = kv_read_record_at_checked(page, KV_HDR_MIN, data_end) {
         if k == key {
             return Some((k, v, e, f));
         }
@@ -155,20 +194,17 @@ where
     };
 
     if hdr.table_slots == 0 {
-        if let Some((k, v, e, fl)) = read_record_at_checked(page, KV_HDR_MIN, data_end) {
+        if let Some((k, v, e, fl)) = kv_read_record_at_checked(page, KV_HDR_MIN, data_end) {
             f(k, v, e, fl);
         }
         return;
     }
 
-    use std::collections::HashSet;
     let table_slots = hdr.table_slots as usize;
     let table_start = match ps.checked_sub(TRAILER_LEN + table_slots * KV_SLOT_SIZE) {
         Some(v) => v,
         None => return,
     };
-
-    let mut seen_off: HashSet<u32> = HashSet::new();
 
     // Итерируем слоты в обратном порядке
     for i in (0..table_slots).rev() {
@@ -177,39 +213,57 @@ where
             break;
         }
         let off = LittleEndian::read_u32(&page[slot_off..slot_off + 4]);
-        if off == KV_EMPTY_OFF || !seen_off.insert(off) {
+        if off == KV_EMPTY_OFF {
             continue;
         }
         let off_usize = off as usize;
-        if let Some((k, v, e, fl)) = read_record_at_checked(page, off_usize, data_end) {
+        if let Some((k, v, e, fl)) = kv_read_record_at_checked(page, off_usize, data_end) {
             f(k, v, e, fl);
         }
     }
 }
 
-/// Прочитать запись по произвольному смещению off с учётом верхней границы data_end.
-/// Возвращает None, если запись целиком не помещается в data‑area.
-#[inline]
-fn read_record_at_checked<'a>(
-    page: &'a [u8],
-    off: usize,
-    data_end: usize,
-) -> Option<(&'a [u8], &'a [u8], u32, u8)> {
-    // Минимальная “шапка” записи
-    if off.checked_add(11)? > data_end {
-        return None;
-    }
-    let klen = LittleEndian::read_u16(&page[off..off + 2]) as usize;
-    let vlen = LittleEndian::read_u32(&page[off + 2..off + 6]) as usize;
-    let expires_at_sec = LittleEndian::read_u32(&page[off + 6..off + 10]);
-    let vflags = page[off + 10];
+/// Обойти все записи на странице с передачей оффсета записи.
+/// Безопасно: учитывает data_end.
+/// Порядок: ОБРАТНЫЙ порядок слотов (новые → старые); одиночная запись — off=KV_HDR_MIN.
+pub fn kv_for_each_record_with_off<'a, F>(page: &'a [u8], mut f: F)
+where
+    F: FnMut(usize /*off*/, &'a [u8], &'a [u8], u32, u8),
+{
+    let hdr = match kv_header_read_v3(page) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let ps = page.len();
+    let Some(data_end) = data_end_for_page(&hdr, ps) else {
+        return;
+    };
 
-    let base = off + 11;
-    let end = base.checked_add(klen)?.checked_add(vlen)?;
-    if end > data_end {
-        return None;
+    if hdr.table_slots == 0 {
+        if let Some((k, v, e, fl)) = kv_read_record_at_checked(page, KV_HDR_MIN, data_end) {
+            f(KV_HDR_MIN, k, v, e, fl);
+        }
+        return;
     }
-    let key = &page[base..base + klen];
-    let val = &page[base + klen..base + klen + vlen];
-    Some((key, val, expires_at_sec, vflags))
+
+    let table_slots = hdr.table_slots as usize;
+    let table_start = match ps.checked_sub(TRAILER_LEN + table_slots * KV_SLOT_SIZE) {
+        Some(v) => v,
+        None => return,
+    };
+
+    for i in (0..table_slots).rev() {
+        let slot_off = table_start + i * KV_SLOT_SIZE;
+        if slot_off + KV_SLOT_SIZE > ps.saturating_sub(TRAILER_LEN) {
+            break;
+        }
+        let off = LittleEndian::read_u32(&page[slot_off..slot_off + 4]);
+        if off == KV_EMPTY_OFF {
+            continue;
+        }
+        let off_usize = off as usize;
+        if let Some((k, v, e, fl)) = kv_read_record_at_checked(page, off_usize, data_end) {
+            f(off_usize, k, v, e, fl);
+        }
+    }
 }

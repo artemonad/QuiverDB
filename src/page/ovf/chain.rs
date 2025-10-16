@@ -13,6 +13,9 @@
 //! NEW: защита от чрезмерной аллокации/DoS:
 //! - ENV P1_MAX_VALUE_BYTES (usize, по умолчанию 1 GiB) — глобальный лимит на итоговый размер значения.
 //! - На каждом шаге декомпрессии проверяется невыход за expected_len (и, соответственно, за max_value_bytes).
+//!
+//! NEW (tech‑debt): единая константа‑guard для длинных цепочек OVERFLOW:
+//! - OVF_MAX_CHAIN_PAGES_GUARD — предел числа страниц в одной цепочке (по умолчанию 1_000_000).
 
 use anyhow::{anyhow, Result};
 use std::io::{Cursor, Read};
@@ -33,6 +36,10 @@ fn max_value_bytes() -> usize {
             .unwrap_or(1usize << 30) // 1 GiB
     })
 }
+
+/// Предел числа страниц в одной OVERFLOW‑цепочке (safety‑guard).
+/// Нужен, чтобы остановить потенциальные бесконечные циклы/злоумышленно длинные цепочки.
+pub const OVF_MAX_CHAIN_PAGES_GUARD: usize = 1_000_000;
 
 /// Прочитать OVERFLOW3‑цепочку, учитывая codec_id каждой страницы.
 /// Строго проверяет суммарную длину (expected_len).
@@ -59,8 +66,11 @@ pub fn read_overflow_chain(pager: &Pager, mut head: u64, expected_len: usize) ->
 
     while head != NO_PAGE {
         guard += 1;
-        if guard > 1_000_000 {
-            return Err(anyhow!("overflow chain too long or loop detected"));
+        if guard > OVF_MAX_CHAIN_PAGES_GUARD {
+            return Err(anyhow!(
+                "overflow chain too long or loop detected (limit={})",
+                OVF_MAX_CHAIN_PAGES_GUARD
+            ));
         }
 
         let mut page = vec![0u8; ps];
@@ -86,7 +96,6 @@ pub fn read_overflow_chain(pager: &Pager, mut head: u64, expected_len: usize) ->
                     ));
                 }
                 out.extend_from_slice(chunk);
-                // remaining пересчитывается на каждой итерации; дополнительное вычитание не требуется.
             }
             1 => {
                 // zstd — потоковая декомпрессия с ограничением по expected_len
@@ -95,11 +104,9 @@ pub fn read_overflow_chain(pager: &Pager, mut head: u64, expected_len: usize) ->
                     .map_err(|e| anyhow!("zstd decoder init (pid={}): {}", head, e))?;
 
                 loop {
-                    // Если уже набрали всё ожидаемое — это допустимо только на последней странице
                     let remaining = expected_len.saturating_sub(out.len());
                     if remaining == 0 {
                         if h.next_page_id != NO_PAGE {
-                            // Раньше времени закончили — цепочка длиннее, чем ожидали
                             return Err(anyhow!(
                                 "overflow decoded data reached expected len before last page (pid={})",
                                 head
@@ -114,13 +121,11 @@ pub fn read_overflow_chain(pager: &Pager, mut head: u64, expected_len: usize) ->
                     })?;
 
                     if n == 0 {
-                        // Конец распаковки чанка
                         break;
                     }
 
                     out.extend_from_slice(&tmp[..n]);
 
-                    // Проверим инвариант: не выйти за expected_len (и max_value_bytes)
                     if out.len() > expected_len {
                         return Err(anyhow!(
                             "overflow decoded data exceeds expected length (pid={}, out={}, expected={})",

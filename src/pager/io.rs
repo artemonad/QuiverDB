@@ -8,8 +8,10 @@
 //!
 //! Совместимость TDE:
 //! - Если TDE включён, для прочитанной страницы сначала проверяется AEAD‑тег.
-//!   Если он не проходит, в STRICT‑режиме — ошибка, иначе выполняется жёсткая CRC‑проверка,
-//!   игнорирующая ENV‑тумблеры отключения checksum.
+//!   Если он не проходит, в STRICT‑режиме — ошибка.
+//!   В non‑strict: CRC‑fallback теперь допускается ТОЛЬКО для страниц, чей page_lsn
+//!   меньше начала текущей TDE‑эпохи (since_lsn) из KeyJournal.
+//!   Для страниц с lsn >= since_lsn CRC‑fallback запрещён (epoch‑aware запрет).
 //!
 //! NEW:
 //! - Глобальный page cache вынесен в модуль pager::cache. Этот файл использует его API:
@@ -33,6 +35,7 @@ use crate::page::{
     PAGE_MAGIC, OFF_TYPE, KV_OFF_LSN, OVF_OFF_LSN,
     PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3,
 };
+use crate::crypto::KeyJournal; // NEW: Journal для epoch‑aware TDE fallback
 
 use super::core::Pager;
 
@@ -126,9 +129,10 @@ impl Pager {
 
     /// Прочитать страницу в буфер.
     /// - TDE выключен: проверка CRC32/CRC32C (STRICT может запретить нулевой трейлер).
-    /// - TDE включён: сначала проверка AES‑GCM тега; если не прошла — STRICT→ошибка,
-    ///   иначе выполняется жёсткая CRC‑проверка (игнорируя P1_PAGE_CHECKSUM и пр.).
-    /// В обоих случаях используется процессный page cache.
+    /// - TDE включён: сначала проверка AES‑GCM тега; если не прошла —
+    ///   STRICT → ошибка; non‑strict → epoch‑aware fallback:
+    ///     * CRC‑fallback разрешён только если page_lsn < since_lsn текущей TDE‑эпохи (KeyJournal).
+    ///     * Если page_lsn ≥ since_lsn — CRC‑fallback запрещён, возвращаем ошибку.
     pub fn read_page(&self, page_id: u64, buf: &mut [u8]) -> Result<()> {
         let ps = self.meta.page_size as usize;
 
@@ -203,14 +207,31 @@ impl Pager {
                 .ok_or_else(|| anyhow!("TDE key missing"))?;
             let ok_aead = page_verify_trailer_aead_with(buf, key, page_id, lsn)?;
             if !ok_aead {
+                // Жёсткий режим — сразу ошибка
                 if tde_strict() {
-                    return Err(anyhow!("page {} AEAD tag verify failed (TDE strict mode)", page_id));
+                    return Err(anyhow!(
+                        "page {} AEAD tag verify failed (TDE strict mode, lsn={})",
+                        page_id, lsn
+                    ));
                 }
+
+                // Epoch-aware запрет CRC‑fallback: если страница “внутри” текущей TDE‑эпохи —
+                // fallback запрещён.
+                if let Some(epoch_since) = self.tde_current_epoch_since() {
+                    if epoch_since > 0 && lsn >= epoch_since {
+                        return Err(anyhow!(
+                            "page {} AEAD verify failed; CRC fallback disabled for current TDE epoch (lsn={}, epoch_since={})",
+                            page_id, lsn, epoch_since
+                        ));
+                    }
+                }
+
+                // Разрешённый fallback (для исторических страниц до эпохи) — строгая CRC‑проверка
                 let ok_crc = verify_page_crc_strict_kind(buf, self.meta.checksum_kind)?;
                 if !ok_crc {
                     return Err(anyhow!(
-                        "page {} AEAD/strict-CRC verify failed (fallback)",
-                        page_id
+                        "page {} AEAD/CRC verify failed (lsn={}, fallback)",
+                        page_id, lsn
                     ));
                 }
             }
@@ -326,6 +347,22 @@ impl Pager {
         let mut tmp = vec![0u8; self.meta.page_size as usize];
         let _ = self.read_page(page_id, &mut tmp)?;
         Ok(())
+    }
+
+    // --------- NEW: helper для epoch‑aware TDE fallback ---------
+
+    /// Возвращает since_lsn текущей (последней) TDE‑эпохи из KeyJournal, если журнал есть и не пустой.
+    fn tde_current_epoch_since(&self) -> Option<u64> {
+        match KeyJournal::open(&self.root) {
+            Ok(j) => {
+                if let Ok(eps) = j.epochs() {
+                    eps.last().map(|(since, _kid)| *since)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
     }
 }
 

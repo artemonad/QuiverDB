@@ -175,8 +175,15 @@ fn apply_from_psk(path: PathBuf, addr: &str, use_tls: bool) -> Result<()> {
     let mut bytes = 0u64;
     let mut max_lsn = db.pager.meta.last_lsn;
 
-    // Максимальный размер payload: 28 байт заголовок + сама страница (<=1MiB) + запас
-    let max_len = std::cmp::max(2 * 1024 * 1024, WAL_REC_HDR_SIZE + ps);
+    // Безопасный предел размера фрейма (WAL‑header[28] + payload):
+    // учитываем PAGE_IMAGE (ps) и максимально возможный HEADS_UPDATE (12 байт на bucket).
+    // Добавляем небольшой запас и верхний предел для защиты от DoS.
+    let heads_bytes = (db.dir.bucket_count as usize).saturating_mul(12);
+    let mut max_len = WAL_REC_HDR_SIZE + std::cmp::max(ps, heads_bytes) + 64 * 1024; // +64 KiB запас
+    let hard_cap = 32 * 1024 * 1024; // 32 MiB — верхний предел фрейма
+    if max_len > hard_cap {
+        max_len = hard_cap;
+    }
 
     // Персистентные маркеры консистентности
     let mut last_heads_lsn = load_last_heads_lsn(&path).unwrap_or(0);

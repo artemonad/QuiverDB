@@ -3,6 +3,78 @@
 All notable changes to this project are documented in this file.  
 Dates use ISO format (YYYY-MM-DD).
 
+## [2.1.0] – 2025-10-16
+
+Security
+- TDE (AES‑GCM) integrity-only trailer
+  - Introduced compute_aead_tag_for_page() and refactored AEAD tag update/verify to a single code path with constant-time compare.
+  - Clarified semantics: tag-only (integrity), page payload is not encrypted.
+- Epoch‑aware CRC fallback (TDE on)
+  - CRC fallback is allowed only for pages with page_lsn < since_lsn of the latest epoch in KeyJournal; pages with lsn ≥ since_lsn strictly reject fallback.
+
+Added
+- In‑memory keydir with record offsets (pid, off)
+  - New fast-path for get()/exists(): direct read of the exact record by offset (no intra-page scan), with TTL/tombstone semantics and correct fallback.
+  - New API: MemKeyLoc { pid, off }, Db::mem_keydir_get_loc(), and prefix/for_each variants with offsets.
+- KV helpers
+  - kv_read_record_at_checked(page, off, data_end): safe record reader for known offsets.
+  - kv_for_each_record_with_off(page, f(off, k, v, exp, flags)): packed-aware iteration with offsets.
+- WAL mid-header gating
+  - WAL reader now skips a mid-stream “P2WAL001” header only if the previous record was TRUNCATE.
+- Overflow chain guard
+  - OVF_MAX_CHAIN_PAGES_GUARD (default 1_000_000) as a shared safety limit for long chains; used in reader and sweep_orphan_overflow.
+- Segment writer buffer tuning
+  - ENV P1_SEG_WRITE_BUF_MB (default 16) to control BufWriter capacity per segment during batch writes.
+- Bench CLI/features
+  - --big-batch-size N: batch big puts (one WAL commit per batch).
+  - --codec {none|zstd}: initialize DB with codec_default for OVERFLOW3.
+  - Bench profile now sets P1_PAGE_CACHE_OVF=1 and P1_PREALLOC_PAGES=16384.
+
+Changed/Improved
+- Bloom MMAP safety
+  - MMAP now maps the entire file from offset=0 (page-aligned); indexing accounts for header size. test() is compatible with both “body-only” and “full-file” mmaps.
+- get()/exists() performance
+  - Use keydir (pid, off) to directly read the record; on TTL expiry or mismatch, fall back to the usual head→tail scan.
+- Page module exports
+  - Removed re-exports of deprecated/unsafe helpers from page/ and page::kv (kv_read_record no longer re-exported); modern safe helpers are exported instead.
+- TLS CA parsing
+  - Kept a robust manual PEM parser for CERTIFICATE/TRUSTED CERTIFICATE blocks (no reliance on private fields of external crates).
+- Maintenance
+  - sweep_orphan_overflow uses OVF_MAX_CHAIN_PAGES_GUARD for chain traversal.
+
+Fixed
+- Bloom delta-update metrics double count
+  - record_bloom_update(..) no longer emitted twice (only inside BloomSidecar::update_bucket_bits; delete-only batches still record 0-byte freshness updates).
+- Potential mmap offset crash on some platforms
+  - Switching to full-file mapping removes dependency on non page-aligned offsets.
+- WAL reader robustness
+  - Avoids accidentally “eating” bytes that resemble MAGIC mid-stream unless preceded by TRUNCATE.
+
+Environment
+- New: P1_SEG_WRITE_BUF_MB (segment writer buffer, MiB; default 16)
+- Bench profile additionally sets:
+  - P1_PAGE_CACHE_OVF=1 (allow caching OVERFLOW pages)
+  - P1_PREALLOC_PAGES=16384 (hot preallocation on the last touched segment)
+
+CLI
+- quiverdb_bench:
+  - --big-batch-size N: batch big value writes
+  - --codec {none|zstd}: initialize DB with desired OVERFLOW codec
+- No format migration tools needed for 2.1.
+
+Compatibility
+- On‑disk and wire formats unchanged:
+  - Meta v4, Page v3 (KV_RH3/OVERFLOW3), Directory v2, WAL v2.
+- API changes are additive; removed only deprecated re-exports (use safe KV helpers instead).
+
+Performance notes
+- big_put: batching (+zstd, preallocation, larger segment buffer) yields multi‑x improvements.
+- get/exists: faster p50/p90 due to direct record access via keydir offsets; falls back correctly under TTL/tombstones.
+
+Upgrade notes
+- No data migrations required.
+- If using TDE, verify epoch journal is present for epoch‑aware fallback.
+- Consider setting P1_SEG_WRITE_BUF_MB and P1_PREALLOC_PAGES for heavy batch workloads; enable P1_PAGE_CACHE_OVF to speed up big_get.
 ## [2.0.0] – 2025-10-13
 
 2.0 (GA). New on‑disk/wire formats, streamlined write/read path, and production‑ready compaction.

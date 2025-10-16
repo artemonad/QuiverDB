@@ -2,13 +2,18 @@
 //!
 //! 2.0 (по умолчанию):
 //! - Фиксированный CRC32C: низшие 4 байта трейлера — digest (LE), оставшиеся 12 — нули.
-//! - stored==0 трактуется как “OK” для совместимости/нулевых страниц.
+//! - stored==0 трактуется как “OK” (совместимость/нулевые страницы, если не включён ZERO_CHECKSUM_STRICT).
 //!
 //! 2.1 (TDE prep, AEAD-tag):
 //! - Альтернативный режим — AES-256-GCM: весь трейлер (16 байт) — это AEAD-tag.
-//! - Никакого шифрования payload не выполняется (tag-only режим).
+//! - ВНИМАНИЕ: это режим целостности (integrity-only): полезная нагрузка страницы не шифруется,
+//!   сохраняется только тег, вычисленный над содержимым страницы с занулённым трейлером.
 //! - Nonce формируется детерминированно из (page_id, lsn) с помощью derive_gcm_nonce.
-//! - NEW: AAD (Associated Data) добавлена для усиления: b"P2AEAD01" || page[0..16] (MAGIC, version, type, page_id).
+//! - AAD = "P2AEAD01" || page[0..16] (MAGIC, version, type, page_id).
+//!
+//! NEW (refactor):
+//! - Выделена compute_aead_tag_for_page(..), которую используют и update, и verify.
+//! - Строгое сравнение тега — constant-time compare.
 //!
 //! NEW (perf toggle):
 //! - Можно полностью отключить расчёт и проверку CRC32C для страниц (бенч/разработка):
@@ -153,41 +158,56 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
+/// Вычислить 16‑байтовый AEAD‑тег для страницы:
+/// - Делаем копию страницы и зануляем её трейлер;
+/// - AAD = "P2AEAD01" || header[0..16];
+/// - Возвращаем tag (без изменения данных страницы).
+#[inline]
+fn compute_aead_tag_for_page(
+    page: &[u8],
+    key_32: &[u8; 32],
+    nonce12: &[u8; 12],
+) -> Result<[u8; 16]> {
+    if page.len() < TRAILER_LEN {
+        return Err(anyhow!("page buffer too small for AEAD tag compute"));
+    }
+    let ps = page.len();
+
+    // Копия с занулённым трейлером
+    let mut tmp = page.to_vec();
+    for b in &mut tmp[ps - TRAILER_LEN..ps] {
+        *b = 0;
+    }
+
+    let key = Key::<Aes256Gcm>::from_slice(key_32);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(nonce12);
+
+    // AAD по копии (эквивалентно исходной странице для [0..16])
+    let aad = build_aead_aad(&tmp)?;
+
+    // encrypt_in_place_detached возвращает tag (payload не шифруем — integrity-only)
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, &aad, &mut tmp)
+        .map_err(|e| anyhow!("aead tag compute failed: {}", e))?;
+
+    let mut out = [0u8; 16];
+    out.copy_from_slice(tag.as_slice());
+    Ok(out)
+}
+
 /// Обновить трейлер страницы 16-байтовым AEAD-tag (AES-256-GCM).
-/// - Никакое шифрование данных не выполняется (tag-only).
+/// - Никакое шифрование данных не выполняется (tag-only, integrity).
 /// - Nonce (12 байт) передаётся явно.
-/// - Тег вычисляется над всей страницей с занулённым трейлером (AAD = MAGIC "P2AEAD01" + header[0..16]).
+/// - Тег вычисляется над всей странице с занулённым трейлером (AAD = MAGIC "P2AEAD01" + header[0..16]).
 pub fn page_update_trailer_aead_tag(page: &mut [u8], key_32: &[u8; 32], nonce12: [u8; 12]) -> Result<()> {
     if page.len() < TRAILER_LEN {
         return Err(anyhow!("page buffer too small for AEAD trailer"));
     }
     let ps = page.len();
 
-    // Сформируем копию с занулённым трейлером для вычисления тега
-    let mut tmp = page.to_vec();
-    for b in &mut tmp[ps - TRAILER_LEN..ps] {
-        *b = 0;
-    }
-
-    // AES-256-GCM
-    let key = Key::<Aes256Gcm>::from_slice(key_32);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(&nonce12);
-
-    // AAD
-    let aad = build_aead_aad(&tmp)?; // header уже в tmp идентичен page
-
-    // encrypt_in_place_detached возвращает tag, не меняя tmp (мы не шифруем payload)
-    let tag = cipher
-        .encrypt_in_place_detached(nonce, &aad, &mut tmp)
-        .map_err(|e| anyhow!("aead tag compute failed: {}", e))?;
-
-    // Запишем tag (16 байт) в трейлер
-    let tag_bytes = tag.as_slice();
-    if tag_bytes.len() != TRAILER_LEN {
-        return Err(anyhow!("aead tag len != trailer len ({} != {})", tag_bytes.len(), TRAILER_LEN));
-    }
-    page[ps - TRAILER_LEN..ps].copy_from_slice(tag_bytes);
+    let tag = compute_aead_tag_for_page(page, key_32, &nonce12)?;
+    page[ps - TRAILER_LEN..ps].copy_from_slice(&tag);
     Ok(())
 }
 
@@ -207,26 +227,8 @@ pub fn page_verify_trailer_aead_tag(page: &[u8], key_32: &[u8; 32], nonce12: [u8
         return Ok(false);
     }
 
-    // Скопируем и занулим трейлер для вычисления нового тега
-    let mut tmp = page.to_vec();
-    for b in &mut tmp[ps - TRAILER_LEN..ps] {
-        *b = 0;
-    }
-
-    // AES-256-GCM
-    let key = Key::<Aes256Gcm>::from_slice(key_32);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(&nonce12);
-
-    // AAD
-    let aad = build_aead_aad(&tmp)?;
-
-    // Рассчитаем ожидаемый tag
-    let tag = cipher
-        .encrypt_in_place_detached(nonce, &aad, &mut tmp)
-        .map_err(|e| anyhow!("aead tag compute failed: {}", e))?;
-
-    Ok(constant_time_eq(stored, tag.as_slice()))
+    let calc = compute_aead_tag_for_page(page, key_32, &nonce12)?;
+    Ok(constant_time_eq(stored, &calc))
 }
 
 /// Удобная обёртка: обновить трейлер AEAD-tag, дернув nonce из (page_id, lsn).

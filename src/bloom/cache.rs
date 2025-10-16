@@ -2,8 +2,10 @@
 //!
 //! Назначение: снизить I/O при интенсивных exists()/get(not-found) с Bloom fast‑path.
 //! Ключ кэша = (db_id u64, bucket u32, last_lsn u64).
-//! db_id — теперь кэшируется один раз на процесс: вычисление db_id для пути избегает
-//! дорогостоящего canonicalize(path) на каждом вызове.
+//!
+//! Изменения:
+//! - Ключ db_id теперь кэшируется по КАНОНИЗИРОВАННОМУ пути (std::fs::canonicalize).
+//!   Это устраняет дубли для разных представлений одного и того же пути (относительные/абсолютные, symlink).
 //!
 //! Управление ёмкостью: ENV P1_BLOOM_CACHE_BUCKETS (по умолчанию 8; 0 — выключено).
 //!
@@ -24,35 +26,45 @@ struct BloomCacheKey {
     last_lsn: u64,
 }
 
-// --------- быстрый кэш db_id для путей (избавляемся от canonicalize каждый раз) ----------
+// --------- быстрый кэш db_id для путей (по канонизированному пути) ----------
 
 static PATH_DBID_CACHE: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
 
 fn db_id_for_path(path: &Path) -> u64 {
-    // Попробуем достать из кэша
+    // Канонизируем путь, чтобы все формы одного и того же пути (rel/abs/symlink) имели единый ключ
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
     if let Ok(mut guard) = PATH_DBID_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
     {
-        if let Some(&v) = guard.get(path) {
+        if let Some(&v) = guard.get(&canon) {
             return v;
         }
         // Вычислим впервые и положим в кэш
-        let v = compute_db_id_path(path);
-        guard.insert(path.to_path_buf(), v);
+        let v = compute_db_id_path(&canon);
+        guard.insert(canon, v);
         return v;
     }
     // В редком случае (poisoned lock) вычислим напрямую
-    compute_db_id_path(path)
+    compute_db_id_path(&canon)
 }
 
 fn compute_db_id_path(path: &Path) -> u64 {
     use std::hash::Hasher;
-    // Пытаемся канонизировать; при ошибке — используем исходный путь
+    // Путь здесь уже канонизирован снаружи, но повторная попытка не повредит (на случай прямого вызова)
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let s = canon.to_string_lossy();
     let mut h = twox_hash::XxHash64::with_seed(0);
     h.write(s.as_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(md) = std::fs::metadata(&canon) {
+            h.write_u64(md.dev() as u64);
+            h.write_u64(md.ino() as u64);
+        }
+    }
     h.finish()
 }
 
@@ -231,7 +243,7 @@ impl BloomCache {
             self.move_to_back(&key);
             return;
         }
-        if self.map.len() >= self.cap {
+        while self.map.len() >= self.cap {
             let _ = self.pop_front();
         }
         self.map.insert(

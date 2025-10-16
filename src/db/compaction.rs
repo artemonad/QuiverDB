@@ -5,12 +5,19 @@ use std::collections::HashMap;
 use crate::dir::NO_PAGE;
 use crate::page::{
     kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3,
+    KV_HDR_MIN, TRAILER_LEN,
 };
 use crate::page::kv::kv_for_each_record; // packed-aware обход “новые → старые”
 use crate::page::kv_pack::{KvPagePacker, KvPackItem};
 use crate::util::now_secs;
-// NEW: Bloom side-car для delta-update после компактации
+// Bloom side-car для delta-update после компактации
 use crate::bloom::BloomSidecar;
+// NEW: метрики компактации
+use crate::metrics::{
+    record_compaction_keys_selected,
+    record_compaction_keys_deleted,
+    record_compaction_pages_packed,
+};
 
 use super::core::Db;
 
@@ -37,11 +44,11 @@ pub struct CompactSummary {
 impl Db {
     /// Быстрая односканная компактация одного бакета:
     /// - Проход head→tail, на каждой странице “новые→старые” записи (kv_for_each_record).
-    /// - Для ключа принимается первое валидное (не tombstone, не истёкшее TTL) вхождение.
-    /// - Tombstone имеет приоритет (немедленно фиксируется как Deleted).
+    /// - Для ключа принимается первое валидное (не tombstone, не истёкшее) вхождение.
     /// - Значения не разворачиваются: OVERFLOW placeholder переносится как есть.
     /// - Результат упаковывается в KV‑страницы через KvPagePacker (несколько записей на страницу).
     /// - После коммита выполняется Bloom delta‑update по валидным ключам и выставляется fresh last_lsn.
+    /// - NEW: метрики компактации (выбранные/удалённые ключи и упакованные страницы).
     pub fn compact_bucket(&mut self, bucket: u32) -> Result<CompactBucketReport> {
         let mut rep = CompactBucketReport { bucket, ..Default::default() };
 
@@ -74,7 +81,9 @@ impl Db {
 
             let h = kv_header_read_v3(&page)?;
             // Обходим записи "новые → старые".
+            let mut touched = false;
             kv_for_each_record(&page, |k, v, expires_at_sec, vflags| {
+                touched = true;
                 // Если уже принято решение по ключу — пропускаем.
                 if final_map.contains_key(k) {
                     return;
@@ -95,6 +104,37 @@ impl Db {
                 }
             });
 
+            // Безопасный fallback для single-record страницы (только если слотов нет):
+            // читаем запись вручную, проверяя границы data-area.
+            if !touched && h.table_slots == 0 {
+                let data_end = ps.saturating_sub(TRAILER_LEN);
+                let off = KV_HDR_MIN;
+                // [klen u16][vlen u32][expires u32][vflags u8]
+                if off + 11 <= data_end {
+                    let klen = LittleEndian::read_u16(&page[off..off + 2]) as usize;
+                    let vlen = LittleEndian::read_u32(&page[off + 2..off + 6]) as usize;
+                    let expires_at_sec = LittleEndian::read_u32(&page[off + 6..off + 10]);
+                    let vflags = page[off + 10];
+                    let base = off + 11;
+                    let end = base.saturating_add(klen).saturating_add(vlen);
+                    if end <= data_end {
+                        let key = &page[base..base + klen];
+                        if !final_map.contains_key(key) {
+                            let is_tomb = (vflags & 0x1) == 1;
+                            if is_tomb {
+                                final_map.insert(key.to_vec(), None);
+                            } else {
+                                let ttl_ok = expires_at_sec == 0 || now < expires_at_sec;
+                                if ttl_ok {
+                                    let val = &page[base + klen..base + klen + vlen];
+                                    final_map.insert(key.to_vec(), Some(val.to_vec()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             pid = h.next_page_id;
         }
 
@@ -109,6 +149,10 @@ impl Db {
         }
         rep.keys_kept = keys_kept;
         rep.keys_deleted = keys_deleted;
+
+        // Метрики компактации: итоговое число выбранных/удалённых ключей
+        record_compaction_keys_selected(keys_kept);
+        record_compaction_keys_deleted(keys_deleted);
 
         // Если не осталось валидных значений — head = NO_PAGE.
         if keys_kept == 0 {
@@ -131,10 +175,10 @@ impl Db {
 
         // Помощник: сбросить packer в новую страницу и подвесить к текущей голове.
         let flush_page = |packer: &mut KvPagePacker,
-                              pages_acc: &mut Vec<(u64, Vec<u8>)>,
-                              cur_head: &mut u64,
-                              db: &mut Db|
-                              -> Result<()> {
+                          pages_acc: &mut Vec<(u64, Vec<u8>)>,
+                          cur_head: &mut u64,
+                          db: &mut Db|
+                          -> Result<()> {
             if packer.is_empty() {
                 return Ok(());
             }
@@ -142,6 +186,8 @@ impl Db {
             let page = packer.finalize_into_page(pid_new, *cur_head, 0 /*codec_id*/)?;
             pages_acc.push((pid_new, page));
             *cur_head = pid_new;
+            // Метрика: одна упакованная страница
+            record_compaction_pages_packed(1);
             Ok(())
         };
 
@@ -176,6 +222,8 @@ impl Db {
                     }
                     pages.push((pid_new, page));
                     current_head = pid_new;
+                    // Метрика: одна упакованная страница (одиночная)
+                    record_compaction_pages_packed(1);
                 }
             }
         }
@@ -196,12 +244,11 @@ impl Db {
         rep.pages_written = for_commit.len() as u64;
         rep.new_head = current_head;
 
-        // NEW: Bloom delta‑update — отмечаем все оставшиеся ключи и делаем фильтр “fresh”.
+        // Bloom delta‑update — отмечаем все оставшиеся ключи и делаем фильтр “fresh”.
         if !selected.is_empty() {
             if let Ok(mut sidecar) = BloomSidecar::open_or_create_for_db(self, 4096, 6) {
                 let new_lsn = self.pager.meta.last_lsn;
                 let key_slices: Vec<&[u8]> = selected.iter().map(|(k, _)| k.as_slice()).collect();
-                // Если update_bucket_bits не получится — просто пропустим (best-effort).
                 let _ = sidecar.update_bucket_bits(bucket, &key_slices, new_lsn);
             }
         }
