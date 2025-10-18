@@ -31,7 +31,7 @@ pub use key_journal::KeyJournal;
 
 // KMS skeleton (envelope DEK)
 pub mod kms;
-pub use kms::{KmsProvider, EnvKmsProvider};
+pub use kms::{EnvKmsProvider, KmsProvider};
 
 // KeyRing — стор для обёрнутых DEK
 pub mod keyring;
@@ -69,19 +69,27 @@ pub struct StaticKeyProvider {
 
 impl StaticKeyProvider {
     pub fn new<S: Into<String>>(kid: S, key: [u8; 32]) -> Self {
-        Self { kid: kid.into(), key }
+        Self {
+            kid: kid.into(),
+            key,
+        }
     }
 }
 
 impl KeyProvider for StaticKeyProvider {
     fn key(&self, kid: &str) -> Result<KeyMaterial> {
         if kid == self.kid {
-            Ok(KeyMaterial { kid: self.kid.clone(), key: self.key })
+            Ok(KeyMaterial {
+                kid: self.kid.clone(),
+                key: self.key,
+            })
         } else {
             Err(anyhow!("unknown KID '{}'", kid))
         }
     }
-    fn default_kid(&self) -> &str { &self.kid }
+    fn default_kid(&self) -> &str {
+        &self.kid
+    }
 }
 
 impl Drop for StaticKeyProvider {
@@ -114,19 +122,26 @@ impl EnvKeyProvider {
             let key = slice32(&key_vec)?;
             return Ok(Self { kid, key });
         }
-        Err(anyhow!("EnvKeyProvider: set P1_TDE_KEY_HEX or P1_TDE_KEY_BASE64"))
+        Err(anyhow!(
+            "EnvKeyProvider: set P1_TDE_KEY_HEX or P1_TDE_KEY_BASE64"
+        ))
     }
 }
 
 impl KeyProvider for EnvKeyProvider {
     fn key(&self, kid: &str) -> Result<KeyMaterial> {
         if kid == self.kid {
-            Ok(KeyMaterial { kid: self.kid.clone(), key: self.key })
+            Ok(KeyMaterial {
+                kid: self.kid.clone(),
+                key: self.key,
+            })
         } else {
             Err(anyhow!("unknown KID '{}'", kid))
         }
     }
-    fn default_kid(&self) -> &str { &self.kid }
+    fn default_kid(&self) -> &str {
+        &self.kid
+    }
 }
 
 impl Drop for EnvKeyProvider {
@@ -183,8 +198,12 @@ fn decode_hex_trimmed(s: &str) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
     for i in (0..bytes.len()).step_by(2) {
-        let h = (bytes[i] as char).to_digit(16).ok_or_else(|| anyhow!("invalid hex at pos {}", i))?;
-        let l = (bytes[i + 1] as char).to_digit(16).ok_or_else(|| anyhow!("invalid hex at pos {}", i + 1))?;
+        let h = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow!("invalid hex at pos {}", i))?;
+        let l = (bytes[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow!("invalid hex at pos {}", i + 1))?;
         out.push(((h << 4) | l) as u8);
     }
     Ok(out)

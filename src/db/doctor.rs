@@ -35,8 +35,8 @@ use byteorder::{ByteOrder, LittleEndian};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 
+use crate::page::{OFF_TYPE, PAGE_MAGIC, PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3, TRAILER_LEN};
 use crate::pager::{DATA_SEG_EXT, DATA_SEG_PREFIX, SEGMENT_SIZE};
-use crate::page::{PAGE_MAGIC, PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3, OFF_TYPE, TRAILER_LEN};
 
 use super::core::Db;
 
@@ -101,7 +101,13 @@ impl Db {
             match self.pager.read_page(pid, &mut buf) {
                 Ok(()) => {
                     // Типизация
-                    classify_bytes(&buf, &mut kv_pages, &mut ovf_pages, &mut other_magic, &mut no_magic);
+                    classify_bytes(
+                        &buf,
+                        &mut kv_pages,
+                        &mut ovf_pages,
+                        &mut other_magic,
+                        &mut no_magic,
+                    );
 
                     if mode_aead {
                         // AEAD-режим: zero_checksum не применим, страница засчитывается как ok

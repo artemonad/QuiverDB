@@ -16,14 +16,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use crate::db::core::Db;
 use crate::dir::NO_PAGE;
 use crate::metrics::record_bloom_update; // NEW: метрика delta-update
-use crate::page::{kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3, KV_HDR_MIN, TRAILER_LEN};
 use crate::page::kv::kv_for_each_record;
+use crate::page::{kv_header_read_v3, KV_HDR_MIN, PAGE_MAGIC, PAGE_TYPE_KV_RH3, TRAILER_LEN};
 
-use super::{
-    BloomSidecar,
-    bloom_cache_get, bloom_cache_put,
-    lock_bloom_file,
-};
+use super::{bloom_cache_get, bloom_cache_put, lock_bloom_file, BloomSidecar};
 
 impl BloomSidecar {
     /// Полная перестройка Bloom-файла по всей БД (синхронно).
@@ -49,7 +45,10 @@ impl BloomSidecar {
         let ps = db.pager.meta.page_size as usize;
         let now = crate::util::now_secs();
 
-        enum State { Selected, Deleted }
+        enum State {
+            Selected,
+            Deleted,
+        }
         let mut state: HashMap<Vec<u8>, State> = HashMap::new();
         let mut page_buf = vec![0u8; ps];
 
@@ -68,11 +67,16 @@ impl BloomSidecar {
             let mut touched = false;
             kv_for_each_record(&page_buf, |k, _v, expires_at_sec, vflags| {
                 touched = true;
-                if state.contains_key(k) { return; }
+                if state.contains_key(k) {
+                    return;
+                }
                 let is_tomb = (vflags & 0x1) == 1;
                 let ttl_ok = expires_at_sec == 0 || now < expires_at_sec;
-                if is_tomb { state.insert(k.to_vec(), State::Deleted); }
-                else if ttl_ok { state.insert(k.to_vec(), State::Selected); }
+                if is_tomb {
+                    state.insert(k.to_vec(), State::Deleted);
+                } else if ttl_ok {
+                    state.insert(k.to_vec(), State::Selected);
+                }
             });
 
             // Безопасный fallback: только если слотов нет и запись целиком в data-area.
@@ -92,8 +96,11 @@ impl BloomSidecar {
                         if !state.contains_key(key_slice) {
                             let is_tomb = (vflags & 0x1) == 1;
                             let ttl_ok = expires_at_sec == 0 || now < expires_at_sec;
-                            if is_tomb { state.insert(key_slice.to_vec(), State::Deleted); }
-                            else if ttl_ok { state.insert(key_slice.to_vec(), State::Selected); }
+                            if is_tomb {
+                                state.insert(key_slice.to_vec(), State::Deleted);
+                            } else if ttl_ok {
+                                state.insert(key_slice.to_vec(), State::Selected);
+                            }
                         }
                     }
                 }
@@ -143,8 +150,7 @@ impl BloomSidecar {
         // MMAP (robust: поддержка отображения только body и “всего файла”)
         if let Some(ref mm) = self.mmap {
             let bpb = self.meta.bytes_per_bucket as usize;
-            let total_body_len = (self.meta.buckets as usize)
-                .saturating_mul(bpb);
+            let total_body_len = (self.meta.buckets as usize).saturating_mul(bpb);
 
             // Если mmap длиной ровно равен телу — это “старый” режим (map только body).
             // Если mmap длиннее (>= hdr + body) — это “новый” режим (map от offset=0).
@@ -171,7 +177,9 @@ impl BloomSidecar {
         let off = self.hdr_size_u64 + (bucket as u64) * (self.meta.bytes_per_bucket as u64);
 
         if let Some(ref mtx) = self.f_ro {
-            let mut f = mtx.lock().map_err(|_| anyhow!("bloom ro handle poisoned"))?;
+            let mut f = mtx
+                .lock()
+                .map_err(|_| anyhow!("bloom ro handle poisoned"))?;
             f.seek(SeekFrom::Start(off))?;
             f.read_exact(&mut bits)?;
         } else {
@@ -206,7 +214,12 @@ impl BloomSidecar {
     }
 
     /// Delta‑update API: обновить биты бакета (keys) и last_lsn, затем обновить view.
-    pub fn update_bucket_bits(&mut self, bucket: u32, keys: &[&[u8]], new_last_lsn: u64) -> Result<()> {
+    pub fn update_bucket_bits(
+        &mut self,
+        bucket: u32,
+        keys: &[&[u8]],
+        new_last_lsn: u64,
+    ) -> Result<()> {
         if bucket >= self.meta.buckets {
             return Err(anyhow!(
                 "bucket {} out of range 0..{}",

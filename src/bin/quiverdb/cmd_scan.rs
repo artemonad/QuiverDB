@@ -14,14 +14,20 @@ pub fn exec(path: PathBuf, prefix: Option<String>, json: bool, stream: bool) -> 
             db.scan_stream(pref_bytes, |k, v| {
                 println!(
                     "{{\"key_hex\":\"{}\",\"value_hex\":\"{}\",\"key_len\":{},\"value_len\":{}}}",
-                    to_hex(k), to_hex(v), k.len(), v.len()
+                    to_hex(k),
+                    to_hex(v),
+                    k.len(),
+                    v.len()
                 );
             })?;
         } else {
             db.scan_stream(pref_bytes, |k, v| {
                 println!(
                     "key='{}' ({} B) -> value '{}' ({} B)",
-                    display_text(k), k.len(), display_text(v), v.len()
+                    display_text(k),
+                    k.len(),
+                    display_text(v),
+                    v.len()
                 );
             })?;
         }
@@ -41,7 +47,10 @@ pub fn exec(path: PathBuf, prefix: Option<String>, json: bool, stream: bool) -> 
             }
             print!(
                 "{{\"key_hex\":\"{}\",\"value_hex\":\"{}\",\"key_len\":{},\"value_len\":{}}}",
-                to_hex(k), to_hex(v), k.len(), v.len()
+                to_hex(k),
+                to_hex(v),
+                k.len(),
+                v.len()
             );
         }
         println!("]");
@@ -52,7 +61,10 @@ pub fn exec(path: PathBuf, prefix: Option<String>, json: bool, stream: bool) -> 
             for (k, v) in acc {
                 println!(
                     "key='{}' ({} B) -> value '{}' ({} B)",
-                    display_text(&k), k.len(), display_text(&v), v.len()
+                    display_text(&k),
+                    k.len(),
+                    display_text(&v),
+                    v.len()
                 );
             }
         }

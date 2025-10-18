@@ -6,7 +6,7 @@ use QuiverDB::db::Db;
 use QuiverDB::pager::Pager;
 // diagnostics
 use QuiverDB::pager::cache::{
-    page_cache_configure, page_cache_clear, page_cache_len, page_cache_evictions_total,
+    page_cache_clear, page_cache_configure, page_cache_evictions_total, page_cache_len,
 };
 
 fn unique_root(prefix: &str) -> PathBuf {
@@ -75,7 +75,8 @@ fn stress_page_cache_gets_and_evictions() -> Result<()> {
     assert!(
         ev > 0,
         "evictions_total must grow (got {}). Total pages read: {}, cache cap: 8",
-        ev, total_pages
+        ev,
+        total_pages
     );
 
     Ok(())

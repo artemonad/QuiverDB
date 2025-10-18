@@ -21,9 +21,9 @@ use anyhow::{anyhow, Result};
 use std::io::{Cursor, Read};
 use std::sync::OnceLock;
 
-use crate::pager::Pager;
 use crate::dir::NO_PAGE;
 use crate::page::{ovf_header_read_v3, OVF_HDR_MIN};
+use crate::pager::Pager;
 
 /// Максимально допустимый размер значения (байт), читаемого из OVERFLOW‑цепочки.
 /// Настраивается через ENV P1_MAX_VALUE_BYTES. По умолчанию 1 GiB.
@@ -116,9 +116,9 @@ pub fn read_overflow_chain(pager: &Pager, mut head: u64, expected_len: usize) ->
                     }
 
                     let to_read = std::cmp::min(tmp.len(), remaining);
-                    let n = decoder.read(&mut tmp[..to_read]).map_err(|e| {
-                        anyhow!("zstd decode read (pid={}): {}", head, e)
-                    })?;
+                    let n = decoder
+                        .read(&mut tmp[..to_read])
+                        .map_err(|e| anyhow!("zstd decode read (pid={}): {}", head, e))?;
 
                     if n == 0 {
                         break;
@@ -144,7 +144,11 @@ pub fn read_overflow_chain(pager: &Pager, mut head: u64, expected_len: usize) ->
                 }
             }
             other => {
-                return Err(anyhow!("unsupported overflow codec_id={} at pid={}", other, head));
+                return Err(anyhow!(
+                    "unsupported overflow codec_id={} at pid={}",
+                    other,
+                    head
+                ));
             }
         }
 

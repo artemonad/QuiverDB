@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "QuiverDB"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 description = "Embedded KV DB with in-page Robin Hood index, WAL, directory and overflow chains"
 readme = "README.md"
@@ -39,7 +39,6 @@ ffi = []
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 byteorder = "1.5"
-crc32fast = "1"
 crc32c = "0.6"
 twox-hash = "1"
 fs2 = "0.4"

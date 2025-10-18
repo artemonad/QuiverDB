@@ -25,11 +25,10 @@ use std::sync::OnceLock;
 use crate::dir::NO_PAGE;
 use crate::page::{
     kv_pack::{KvPackItem, KvPagePacker},
-    ovf_init_v3, ovf_header_read_v3, ovf_header_write_v3,
-    OVF_HDR_MIN, TRAILER_LEN,
+    ovf_header_read_v3, ovf_header_write_v3, ovf_init_v3, OVF_HDR_MIN, TRAILER_LEN,
 };
 // NEW: метрики packing + bloom delta-update
-use crate::metrics::{record_pack_page, record_bloom_update};
+use crate::metrics::{record_bloom_update, record_pack_page};
 // NEW: bloom side-car для delta-update
 use crate::bloom::BloomSidecar;
 
@@ -85,7 +84,10 @@ impl Db {
 
 impl<'a> Batch<'a> {
     pub fn new(db: &'a mut Db) -> Self {
-        Self { db, pending_ops: Vec::new() }
+        Self {
+            db,
+            pending_ops: Vec::new(),
+        }
     }
 
     /// put внутри batch: буферизация операции (без немедленной аллокации).
@@ -96,7 +98,10 @@ impl<'a> Batch<'a> {
         let bucket = self.db.dir.bucket_of_key(key, self.db.pager.meta.hash_kind);
         self.pending_ops.push(PendingOp {
             bucket,
-            kind: OpKind::Put { key: key.to_vec(), value: value.to_vec() },
+            kind: OpKind::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
         });
         Ok(())
     }
@@ -163,7 +168,8 @@ impl<'a> Batch<'a> {
 
                         if v.len() > pack_threshold {
                             // Большое значение → OVERFLOW + placeholder
-                            let (ovf_head, mut ovf_pages) = self.build_overflow_chain_pages_full(v)?;
+                            let (ovf_head, mut ovf_pages) =
+                                self.build_overflow_chain_pages_full(v)?;
                             pages_to_commit.append(&mut ovf_pages);
 
                             let placeholder = make_ovf_placeholder_v3(v.len() as u64, ovf_head);
@@ -227,7 +233,9 @@ impl<'a> Batch<'a> {
         let mut updates: Vec<(u32, u64)> = new_heads.into_iter().collect();
         updates.sort_by_key(|e| e.0);
 
-        self.db.pager.commit_pages_batch_with_heads(&mut for_commit, &updates)?;
+        self.db
+            .pager
+            .commit_pages_batch_with_heads(&mut for_commit, &updates)?;
 
         // 5) Мгновенная видимость читателям
         if !updates.is_empty() {
@@ -242,7 +250,8 @@ impl<'a> Batch<'a> {
 
                     for (bucket, keys_vec) in bloom_keys.into_iter() {
                         // соберём &[&[u8]]
-                        let key_slices: Vec<&[u8]> = keys_vec.iter().map(|k| k.as_slice()).collect();
+                        let key_slices: Vec<&[u8]> =
+                            keys_vec.iter().map(|k| k.as_slice()).collect();
                         // Метрика record_bloom_update(..) уже учитывается внутри update_bucket_bits()
                         let _ = sidecar.update_bucket_bits(bucket, &key_slices, new_lsn);
                     }
@@ -363,12 +372,17 @@ impl<'a> Batch<'a> {
             }
         }
 
-        Err(anyhow!("record too large for KV page even after flush (and OVF fallback)"))
+        Err(anyhow!(
+            "record too large for KV page even after flush (and OVF fallback)"
+        ))
     }
 
     /// Построить OVERFLOW3‑цепочку целиком в памяти (все страницы),
     /// вернуть (head_pid, pages).
-    fn build_overflow_chain_pages_full(&mut self, value: &[u8]) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
+    fn build_overflow_chain_pages_full(
+        &mut self,
+        value: &[u8],
+    ) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
         let ps = self.db.pager.meta.page_size as usize;
         let header_min = OVF_HDR_MIN;
         let cap = ps - header_min - TRAILER_LEN;
@@ -384,7 +398,11 @@ impl<'a> Batch<'a> {
 
         for i in 0..n {
             let pid = start_pid + i as u64;
-            let next = if i + 1 < n { start_pid + (i as u64) + 1 } else { NO_PAGE };
+            let next = if i + 1 < n {
+                start_pid + (i as u64) + 1
+            } else {
+                NO_PAGE
+            };
 
             let (codec_id, payload) = if codec_default == 1 {
                 match zstd::bulk::compress(chunks[i], 0) {

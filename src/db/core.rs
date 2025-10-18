@@ -76,7 +76,14 @@ impl MemKeyDir {
     /// Вставка совместимости: только pid (off=0).
     #[inline]
     pub fn insert(&mut self, bucket: u32, key: &[u8], page_id: u64) {
-        self.insert_loc(bucket, key, MemKeyLoc { pid: page_id, off: 0 });
+        self.insert_loc(
+            bucket,
+            key,
+            MemKeyLoc {
+                pid: page_id,
+                off: 0,
+            },
+        );
     }
 
     /// Получить локацию (pid, off).
@@ -139,7 +146,11 @@ impl MemKeyDir {
 
     /// Обход по префиксу (bucket, key, pid, off).
     #[inline]
-    pub fn for_each_prefix_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(&self, prefix: &[u8], mut f: F) {
+    pub fn for_each_prefix_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(
+        &self,
+        prefix: &[u8],
+        mut f: F,
+    ) {
         for (b, map) in self.maps.iter().enumerate() {
             let b = b as u32;
             for (k, loc) in map.iter() {
@@ -202,7 +213,9 @@ impl Db {
     /// Новый быстрый путь: получить локацию (pid, off).
     #[inline]
     pub(crate) fn mem_keydir_get_loc(&self, bucket: u32, key: &[u8]) -> Option<MemKeyLoc> {
-        self.mem_keydir.as_ref().and_then(|kd| kd.get_loc(bucket, key))
+        self.mem_keydir
+            .as_ref()
+            .and_then(|kd| kd.get_loc(bucket, key))
     }
 
     /// Вставка локации (pid, off) — используется строителем keydir.
@@ -230,7 +243,11 @@ impl Db {
 
     /// Обход по префиксу (bucket, key, pid).
     #[inline]
-    pub(crate) fn mem_keydir_for_each_prefix<F: FnMut(u32, &[u8], u64)>(&self, prefix: &[u8], f: F) {
+    pub(crate) fn mem_keydir_for_each_prefix<F: FnMut(u32, &[u8], u64)>(
+        &self,
+        prefix: &[u8],
+        f: F,
+    ) {
         if let Some(kd) = self.mem_keydir.as_ref() {
             kd.for_each_prefix(prefix, f);
         }
@@ -248,7 +265,11 @@ impl Db {
     /// Обход по префиксу с оффсетами (bucket, key, MemKeyLoc).
     #[allow(dead_code)]
     #[inline]
-    pub(crate) fn mem_keydir_for_each_prefix_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(&self, prefix: &[u8], f: F) {
+    pub(crate) fn mem_keydir_for_each_prefix_with_off<F: FnMut(u32, &[u8], MemKeyLoc)>(
+        &self,
+        prefix: &[u8],
+        f: F,
+    ) {
         if let Some(kd) = self.mem_keydir.as_ref() {
             kd.for_each_prefix_with_off(prefix, f);
         }
@@ -269,7 +290,9 @@ impl Db {
     /// Возвращает Err в RO-режиме.
     pub fn set_dir_heads_bulk(&mut self, updates: &[(u32, u64)]) -> Result<()> {
         if self.readonly {
-            return Err(anyhow!("set_dir_heads_bulk: Db is read-only (writer-only op)"));
+            return Err(anyhow!(
+                "set_dir_heads_bulk: Db is read-only (writer-only op)"
+            ));
         }
         self.dir.set_heads_bulk(updates)
     }

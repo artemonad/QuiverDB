@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use QuiverDB::bloom::BloomSidecar;
 use QuiverDB::db::Db;
 use QuiverDB::dir::Directory;
-use QuiverDB::meta::{read_meta, init_meta_v4, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32C};
+use QuiverDB::meta::{init_meta_v4, read_meta, CKSUM_CRC32C, CODEC_ZSTD, HASH_KIND_XX64_SEED0};
 
 /// Простой детерминированный PRNG (SplitMix64).
 /// Достаточен для бенчей; не криптостойкий.
@@ -57,7 +57,11 @@ impl<'a> Progress<'a> {
         if cur >= self.next || cur == self.total {
             let pct = (cur as f64 / self.total.max(1) as f64) * 100.0;
             let elapsed = self.start.elapsed().as_secs_f64();
-            let tput = if elapsed > 0.0 { cur as f64 / elapsed } else { 0.0 };
+            let tput = if elapsed > 0.0 {
+                cur as f64 / elapsed
+            } else {
+                0.0
+            };
             println!(
                 "[{:>10}] {:>7} / {:<7} ({:>5.1}%) elapsed={:.2}s, tput={:.0} ops/s",
                 self.name, cur, self.total, pct, elapsed, tput
@@ -262,7 +266,11 @@ fn run() -> Result<()> {
 
     // Phase A: load (put)
     if opt.batch_size > 0 {
-        println!("==> Phase: put_batch ({} keys, batch={})", keys.len(), opt.batch_size);
+        println!(
+            "==> Phase: put_batch ({} keys, batch={})",
+            keys.len(),
+            opt.batch_size
+        );
         phases.push(phase_put_batch(&opt, &keys, &val)?);
     } else {
         println!("==> Phase: put_single ({} keys)", keys.len());
@@ -290,10 +298,16 @@ fn run() -> Result<()> {
     // Phase E: big values (OVERFLOW)
     let big_size = opt.big_size.unwrap_or((opt.page_size as usize) * 2);
     if opt.big_batch_size > 0 {
-        println!("==> Phase: big_put ({} items, size={} B, batched={})", opt.big_n, big_size, opt.big_batch_size);
+        println!(
+            "==> Phase: big_put ({} items, size={} B, batched={})",
+            opt.big_n, big_size, opt.big_batch_size
+        );
         phases.push(phase_big_put_batched(&opt, big_size)?);
     } else {
-        println!("==> Phase: big_put ({} items, size={} B)", opt.big_n, big_size);
+        println!(
+            "==> Phase: big_put ({} items, size={} B)",
+            opt.big_n, big_size
+        );
         phases.push(phase_big_put(&opt, big_size)?);
     }
     println!("==> Phase: big_get ({} items)", opt.big_n);
@@ -377,8 +391,14 @@ fn apply_profile_env(profile: Profile) {
 fn enable_tde_env() -> Result<()> {
     println!("[bench] TDE: enabling AES-GCM trailer tag (P1_TDE_ENABLED=1)");
     std::env::set_var("P1_TDE_ENABLED", "1");
-    let has_hex = std::env::var("P1_TDE_KEY_HEX").ok().filter(|s| !s.is_empty()).is_some();
-    let has_b64 = std::env::var("P1_TDE_KEY_BASE64").ok().filter(|s| !s.is_empty()).is_some();
+    let has_hex = std::env::var("P1_TDE_KEY_HEX")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let has_b64 = std::env::var("P1_TDE_KEY_BASE64")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
     if !has_hex && !has_b64 {
         // Тестовый 32-байтовый ключ (детерминированный)
         // 0x11 повторён 32 раза — достаточно для оценки overhead
@@ -668,7 +688,13 @@ fn prepare_db(opt: &Opt) -> Result<()> {
         if !meta_path.exists() {
             match opt.codec {
                 Some(CodecChoice::Zstd) => {
-                    init_meta_v4(&opt.path, opt.page_size, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32C)?;
+                    init_meta_v4(
+                        &opt.path,
+                        opt.page_size,
+                        HASH_KIND_XX64_SEED0,
+                        CODEC_ZSTD,
+                        CKSUM_CRC32C,
+                    )?;
                     Directory::create(&opt.path, opt.buckets)?;
                 }
                 _ => {
@@ -719,7 +745,10 @@ fn print_report_human(r: &BenchReport) -> Result<()> {
     println!("  pack_pages              = {}", m.pack_pages);
     println!("  pack_records            = {}", m.pack_records);
     println!("  pack_pages_single       = {}", m.pack_pages_single);
-    println!("  pack_avg_records/page   = {:.2}", m.avg_pack_records_per_page());
+    println!(
+        "  pack_avg_records/page   = {:.2}",
+        m.avg_pack_records_per_page()
+    );
     Ok(())
 }
 
@@ -766,7 +795,10 @@ fn print_report_json(r: &BenchReport) -> Result<()> {
     print!("\"pack_pages\":{},", m.pack_pages);
     print!("\"pack_records\":{},", m.pack_records);
     print!("\"pack_pages_single\":{},", m.pack_pages_single);
-    print!("\"pack_avg_records_per_page\":{:.3}", m.avg_pack_records_per_page());
+    print!(
+        "\"pack_avg_records_per_page\":{:.3}",
+        m.avg_pack_records_per_page()
+    );
     print!("}}");
 
     println!("}}");

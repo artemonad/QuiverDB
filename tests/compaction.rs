@@ -33,7 +33,9 @@ fn compaction_basic_and_overflow() -> Result<()> {
         let db_ro = Db::open_ro(&root)?;
         let k1 = db_ro.get(b"k1")?;
         let k2 = db_ro.get(b"k2")?.expect("k2 must exist before compaction");
-        let vb = db_ro.get(b"big")?.expect("big must exist before compaction");
+        let vb = db_ro
+            .get(b"big")?
+            .expect("big must exist before compaction");
         assert!(k1.is_none(), "k1 must be deleted by tombstone");
         assert_eq!(k2.as_slice(), b"v2");
         assert_eq!(vb.len(), big.len());
@@ -50,7 +52,10 @@ fn compaction_basic_and_overflow() -> Result<()> {
     // Ожидания по отчёту: хотя бы один бакет был пересобран,
     // были записаны новые страницы (минимум одна).
     assert!(sum.buckets_compacted >= 1, "must compact at least 1 bucket");
-    assert!(sum.pages_written_sum >= 1, "must write some pages during compaction");
+    assert!(
+        sum.pages_written_sum >= 1,
+        "must write some pages during compaction"
+    );
 
     // 4) После компактации: k1 отсутствует, k2 = "v2", big совпадает по байтам
     {

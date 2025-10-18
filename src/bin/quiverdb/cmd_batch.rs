@@ -22,7 +22,8 @@ pub fn exec(path: PathBuf, ops_file: Option<PathBuf>, ops_json: Option<String>) 
         return Err(anyhow!("provide --ops-file or --ops-json"));
     };
 
-    let ops: Vec<RawOp> = serde_json::from_str(&raw).context("parse ops json (array of objects)")?;
+    let ops: Vec<RawOp> =
+        serde_json::from_str(&raw).context("parse ops json (array of objects)")?;
     if ops.is_empty() {
         println!("No ops to execute.");
         return Ok(());
@@ -33,7 +34,9 @@ pub fn exec(path: PathBuf, ops_file: Option<PathBuf>, ops_json: Option<String>) 
         for op in ops {
             match op.op.to_ascii_lowercase().as_str() {
                 "put" => {
-                    let v = op.value.ok_or_else(|| anyhow!("put requires value for key '{}'", op.key))?;
+                    let v = op
+                        .value
+                        .ok_or_else(|| anyhow!("put requires value for key '{}'", op.key))?;
                     let (bytes, _src) = decode_value_arg(&v)?;
                     b.put(op.key.as_bytes(), &bytes)?;
                 }

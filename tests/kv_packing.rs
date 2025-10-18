@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use QuiverDB::db::Db;
 use QuiverDB::dir::{Directory, NO_PAGE};
-use QuiverDB::pager::Pager;
 use QuiverDB::page::{kv_header_read_v3, PAGE_MAGIC};
+use QuiverDB::pager::Pager;
 
 #[test]
 fn kv_packing_batch_packs_multiple_records_per_page() -> Result<()> {
@@ -49,7 +49,11 @@ fn kv_packing_batch_packs_multiple_records_per_page() -> Result<()> {
 
     let mut head_page = vec![0u8; ps];
     pager.read_page(head_pid, &mut head_page)?;
-    assert_eq!(&head_page[0..4], PAGE_MAGIC, "KV page magic expected at head");
+    assert_eq!(
+        &head_page[0..4],
+        PAGE_MAGIC,
+        "KV page magic expected at head"
+    );
 
     let hdr = kv_header_read_v3(&head_page)?;
     assert!(
@@ -64,7 +68,12 @@ fn kv_packing_batch_packs_multiple_records_per_page() -> Result<()> {
     for idx in [0usize, n / 2, n - 1] {
         let (k, v) = &kvs[idx];
         let got = db_ro.get(k.as_slice())?.expect("value must exist");
-        assert_eq!(got.as_slice(), v.as_slice(), "value mismatch for key {:?}", String::from_utf8_lossy(k));
+        assert_eq!(
+            got.as_slice(),
+            v.as_slice(),
+            "value mismatch for key {:?}",
+            String::from_utf8_lossy(k)
+        );
     }
 
     Ok(())

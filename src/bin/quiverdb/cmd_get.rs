@@ -24,7 +24,12 @@ pub fn exec(path: PathBuf, key: String, out: Option<PathBuf>) -> Result<()> {
                     .open(&out_path)?;
                 f.write_all(&v)?;
                 f.sync_all()?;
-                println!("FOUND '{}': {} B -> wrote to {}", key, v.len(), out_path.display());
+                println!(
+                    "FOUND '{}': {} B -> wrote to {}",
+                    key,
+                    v.len(),
+                    out_path.display()
+                );
             } else {
                 println!("FOUND '{}': {} B", key, v.len());
                 println!("text: {}", display_text(&v));

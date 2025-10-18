@@ -15,8 +15,7 @@ pub fn exec(
     k_hashes: Option<u32>,
 ) -> Result<()> {
     // Bloom — side-car: достаточно RO-открытия базы (shared lock).
-    let db_ro = Db::open_ro(&path)
-        .with_context(|| format!("open RO DB at {}", path.display()))?;
+    let db_ro = Db::open_ro(&path).with_context(|| format!("open RO DB at {}", path.display()))?;
 
     let bpb = bytes_per_bucket.unwrap_or(4096);
     let k = k_hashes.unwrap_or(6);

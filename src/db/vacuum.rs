@@ -13,8 +13,8 @@
 
 use anyhow::Result;
 
-use super::core::Db;
 use super::compaction::CompactSummary;
+use super::core::Db;
 
 /// Сводка “вакуумной” операции: компактация + sweep сиротских OVERFLOW.
 #[derive(Debug, Clone)]

@@ -17,9 +17,7 @@ use std::sync::OnceLock;
 use crate::dir::NO_PAGE;
 use crate::free::FreeList;
 use crate::metrics;
-use crate::page::{
-    kv_header_read_v3, ovf_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3,
-};
+use crate::page::{kv_header_read_v3, ovf_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3};
 // packed-aware обход всех записей страницы
 use crate::page::kv::kv_for_each_record;
 // util: общий парсер OVERFLOW placeholder (TLV 0x01, len=16)
@@ -165,11 +163,17 @@ impl Db {
         println!("  wal_appends_total       = {}", m2.wal_appends_total);
         println!("  wal_bytes_written       = {}", m2.wal_bytes_written);
         println!("  wal_fsync_calls         = {}", m2.wal_fsync_calls);
-        println!("  wal_avg_batch_pages     = {:.2}", m2.avg_wal_batch_pages());
+        println!(
+            "  wal_avg_batch_pages     = {:.2}",
+            m2.avg_wal_batch_pages()
+        );
         println!("  wal_truncations         = {}", m2.wal_truncations);
         println!("  page_cache_hits         = {}", m2.page_cache_hits);
         println!("  page_cache_misses       = {}", m2.page_cache_misses);
-        println!("  page_cache_hit_ratio    = {:.2}%", cache_hit_ratio2 * 100.0);
+        println!(
+            "  page_cache_hit_ratio    = {:.2}%",
+            cache_hit_ratio2 * 100.0
+        );
         println!("  rh_page_compactions     = {}", m2.rh_page_compactions);
         println!("  overflow_chains_created = {}", m2.overflow_chains_created);
         println!("  overflow_chains_freed   = {}", m2.overflow_chains_freed);
@@ -358,7 +362,10 @@ impl Db {
     }
 
     /// NEW: ленивое решение — если цепочка бакета длиннее порога, запустить компактацию.
-    pub fn lazy_compact_bucket_if_needed(&mut self, bucket: u32) -> Result<Option<CompactBucketReport>> {
+    pub fn lazy_compact_bucket_if_needed(
+        &mut self,
+        bucket: u32,
+    ) -> Result<Option<CompactBucketReport>> {
         if self.readonly {
             return Err(anyhow!("lazy_compact_bucket_if_needed: Db is read-only"));
         }
@@ -420,7 +427,11 @@ impl Db {
     /// (в порядке их индекса) и, опционально, sweep сиротских OVERFLOW‑страниц.
     ///
     /// Возвращает сводку по выполненной работе.
-    pub fn auto_maintenance(&mut self, max_buckets: u32, do_sweep: bool) -> Result<AutoMaintSummary> {
+    pub fn auto_maintenance(
+        &mut self,
+        max_buckets: u32,
+        do_sweep: bool,
+    ) -> Result<AutoMaintSummary> {
         if self.readonly {
             return Err(anyhow!("auto_maintenance: Db is read-only"));
         }

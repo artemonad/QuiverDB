@@ -28,24 +28,28 @@ use std::io::{Read, Seek, SeekFrom, Write};
 // Нужен для чтения lsn из заголовка (KV/Ovf)
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::crypto::KeyJournal;
 use crate::free::FreeList;
 use crate::metrics::{record_cache_hit, record_cache_miss};
 use crate::page::{
-    page_verify_checksum, page_verify_trailer_aead_with, page_trailer_is_zero_crc32,
-    PAGE_MAGIC, OFF_TYPE, KV_OFF_LSN, OVF_OFF_LSN,
-    PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3,
-};
-use crate::crypto::KeyJournal; // NEW: Journal для epoch‑aware TDE fallback
+    page_trailer_is_zero_crc32,
+    page_verify_checksum,
+    page_verify_trailer_aead_with,
+    verify_page_crc_strict_kind, // Единая строгая CRC‑проверка из модуля page
+    KV_OFF_LSN,
+    OFF_TYPE,
+    OVF_OFF_LSN,
+    PAGE_MAGIC,
+    PAGE_TYPE_KV_RH3,
+    PAGE_TYPE_OVERFLOW3,
+}; // NEW: Journal для epoch‑aware TDE fallback
 
 use super::core::Pager;
 
 // NEW: подключаем процессный кэш
 use crate::pager::cache::{
-    page_cache_get as pc_get,
-    page_cache_put as pc_put,
-    page_cache_invalidate as pc_invalidate,
-    page_cache_configure as pc_configure_impl,
-    page_cache_init as pc_init,
+    page_cache_configure as pc_configure_impl, page_cache_get as pc_get,
+    page_cache_init as pc_init, page_cache_invalidate as pc_invalidate, page_cache_put as pc_put,
 };
 
 // --------------------------- Strict flags (dynamic) ---------------------------
@@ -197,8 +201,12 @@ impl Pager {
             }
             let ptype = LittleEndian::read_u16(&buf[OFF_TYPE..OFF_TYPE + 2]);
             let lsn = match ptype {
-                t if t == PAGE_TYPE_KV_RH3 => LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8]),
-                t if t == PAGE_TYPE_OVERFLOW3 => LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8]),
+                t if t == PAGE_TYPE_KV_RH3 => {
+                    LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8])
+                }
+                t if t == PAGE_TYPE_OVERFLOW3 => {
+                    LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8])
+                }
                 _ => return Err(anyhow!("unsupported page type {} on TDE read", ptype)),
             };
             let key = self
@@ -211,7 +219,8 @@ impl Pager {
                 if tde_strict() {
                     return Err(anyhow!(
                         "page {} AEAD tag verify failed (TDE strict mode, lsn={})",
-                        page_id, lsn
+                        page_id,
+                        lsn
                     ));
                 }
 
@@ -231,7 +240,8 @@ impl Pager {
                 if !ok_crc {
                     return Err(anyhow!(
                         "page {} AEAD/CRC verify failed (lsn={}, fallback)",
-                        page_id, lsn
+                        page_id,
+                        lsn
                     ));
                 }
             }
@@ -364,36 +374,4 @@ impl Pager {
             Err(_) => None,
         }
     }
-}
-
-// ----------------------- helpers (локальные для этого файла) -----------------------
-
-use crate::page::TRAILER_LEN;
-
-/// Строгая CRC‑проверка трейлера страницы, игнорирующая ENV‑тумблеры отключения checksum.
-/// Поддерживает kind: 0=CRC32 (IEEE via crc32fast), 1=CRC32C. kind=2 (blake3_128) — пока Err.
-fn verify_page_crc_strict_kind(page: &[u8], checksum_kind: u8) -> Result<bool> {
-    if page.len() < TRAILER_LEN {
-        return Err(anyhow!("page buffer too small for strict CRC verify"));
-    }
-    let ps = page.len();
-
-    let stored32 = LittleEndian::read_u32(&page[ps - TRAILER_LEN..ps - TRAILER_LEN + 4]);
-    if stored32 == 0 {
-        return Ok(false);
-    }
-
-    let mut copy = page.to_vec();
-    for b in &mut copy[ps - TRAILER_LEN..ps] {
-        *b = 0;
-    }
-
-    let calc = match checksum_kind {
-        0 => crc32fast::hash(&copy[..]),
-        1 => crc32c::crc32c(&copy[..]),
-        2 => return Err(anyhow!("strict CRC verify: checksum_kind=blake3_128 not implemented")),
-        other => return Err(anyhow!("strict CRC verify: unknown checksum_kind {}", other)),
-    };
-
-    Ok(stored32 == calc)
 }

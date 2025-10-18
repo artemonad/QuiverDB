@@ -1,28 +1,22 @@
 //! page/checksum — 16-байтовый трейлер страницы.
 //!
-//! 2.0 (по умолчанию):
-//! - Фиксированный CRC32C: низшие 4 байта трейлера — digest (LE), оставшиеся 12 — нули.
-//! - stored==0 трактуется как “OK” (совместимость/нулевые страницы, если не включён ZERO_CHECKSUM_STRICT).
+//! CRC режим (по умолчанию и единственный): CRC32C (Castagnoli).
+//! - trailer[0..4] — CRC32C (LE) по всей странице с занулённым трейлером;
+//! - trailer[4..16] — нули;
+//! - stored == 0 считается допустимым (нулевая/пустая страница), если не включён ZERO_CHECKSUM_STRICT;
+//! - ENV P1_PAGE_CHECKSUM=0|false|off|no (или P1_DISABLE_PAGE_CHECKSUM=1) — полностью выключает расчёт/проверку (бенчи/разработка).
 //!
-//! 2.1 (TDE prep, AEAD-tag):
-//! - Альтернативный режим — AES-256-GCM: весь трейлер (16 байт) — это AEAD-tag.
-//! - ВНИМАНИЕ: это режим целостности (integrity-only): полезная нагрузка страницы не шифруется,
-//!   сохраняется только тег, вычисленный над содержимым страницы с занулённым трейлером.
-//! - Nonce формируется детерминированно из (page_id, lsn) с помощью derive_gcm_nonce.
-//! - AAD = "P2AEAD01" || page[0..16] (MAGIC, version, type, page_id).
+//! AEAD режим (TDE): AES‑256‑GCM tag‑only (интегритет без шифрования payload).
+//! - trailer = 16‑байтовый тег;
+//! - AAD = "P2AEAD01" || page[0..16] (MAGIC, version, type, page_id);
+//! - Nonce = derive_gcm_nonce(page_id, lsn);
+//! - update/verify считают тег над копией страницы с занулённым трейлером — данные страницы не изменяются.
 //!
-//! NEW (refactor):
-//! - Выделена compute_aead_tag_for_page(..), которую используют и update, и verify.
-//! - Строгое сравнение тега — constant-time compare.
+//! Примечание (переходный шаг):
+//! - В сигнатурах page_update_checksum/page_verify_checksum параметр checksum_kind сохранён,
+//!   но игнорируется (всегда CRC32C). В следующем шаге он будет удалён из API и из meta.
 //!
-//! NEW (perf toggle):
-//! - Можно полностью отключить расчёт и проверку CRC32C для страниц (бенч/разработка):
-//!   * P1_PAGE_CHECKSUM=0|false|off|no  — отключить;
-//!   * или P1_DISABLE_PAGE_CHECKSUM=1|true|yes|on — отключить.
-//! - При отключении update — зануление трейлера, verify — всегда Ok(true).
-//!
-//! Примечание: текущий pager/page код продолжает использовать CRC32C-функции,
-//! а AEAD-функции задействуются, когда включён TDE (pager.tde_enabled=true).
+//! Strict helper verify_page_crc_strict_kind также сведён к CRC32C и игнорирует параметр kind.
 
 use anyhow::{anyhow, Result};
 use byteorder::{ByteOrder, LittleEndian};
@@ -56,16 +50,15 @@ fn page_checksum_disabled() -> bool {
     })
 }
 
-// ---------- CRC32C (2.0, по умолчанию) ----------
+// ---------- CRC32C (единственный режим) ----------
 
 #[inline]
 fn compute_crc32c(bytes: &[u8]) -> u32 {
     crc32c::crc32c(bytes)
 }
 
-/// Обновить трейлер чексуммы страницы (CRC32C).
-/// Требуется: page.len() >= TRAILER_LEN.
-/// Если page checksum отключён через ENV — трейлер зануляется без расчёта.
+/// Обновить трейлер чексуммы страницы (CRC32C единственный).
+/// Параметр checksum_kind игнорируется (переходный шаг).
 pub fn page_update_checksum(page: &mut [u8], _checksum_kind: u8) -> Result<()> {
     if page.len() < TRAILER_LEN {
         return Err(anyhow!("page buffer too small for checksum"));
@@ -96,8 +89,8 @@ pub fn page_update_checksum(page: &mut [u8], _checksum_kind: u8) -> Result<()> {
     Ok(())
 }
 
-/// Проверить трейлер чексуммы страницы (CRC32C). true = ок.
-/// Если page checksum отключён через ENV — всегда Ok(true).
+/// Проверить трейлер чексуммы страницы (CRC32C единственный). true = ок.
+/// Параметр checksum_kind игнорируется (переходный шаг).
 pub fn page_verify_checksum(page: &[u8], _checksum_kind: u8) -> Result<bool> {
     if page.len() < TRAILER_LEN {
         return Err(anyhow!("page buffer too small for checksum verify"));
@@ -126,14 +119,14 @@ pub fn page_verify_checksum(page: &[u8], _checksum_kind: u8) -> Result<bool> {
 
 // ---------- AES-256-GCM tag-only (TDE) ----------
 
+use crate::crypto::derive_gcm_nonce;
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
-use crate::crypto::derive_gcm_nonce;
 
 /// Построить AAD для AEAD-тега:
-///   AAD = "P2AEAD01" || page[0..16] (MAGIC[4], version u16, type u16, page_id u64)
+///   AAD = "P2AEAD01" || page[0..16] (MAGIC, version, type, page_id)
 #[inline]
 fn build_aead_aad(page: &[u8]) -> Result<[u8; 24]> {
     if page.len() < 16 {
@@ -159,9 +152,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Вычислить 16‑байтовый AEAD‑тег для страницы:
-/// - Делаем копию страницы и зануляем её трейлер;
+/// - Копируем страницу и зануляем её трейлер;
 /// - AAD = "P2AEAD01" || header[0..16];
-/// - Возвращаем tag (без изменения данных страницы).
+/// - Возвращаем tag (payload страницы не модифицируется).
 #[inline]
 fn compute_aead_tag_for_page(
     page: &[u8],
@@ -186,7 +179,7 @@ fn compute_aead_tag_for_page(
     // AAD по копии (эквивалентно исходной странице для [0..16])
     let aad = build_aead_aad(&tmp)?;
 
-    // encrypt_in_place_detached возвращает tag (payload не шифруем — integrity-only)
+    // encrypt_in_place_detached возвращает tag; изменённый tmp нас не волнует (это копия)
     let tag = cipher
         .encrypt_in_place_detached(nonce, &aad, &mut tmp)
         .map_err(|e| anyhow!("aead tag compute failed: {}", e))?;
@@ -196,26 +189,30 @@ fn compute_aead_tag_for_page(
     Ok(out)
 }
 
-/// Обновить трейлер страницы 16-байтовым AEAD-tag (AES-256-GCM).
-/// - Никакое шифрование данных не выполняется (tag-only, integrity).
-/// - Nonce (12 байт) передаётся явно.
-/// - Тег вычисляется над всей странице с занулённым трейлером (AAD = MAGIC "P2AEAD01" + header[0..16]).
-pub fn page_update_trailer_aead_tag(page: &mut [u8], key_32: &[u8; 32], nonce12: [u8; 12]) -> Result<()> {
+/// Обновить трейлер страницы 16-байтовым AEAD‑тегом (AES-256‑GCM).
+/// Данные страницы не модифицируются — тег считается на копии.
+pub fn page_update_trailer_aead_tag(
+    page: &mut [u8],
+    key_32: &[u8; 32],
+    nonce12: [u8; 12],
+) -> Result<()> {
     if page.len() < TRAILER_LEN {
         return Err(anyhow!("page buffer too small for AEAD trailer"));
     }
     let ps = page.len();
-
     let tag = compute_aead_tag_for_page(page, key_32, &nonce12)?;
     page[ps - TRAILER_LEN..ps].copy_from_slice(&tag);
     Ok(())
 }
 
-/// Проверить 16-байтовый AEAD-tag в трейлере (AES-256-GCM).
-/// - Nonce (12 байт) передаётся явно.
+/// Проверить 16-байтовый AEAD‑тег в трейлере (AES-256‑GCM).
 /// - Возвращает true при совпадении, иначе false.
 /// - stored == 0..0 (все нули) возвращает false (строго).
-pub fn page_verify_trailer_aead_tag(page: &[u8], key_32: &[u8; 32], nonce12: [u8; 12]) -> Result<bool> {
+pub fn page_verify_trailer_aead_tag(
+    page: &[u8],
+    key_32: &[u8; 32],
+    nonce12: [u8; 12],
+) -> Result<bool> {
     if page.len() < TRAILER_LEN {
         return Err(anyhow!("page buffer too small for AEAD verify"));
     }
@@ -231,37 +228,70 @@ pub fn page_verify_trailer_aead_tag(page: &[u8], key_32: &[u8; 32], nonce12: [u8
     Ok(constant_time_eq(stored, &calc))
 }
 
-/// Удобная обёртка: обновить трейлер AEAD-tag, дернув nonce из (page_id, lsn).
+/// Удобная обёртка: обновить трейлер AEAD‑tag, дернув nonce из (page_id, lsn).
 #[inline]
-pub fn page_update_trailer_aead_with(page: &mut [u8], key_32: &[u8; 32], page_id: u64, lsn: u64) -> Result<()> {
+pub fn page_update_trailer_aead_with(
+    page: &mut [u8],
+    key_32: &[u8; 32],
+    page_id: u64,
+    lsn: u64,
+) -> Result<()> {
     let nonce = derive_gcm_nonce(page_id, lsn);
     page_update_trailer_aead_tag(page, key_32, nonce)
 }
 
-/// Удобная обёртка: проверить AEAD-tag, дернув nonce из (page_id, lsn).
+/// Удобная обёртка: проверить AEAD‑tag, дернув nonce из (page_id, lsn).
 #[inline]
-pub fn page_verify_trailer_aead_with(page: &[u8], key_32: &[u8; 32], page_id: u64, lsn: u64) -> Result<bool> {
+pub fn page_verify_trailer_aead_with(
+    page: &[u8],
+    key_32: &[u8; 32],
+    page_id: u64,
+    lsn: u64,
+) -> Result<bool> {
     let nonce = derive_gcm_nonce(page_id, lsn);
     page_verify_trailer_aead_tag(page, key_32, nonce)
 }
 
-// ---------- Helpers (new): чтение поля CRC из трейлера ----------
+// ---------- Helpers (чтение поля CRC из трейлера) ----------
 
 /// Прочитать низшие 4 байта трейлера страницы как u32 (LE).
-/// Полезно для диагностики и «строгой» проверки нулевого трейлера в CRC‑режиме.
-/// Возвращает Err, если буфер меньше TRAILER_LEN.
 #[inline]
 pub fn page_trailer_crc32_le(page: &[u8]) -> Result<u32> {
     if page.len() < TRAILER_LEN {
         return Err(anyhow!("page buffer too small for trailer read"));
     }
     let ps = page.len();
-    Ok(LittleEndian::read_u32(&page[ps - TRAILER_LEN..ps - TRAILER_LEN + 4]))
+    Ok(LittleEndian::read_u32(
+        &page[ps - TRAILER_LEN..ps - TRAILER_LEN + 4],
+    ))
 }
 
 /// Проверка «нулевого трейлера» для CRC‑режима (stored CRC32 == 0).
-/// Для TDE/AEAD этот хелпер неприменим (там весь трейлер — tag).
 #[inline]
 pub fn page_trailer_is_zero_crc32(page: &[u8]) -> Result<bool> {
     Ok(page_trailer_crc32_le(page)? == 0)
+}
+
+// ---------- Strict verify helper (используется в pager/io) ----------
+
+/// Строгая CRC‑проверка трейлера страницы, игнорирующая ENV‑тумблеры.
+/// Всегда использует CRC32C (Castagnoli). Параметр checksum_kind игнорируется.
+pub fn verify_page_crc_strict_kind(page: &[u8], _checksum_kind: u8) -> Result<bool> {
+    if page.len() < TRAILER_LEN {
+        return Err(anyhow!("page buffer too small for strict CRC verify"));
+    }
+    let ps = page.len();
+
+    let stored32 = LittleEndian::read_u32(&page[ps - TRAILER_LEN..ps - TRAILER_LEN + 4]);
+    if stored32 == 0 {
+        return Ok(false);
+    }
+
+    let mut copy = page.to_vec();
+    for b in &mut copy[ps - TRAILER_LEN..ps] {
+        *b = 0;
+    }
+
+    let calc = compute_crc32c(&copy[..]);
+    Ok(stored32 == calc)
 }

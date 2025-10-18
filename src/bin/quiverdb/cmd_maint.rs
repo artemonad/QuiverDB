@@ -9,8 +9,8 @@ use QuiverDB::db::Db;
 ///   quiverdb auto-maint --path ./db --max-buckets 32 --sweep
 ///   quiverdb auto-maint --path ./db --max-buckets 16 --json
 pub fn exec(path: PathBuf, max_buckets: u32, do_sweep: bool, json: bool) -> Result<()> {
-    let mut db = Db::open(&path)
-        .with_context(|| format!("open writer DB at {}", path.display()))?;
+    let mut db =
+        Db::open(&path).with_context(|| format!("open writer DB at {}", path.display()))?;
 
     let sum = db
         .auto_maintenance(max_buckets, do_sweep)

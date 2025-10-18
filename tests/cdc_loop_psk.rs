@@ -8,20 +8,19 @@ use std::thread;
 
 use QuiverDB::db::Db;
 use QuiverDB::wal::{
-    WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE,
-    WAL_REC_OFF_TYPE, WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_OFF_LEN, WAL_REC_OFF_CRC32,
-    WAL_REC_PAGE_IMAGE, WAL_REC_HEADS_UPDATE,
-    crc32c_of_parts,
+    crc32c_of_parts, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_HDR_SIZE, WAL_REC_HEADS_UPDATE,
+    WAL_REC_OFF_CRC32, WAL_REC_OFF_LEN, WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_OFF_TYPE,
+    WAL_REC_PAGE_IMAGE,
 };
-use QuiverDB::wal::reader::read_next_record;
+// NEW: stateful reader вместо deprecated read_next_record
 use QuiverDB::wal::encode::build_hdr_with_crc;
-use QuiverDB::wal::net::{load_psk_from_env, write_framed_psk, read_next_framed_psk};
+use QuiverDB::wal::net::{load_psk_from_env, read_next_framed_psk, write_framed_psk};
+use QuiverDB::wal::reader::WalStreamReader;
 
 use QuiverDB::meta::set_last_lsn;
 use QuiverDB::page::{
-    PAGE_MAGIC, OFF_TYPE, KV_OFF_LSN, OVF_OFF_LSN,
-    PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3,
-    KV_HDR_MIN,
+    KV_HDR_MIN, KV_OFF_LSN, OFF_TYPE, OVF_OFF_LSN, PAGE_MAGIC, PAGE_TYPE_KV_RH3,
+    PAGE_TYPE_OVERFLOW3,
 };
 
 fn unique_root(prefix: &str) -> PathBuf {
@@ -83,7 +82,11 @@ fn cdc_loop_psk_end_to_end() -> Result<()> {
     let mut frames_buf: Vec<Vec<u8>> = Vec::new();
     let mut pos = WAL_HDR_SIZE as u64;
     let file_len = src.metadata()?.len();
-    while let Some((rec, next_pos)) = read_next_record(&mut src, pos, file_len)? {
+
+    // NEW: stateful WAL reader
+    let mut rdr = WalStreamReader::new();
+
+    while let Some((rec, next_pos)) = rdr.read_next(&mut src, pos, file_len)? {
         // Сформируем bytes кадра WAL: [WAL header 28][payload]
         let mut buf = Vec::with_capacity(WAL_REC_HDR_SIZE + rec.payload.len());
         let hdr28 = build_hdr_with_crc(rec.rec_type, rec.lsn, rec.page_id, &rec.payload);
@@ -94,10 +97,7 @@ fn cdc_loop_psk_end_to_end() -> Result<()> {
         frames_buf.push(buf);
         pos = next_pos;
     }
-    assert!(
-        !frames_buf.is_empty(),
-        "producer WAL must contain frames"
-    );
+    assert!(!frames_buf.is_empty(), "producer WAL must contain frames");
 
     // Writer нам больше не нужен — после этого Drop усечёт WAL, но кадры уже в памяти
     drop(db_prod);
@@ -167,7 +167,8 @@ fn apply_psk_stream(dst: &PathBuf, host_port: &str) -> Result<()> {
 
         let rec_type = payload[WAL_REC_OFF_TYPE];
         let lsn = LittleEndian::read_u64(&payload[WAL_REC_OFF_LSN..WAL_REC_OFF_LSN + 8]);
-        let page_id = LittleEndian::read_u64(&payload[WAL_REC_OFF_PAGE_ID..WAL_REC_OFF_PAGE_ID + 8]);
+        let page_id =
+            LittleEndian::read_u64(&payload[WAL_REC_OFF_PAGE_ID..WAL_REC_OFF_PAGE_ID + 8]);
         let len = LittleEndian::read_u32(&payload[WAL_REC_OFF_LEN..WAL_REC_OFF_LEN + 4]) as usize;
         let stored_crc = LittleEndian::read_u32(&payload[WAL_REC_OFF_CRC32..WAL_REC_OFF_CRC32 + 4]);
 
@@ -246,12 +247,20 @@ fn apply_psk_stream(dst: &PathBuf, host_port: &str) -> Result<()> {
 }
 
 fn v3_page_lsn(buf: &[u8]) -> Option<u64> {
-    if buf.len() < KV_HDR_MIN { return None; }
-    if &buf[..4] != PAGE_MAGIC { return None; }
+    if buf.len() < KV_HDR_MIN {
+        return None;
+    }
+    if &buf[..4] != PAGE_MAGIC {
+        return None;
+    }
     let ptype = LittleEndian::read_u16(&buf[OFF_TYPE..OFF_TYPE + 2]);
     match ptype {
-        t if t == PAGE_TYPE_KV_RH3 => Some(LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8])),
-        t if t == PAGE_TYPE_OVERFLOW3 => Some(LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8])),
+        t if t == PAGE_TYPE_KV_RH3 => {
+            Some(LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8]))
+        }
+        t if t == PAGE_TYPE_OVERFLOW3 => {
+            Some(LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8]))
+        }
         _ => None,
     }
 }

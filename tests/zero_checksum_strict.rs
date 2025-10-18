@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use byteorder::{ByteOrder, LittleEndian};
 
 use QuiverDB::dir::NO_PAGE;
+use QuiverDB::page::{kv_header_read_v3, kv_header_write_v3, kv_init_v3, KV_HDR_MIN};
 use QuiverDB::pager::Pager;
-use QuiverDB::page::{kv_init_v3, kv_header_read_v3, kv_header_write_v3, KV_HDR_MIN};
 
 #[test]
 fn zero_checksum_non_strict_ok_and_strict_fails() -> Result<()> {
@@ -78,7 +78,13 @@ fn unique_root(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("qdb2-{}-{}-{}", prefix, pid, t))
 }
 
-fn write_single_record_kv(page: &mut [u8], key: &[u8], value: &[u8], expires_at_sec: u32, vflags: u8) -> Result<()> {
+fn write_single_record_kv(
+    page: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    expires_at_sec: u32,
+    vflags: u8,
+) -> Result<()> {
     if page.len() < KV_HDR_MIN + 16 {
         anyhow::bail!("page too small for KV record");
     }

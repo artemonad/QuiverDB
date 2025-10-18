@@ -26,14 +26,12 @@ use byteorder::{ByteOrder, LittleEndian};
 use crate::bloom::BloomSidecar;
 use crate::dir::NO_PAGE;
 use crate::metrics::{
-    record_bloom_negative, record_bloom_positive, record_bloom_skipped_stale, record_ttl_skipped,
-    record_keydir_hit, record_keydir_miss,
+    record_bloom_negative, record_bloom_positive, record_bloom_skipped_stale, record_keydir_hit,
+    record_keydir_miss, record_ttl_skipped,
 };
-use crate::page::{
-    kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3, TRAILER_LEN,
-};
-use crate::page::kv::{kv_for_each_record, kv_read_record_at_checked};
 use crate::page::common::KV_SLOT_SIZE;
+use crate::page::kv::{kv_for_each_record, kv_read_record_at_checked};
+use crate::page::{kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3, TRAILER_LEN};
 use crate::util::now_secs;
 
 use super::core::{Db, MemKeyLoc};
@@ -53,7 +51,9 @@ impl Db {
             if loc.pid == NO_PAGE {
                 return Ok(false);
             }
-            if let Some(res) = self.exists_from_pid_off_or_fallback_with_buf(key, loc, now, &mut page_buf)? {
+            if let Some(res) =
+                self.exists_from_pid_off_or_fallback_with_buf(key, loc, now, &mut page_buf)?
+            {
                 return Ok(res);
             }
         } else {
@@ -125,7 +125,9 @@ impl Db {
 
         // Прямая проверка по off
         let off = loc.off as usize;
-        if let Some((k, _v, expires_at_sec, vflags)) = kv_read_record_at_checked(page_buf, off, data_end) {
+        if let Some((k, _v, expires_at_sec, vflags)) =
+            kv_read_record_at_checked(page_buf, off, data_end)
+        {
             if k != key {
                 // рассогласование (редко) — пусть обычный путь решает
                 return Ok(None);
@@ -137,7 +139,9 @@ impl Db {
             if expires_at_sec != 0 && now >= expires_at_sec {
                 record_ttl_skipped();
                 // Протухло: возможно есть более старая валидная версия — fallback от next_pid
-                return self.exists_scan_chain_from_with_buf(key, next, now, page_buf).map(Some);
+                return self
+                    .exists_scan_chain_from_with_buf(key, next, now, page_buf)
+                    .map(Some);
             }
             // Валидная запись — присутствует
             return Ok(Some(true));

@@ -34,7 +34,9 @@ fn bloom_fresh_negative_hint() -> Result<()> {
     );
 
     // 4) Отрицательный хинт: ключа "missing" точно нет
-    let bucket = db_ro.dir.bucket_of_key(b"missing", db_ro.pager.meta.hash_kind);
+    let bucket = db_ro
+        .dir
+        .bucket_of_key(b"missing", db_ro.pager.meta.hash_kind);
     let maybe = sidecar.test(bucket, b"missing")?;
     assert!(!maybe, "bloom must say 'definitely absent' for missing");
 

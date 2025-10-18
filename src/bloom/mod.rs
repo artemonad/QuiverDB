@@ -7,5 +7,5 @@ pub mod cache;
 pub mod sidecar;
 
 // Удобные реэкспорты верхнего уровня
+pub use cache::{bloom_cache_counters, bloom_cache_stats};
 pub use sidecar::BloomSidecar;
-pub use cache::{bloom_cache_stats, bloom_cache_counters};

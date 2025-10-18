@@ -13,13 +13,11 @@
 //! - Если страница не KV_RH3 или MAGIC не совпадает — возвращает Continue.
 //! - Обход используется через kv_for_each_record (packed‑aware; reverse слоты).
 
-use byteorder::{ByteOrder, LittleEndian};
 use crate::metrics::record_ttl_skipped;
-use crate::util::decode_ovf_placeholder_v3;
-use crate::page::{
-    PAGE_MAGIC, PAGE_TYPE_KV_RH3, OFF_TYPE,
-};
 use crate::page::kv::kv_for_each_record;
+use crate::page::{OFF_TYPE, PAGE_MAGIC, PAGE_TYPE_KV_RH3};
+use crate::util::decode_ovf_placeholder_v3;
+use byteorder::{ByteOrder, LittleEndian};
 
 /// Решение при чтении value по одной странице.
 #[derive(Debug)]
@@ -27,7 +25,10 @@ pub enum DecideOnPage {
     Tombstone,
     Valid(Vec<u8>),
     /// На странице встретился OVERFLOW placeholder — нужно раскрыть цепочку на вызывающем уровне.
-    NeedOverflow { total_len: usize, head_pid: u64 },
+    NeedOverflow {
+        total_len: usize,
+        head_pid: u64,
+    },
     /// Ничего не нашли или всё протухло — нужно перейти к next_page_id.
     Continue,
 }

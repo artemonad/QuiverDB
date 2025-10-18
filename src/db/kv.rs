@@ -12,39 +12,31 @@
 //!       если запись протухла — корректный fallback от next_pid
 //! - Bloom positive → лёгкий префетч головы (pager.prefetch_page(head)).
 //!
-//! Изменения:
-//! - Добавлен быстрый путь по оффсету записи из in‑memory keydir.
-//!   При наличии MemKeyLoc { pid, off } избегаем внутристраничного поиска (слоты),
-//!   читаем запись по известному смещению и применяем tombstone/TTL/OVERFLOW‑семантику.
-//!   При любом несоответствии выполняется аккуратный fallback на прежний обход цепочки.
-//! - Логика per‑page поиска (скан слотов newest→oldest) остаётся в db/read_page.rs
-//!   и применяется на fallback.
+//! NEW: value cache для OVERFLOW — перед чтением цепочки пробуем кэш, после чтения кладём в кэш.
 
 use anyhow::{anyhow, Result};
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::bloom::BloomSidecar;
+use crate::dir::NO_PAGE;
 use crate::metrics::{
-    record_bloom_negative,
-    record_bloom_positive,
-    record_bloom_skipped_stale,
-    record_ttl_skipped,
-};
-use crate::page::{
-    kv_init_v3, kv_header_read_v3, kv_header_write_v3,
-    ovf_header_read_v3, ovf_init_v3, ovf_header_write_v3,
-    PAGE_MAGIC, PAGE_TYPE_KV_RH3,
-    KV_HDR_MIN, TRAILER_LEN, OVF_HDR_MIN,
+    record_bloom_negative, record_bloom_positive, record_bloom_skipped_stale, record_ttl_skipped,
 };
 use crate::page::ovf::chain as page_ovf_chain;
-use crate::dir::NO_PAGE;
-use crate::bloom::BloomSidecar;
-use crate::util::{now_secs, decode_ovf_placeholder_v3};
+use crate::page::{
+    kv_header_read_v3, kv_header_write_v3, kv_init_v3, ovf_header_read_v3, ovf_header_write_v3,
+    ovf_init_v3, KV_HDR_MIN, OVF_HDR_MIN, PAGE_MAGIC, PAGE_TYPE_KV_RH3, TRAILER_LEN,
+};
+use crate::util::{decode_ovf_placeholder_v3, now_secs};
 
 // Общие хелперы чтения одной страницы (скан newest→oldest)
 use crate::db::read_page::{decide_value_on_page, DecideOnPage};
 
 // Быстрый безопасный ридер записи по известному смещению
 use crate::page::kv::kv_read_record_at_checked;
+
+// NEW: кэш распакованных OVERFLOW значений (LRU по байтам)
+use crate::pager::value_cache::{value_cache_get, value_cache_put};
 
 use super::core::{Db, MemKeyLoc};
 
@@ -97,8 +89,7 @@ impl Db {
             kv_header_write_v3(&mut kv_page, &h)?;
         }
 
-        let mut for_commit: Vec<(u64, &mut [u8])> =
-            Vec::with_capacity(ovf_pages.len() + 1);
+        let mut for_commit: Vec<(u64, &mut [u8])> = Vec::with_capacity(ovf_pages.len() + 1);
         for (pid, buf) in ovf_pages.iter_mut() {
             for_commit.push((*pid, buf.as_mut_slice()));
         }
@@ -153,14 +144,14 @@ impl Db {
 
         // Быстрый путь: in‑memory keydir с оффсетом
         if let Some(loc) = self.mem_keydir_get_loc(bucket, key) {
-            // Tombstone — немедленно None
             if loc.pid == NO_PAGE {
                 return Ok(None);
             }
-            if let Some(v) = self.get_from_pid_off_or_fallback_with_buf(key, loc, now, &mut page_buf)? {
+            if let Some(v) =
+                self.get_from_pid_off_or_fallback_with_buf(key, loc, now, &mut page_buf)?
+            {
                 return Ok(Some(v));
             }
-            // Если вернулся None — fallback выполнит обычный путь ниже
         }
 
         // Bloom fast‑path (кэшированный sidecar)
@@ -208,7 +199,12 @@ impl Db {
         overhead + key.len() + value.len() <= ps
     }
 
-    pub(crate) fn write_single_record_kv_page(&self, page: &mut [u8], key: &[u8], value: &[u8]) -> Result<()> {
+    pub(crate) fn write_single_record_kv_page(
+        &self,
+        page: &mut [u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
         self.write_single_record_kv_page_with_flags(page, key, value, 0, 0)
     }
 
@@ -259,7 +255,11 @@ impl Db {
 
         for i in 0..n {
             let pid = start_pid + i as u64;
-            let next = if i + 1 < n { start_pid + i as u64 + 1 } else { NO_PAGE };
+            let next = if i + 1 < n {
+                start_pid + i as u64 + 1
+            } else {
+                NO_PAGE
+            };
 
             let (codec_id, payload) = if codec_default == 1 {
                 match compress_zstd(chunks[i]) {
@@ -286,10 +286,6 @@ impl Db {
         Ok((start_pid, out))
     }
 
-    fn read_overflow_chain(&self, head: u64, expected_len: usize) -> Result<Vec<u8>> {
-        page_ovf_chain::read_overflow_chain(&self.pager, head, expected_len)
-    }
-
     /// Новый быстрый путь: по известной локации (pid, off) попытаться вернуть
     /// значение сразу, при несоответствии/TTL — fallback к цепочке.
     fn get_from_pid_off_or_fallback_with_buf(
@@ -301,7 +297,6 @@ impl Db {
     ) -> Result<Option<Vec<u8>>> {
         let ps = self.pager.meta.page_size as usize;
 
-        // safety: loc.pid уже проверен на NO_PAGE выше
         self.pager.read_page(loc.pid, page_buf)?;
         if &page_buf[0..4] != PAGE_MAGIC {
             return self.get_from_chain_starting_at_with_buf(key, loc.pid, now, page_buf);
@@ -317,32 +312,25 @@ impl Db {
 
         // Безопасно прочитаем запись по оффсету
         let off_usize = loc.off as usize;
-        if let Some((k, v, expires_at_sec, vflags)) = kv_read_record_at_checked(page_buf, off_usize, data_end) {
-            // Если вдруг ключ не совпал (редкий случай рассогласования) — fallback
+        if let Some((k, v, expires_at_sec, vflags)) =
+            kv_read_record_at_checked(page_buf, off_usize, data_end)
+        {
             if k != key {
                 return self.get_from_chain_starting_at_with_buf(key, loc.pid, now, page_buf);
             }
 
             if (vflags & 0x1) == 1 {
-                // tombstone — немедленно None
                 return Ok(None);
             }
 
-            // TTL read-side
             if expires_at_sec != 0 && now >= expires_at_sec {
                 record_ttl_skipped();
-                // более старая валидная версия — либо на этой странице (но мы знаем точное место новой),
-                // либо в хвосте — используем общий fallback по цепочке
                 return self.get_from_chain_starting_at_with_buf(key, next, now, page_buf);
             }
 
             // Валидная запись: inline либо OVERFLOW placeholder
-            if let Some((total_len, head_pid)) = decode_ovf_placeholder_v3(v) {
-                let val = self.read_overflow_chain(head_pid, total_len as usize)?;
-                return Ok(Some(val));
-            } else {
-                return Ok(Some(v.to_vec()));
-            }
+            let val = self.expand_value_cached(v)?;
+            return Ok(Some(val));
         }
 
         // Если запись не прочиталась по оффсету — fallback
@@ -376,14 +364,40 @@ impl Db {
             match decide_value_on_page(page_buf, key, now) {
                 DecideOnPage::Tombstone => return Ok(None),
                 DecideOnPage::Valid(v) => return Ok(Some(v)),
-                DecideOnPage::NeedOverflow { total_len, head_pid } => {
-                    let val = self.read_overflow_chain(head_pid, total_len)?;
+                DecideOnPage::NeedOverflow {
+                    total_len,
+                    head_pid,
+                } => {
+                    if let Some(cached) = value_cache_get(self.pager.db_id, head_pid, total_len) {
+                        return Ok(Some(cached));
+                    }
+                    let val =
+                        page_ovf_chain::read_overflow_chain(&self.pager, head_pid, total_len)?;
+                    value_cache_put(self.pager.db_id, head_pid, total_len, &val);
                     return Ok(Some(val));
                 }
-                DecideOnPage::Continue => { pid = next; }
+                DecideOnPage::Continue => {
+                    pid = next;
+                }
             }
         }
         Ok(None)
+    }
+
+    /// Раскрыть значение (OVERFLOW placeholder → байты) c value cache.
+    #[inline]
+    fn expand_value_cached(&self, v: &[u8]) -> Result<Vec<u8>> {
+        if let Some((total_len, head_pid)) = decode_ovf_placeholder_v3(v) {
+            if let Some(cached) = value_cache_get(self.pager.db_id, head_pid, total_len as usize) {
+                return Ok(cached);
+            }
+            let val =
+                page_ovf_chain::read_overflow_chain(&self.pager, head_pid, total_len as usize)?;
+            value_cache_put(self.pager.db_id, head_pid, total_len as usize, &val);
+            Ok(val)
+        } else {
+            Ok(v.to_vec())
+        }
     }
 }
 
@@ -409,6 +423,8 @@ fn data_end_for_header(hdr: &crate::page::kv::KvHeaderV3, ps: usize) -> usize {
     if hdr.table_slots == 0 {
         ps.saturating_sub(TRAILER_LEN)
     } else {
-        ps.saturating_sub(TRAILER_LEN + (hdr.table_slots as usize) * crate::page::common::KV_SLOT_SIZE)
+        ps.saturating_sub(
+            TRAILER_LEN + (hdr.table_slots as usize) * crate::page::common::KV_SLOT_SIZE,
+        )
     }
 }

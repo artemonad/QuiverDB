@@ -5,7 +5,12 @@ use QuiverDB::db::Db;
 
 use super::util::{decode_value_arg, read_all};
 
-pub fn exec(path: PathBuf, key: String, value: Option<String>, value_file: Option<PathBuf>) -> Result<()> {
+pub fn exec(
+    path: PathBuf,
+    key: String,
+    value: Option<String>,
+    value_file: Option<PathBuf>,
+) -> Result<()> {
     let val_bytes = match (value, value_file) {
         (_, Some(p)) => read_all(&p)?,
         (Some(s), None) => decode_value_arg(&s)?.0,

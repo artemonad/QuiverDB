@@ -97,7 +97,7 @@ pub struct BloomSidecar {
     pub(crate) root: PathBuf,
     pub(crate) path: PathBuf,
     pub(crate) meta: BloomMeta,
-    pub(crate) hdr_size_u64: u64,   // 40 (v1) или 48 (v2)
+    pub(crate) hdr_size_u64: u64, // 40 (v1) или 48 (v2)
     pub(crate) hdr_size_usize: usize,
     pub(crate) version: u32,
 
@@ -107,47 +107,76 @@ pub struct BloomSidecar {
     // RAM‑копия body (если выбрали RAM режим)
     pub(crate) body: Option<Box<[u8]>>,
 
-    // MMAP view на body (если выбрали mmap режим)
+    // MMAP view на ВЕСЬ файл (если выбрали mmap режим)
+    // Индексация body учитывает hdr_size.
     pub(crate) mmap: Option<Mmap>,
 }
 
 // -------------------- общие helpers и view‑логика (для подмодулей) --------------------
 
 impl BloomSidecar {
-    // Перечитать views (mmap/RAM) — общая логика для open/ops
+    /// Перечитать views (mmap/RAM) — общая логика для open/ops.
+    /// Новая политика mmap: отображаем ВЕСЬ файл (offset=0), чтобы избежать EINVAL на невыравненных offset’ах.
     pub(crate) fn reload_views(&mut self) -> Result<()> {
-        let total_body_len = (self.meta.buckets as usize)
-            .saturating_mul(self.meta.bytes_per_bucket as usize);
+        let total_body_len =
+            (self.meta.buckets as usize).saturating_mul(self.meta.bytes_per_bucket as usize);
+
+        // При пустом body ничего не отображаем и не держим RAM‑копию
+        if total_body_len == 0 {
+            self.mmap = None;
+            self.body = None;
+            return Ok(());
+        }
 
         if bloom_mmap_enabled() {
             if let Some(ref ro) = self.f_ro {
-                let file = ro.lock().map_err(|_| anyhow!("bloom ro handle poisoned"))?;
-                if total_body_len == 0 {
-                    self.mmap = None;
-                } else {
+                // Защищённо достаём метаданные и мэпим ВЕСЬ файл от offset=0
+                let file_guard = ro.lock().map_err(|_| anyhow!("bloom ro handle poisoned"))?;
+                let flen = file_guard.metadata()?.len() as usize;
+
+                // Файл должен содержать заголовок + всё body
+                if flen >= self.hdr_size_usize.saturating_add(total_body_len) {
+                    // map whole file (offset=0) — безопасно для всех платформ
                     let mmap = unsafe {
                         MmapOptions::new()
-                            .offset(self.hdr_size_u64)
-                            .len(total_body_len)
-                            .map(&*file)
+                            .offset(0)
+                            .len(flen)
+                            .map(&*file_guard)
                             .map_err(|e| anyhow!("bloom mmap reload: {}", e))?
                     };
                     self.mmap = Some(mmap);
+                    self.body = None;
+                    return Ok(());
                 }
-                self.body = None;
-            } else {
-                self.body = Some(read_body_from_path(&self.path, self.hdr_size_u64, total_body_len)?);
-                self.mmap = None;
+                // Если файл короче ожидаемого — fallback на RAM‑чтение body
+                drop(file_guard);
             }
-        } else {
-            self.body = Some(read_body_from_path(&self.path, self.hdr_size_u64, total_body_len)?);
+            // Нет ro‑хэндла — fallback RAM
+            self.body = Some(read_body_from_path(
+                &self.path,
+                self.hdr_size_u64,
+                total_body_len,
+            )?);
             self.mmap = None;
+            return Ok(());
         }
+
+        // RAM режим: читаем только body.
+        self.body = Some(read_body_from_path(
+            &self.path,
+            self.hdr_size_u64,
+            total_body_len,
+        )?);
+        self.mmap = None;
         Ok(())
     }
 
     // Записать в заголовок last_lsn (v2) под открытым файловым хэндлом — общая логика
-    pub(crate) fn write_header_last_lsn_locked(&mut self, f: &mut File, last_lsn: u64) -> Result<()> {
+    pub(crate) fn write_header_last_lsn_locked(
+        &mut self,
+        f: &mut File,
+        last_lsn: u64,
+    ) -> Result<()> {
         if self.version != VERSION_V2 {
             return Ok(());
         }

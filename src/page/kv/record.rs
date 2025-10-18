@@ -1,9 +1,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 
-use crate::page::common::{
-    TRAILER_LEN, KV_HDR_MIN, KV_SLOT_SIZE, KV_EMPTY_OFF,
-};
-use super::header::{KvHeaderV3, kv_header_read_v3};
+use super::header::{kv_header_read_v3, KvHeaderV3};
+use crate::page::common::{KV_EMPTY_OFF, KV_HDR_MIN, KV_SLOT_SIZE, TRAILER_LEN};
 
 /// Прочитать запись данных по смещению `off` БЕЗ учёта верхней границы data‑area.
 /// Формат: [klen u16][vlen u32][expires_at_sec u32][vflags u8][key][value].
@@ -19,7 +17,12 @@ use super::header::{KvHeaderV3, kv_header_read_v3};
 pub fn kv_read_record_unchecked<'a>(
     page: &'a [u8],
     off: usize,
-) -> Option<(&'a [u8], &'a [u8], u32 /*expires_at_sec*/, u8 /*vflags*/)> {
+) -> Option<(
+    &'a [u8],
+    &'a [u8],
+    u32, /*expires_at_sec*/
+    u8,  /*vflags*/
+)> {
     // klen + vlen + expires + vflags занимают 2 + 4 + 4 + 1 = 11 байт
     if off + 11 > page.len() {
         return None;
@@ -47,10 +50,7 @@ pub fn kv_read_record_unchecked<'a>(
     note = "Use kv_find_record_by_key/kv_for_each_record/kv_for_each_record_with_off or kv_read_record_at_checked; \
 this function does not guard against slot-table bounds and may read beyond data area on packed pages."
 )]
-pub fn kv_read_record<'a>(
-    page: &'a [u8],
-    off: usize,
-) -> Option<(&'a [u8], &'a [u8], u32, u8)> {
+pub fn kv_read_record<'a>(page: &'a [u8], off: usize) -> Option<(&'a [u8], &'a [u8], u32, u8)> {
     kv_read_record_unchecked(page, off)
 }
 
@@ -116,7 +116,12 @@ pub fn kv_fp8(key: &[u8]) -> u8 {
 pub fn kv_find_record_by_key<'a>(
     page: &'a [u8],
     key: &[u8],
-) -> Option<(&'a [u8], &'a [u8], u32 /*expires_at_sec*/, u8 /*vflags*/)> {
+) -> Option<(
+    &'a [u8],
+    &'a [u8],
+    u32, /*expires_at_sec*/
+    u8,  /*vflags*/
+)> {
     let hdr = kv_header_read_v3(page).ok()?;
     let ps = page.len();
 

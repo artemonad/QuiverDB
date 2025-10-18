@@ -22,7 +22,11 @@ pub fn exec(path: PathBuf, page_size: u32, buckets: u32) -> Result<()> {
             Ok(_) => println!("DB already initialized at {}", path.display()),
             Err(_) => {
                 Directory::create(&path, buckets)?;
-                println!("Created directory with {} buckets at {}", buckets, path.display());
+                println!(
+                    "Created directory with {} buckets at {}",
+                    buckets,
+                    path.display()
+                );
             }
         }
         return Ok(());

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use QuiverDB::db::Db;
 use QuiverDB::db::compaction::{CompactBucketReport, CompactSummary};
+use QuiverDB::db::Db;
 
 /// CLI: compact
 /// - Если указан --bucket, компактуем один бакет.
@@ -10,8 +10,8 @@ use QuiverDB::db::compaction::{CompactBucketReport, CompactSummary};
 /// - --json управляет форматом вывода.
 pub fn exec(path: PathBuf, bucket: Option<u32>, json: bool) -> Result<()> {
     // Компактация — операция записи: нужен writer (эксклюзивный lock).
-    let mut db = Db::open(&path)
-        .with_context(|| format!("open writer DB at {}", path.display()))?;
+    let mut db =
+        Db::open(&path).with_context(|| format!("open writer DB at {}", path.display()))?;
 
     if let Some(b) = bucket {
         let rep = db

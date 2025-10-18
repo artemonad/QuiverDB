@@ -20,6 +20,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = 128)]
         buckets: u32,
     },
+
     /// Put key/value (value as string or from file)
     Put {
         #[arg(long)]
@@ -33,6 +34,7 @@ pub enum Cmd {
         #[arg(long)]
         value_file: Option<PathBuf>,
     },
+
     /// Get key
     Get {
         #[arg(long)]
@@ -43,6 +45,7 @@ pub enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+
     /// Quick existence check (Bloom fast‑path if fresh)
     Exists {
         #[arg(long)]
@@ -50,6 +53,7 @@ pub enum Cmd {
         #[arg(long)]
         key: String,
     },
+
     /// Delete key (tombstone write)
     Del {
         #[arg(long)]
@@ -57,6 +61,7 @@ pub enum Cmd {
         #[arg(long)]
         key: String,
     },
+
     /// Batch operations from JSON (single WAL batch commit)
     ///
     /// JSON формат (массив объектов):
@@ -76,6 +81,7 @@ pub enum Cmd {
         #[arg(long)]
         ops_json: Option<String>,
     },
+
     /// Scan with optional prefix. --json prints JSON array (or JSONL with --stream).
     Scan {
         #[arg(long)]
@@ -90,6 +96,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         stream: bool,
     },
+
     /// Print meta/dir/metrics summary
     ///
     /// Пример:
@@ -102,11 +109,13 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
     /// Sweep orphan OVERFLOW pages (writer-only)
     Sweep {
         #[arg(long)]
         path: PathBuf,
     },
+
     /// Doctor: scan all pages with CRC/IO checks (use --json for JSON)
     Doctor {
         #[arg(long)]
@@ -114,6 +123,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
     /// Truncate WAL to header (exclusive lock required)
     ///
     /// Примечания:
@@ -123,6 +133,7 @@ pub enum Cmd {
         #[arg(long)]
         path: PathBuf,
     },
+
     /// Compact chains: rebuild tail-wins pages without tombstones/expired.
     ///
     /// По умолчанию компактует всю БД. Можно указать один бакет:
@@ -138,6 +149,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
     /// Vacuum: compact all + sweep orphan OVERFLOW (writer-only)
     ///
     /// Выполняет перестройку цепочек и затем освобождает сиротские OVERFLOW страницы.
@@ -148,6 +160,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
     /// Bloom side-car maintenance: rebuild bloom.bin
     ///
     /// По умолчанию перестраивает все бакеты.
@@ -166,6 +179,7 @@ pub enum Cmd {
         #[arg(long)]
         k: Option<u32>,
     },
+
     /// TDE operations
     ///
     /// Пример:
@@ -179,6 +193,7 @@ pub enum Cmd {
         #[arg(long)]
         kid: String,
     },
+
     /// Auto maintenance: compact limited number of buckets and optional sweep orphan OVERFLOW.
     ///
     /// Примеры:
@@ -199,7 +214,6 @@ pub enum Cmd {
     },
 
     // -------------------- NEW: CDC commands --------------------
-
     /// CDC apply: применить поток WAL (file:// или tcp+psk://).
     ///
     /// Примеры:
@@ -219,10 +233,6 @@ pub enum Cmd {
     /// Примеры:
     ///   quiverdb cdc-ship --path ./db --to file://./wal-stream.bin
     ///   quiverdb cdc-ship --path ./db --to tcp+psk://127.0.0.1:9099 --since-lsn 12345
-    ///
-    /// ENV:
-    ///   P1_SHIP_SINCE_INCLUSIVE=1|true|yes|on — трактовать --since-lsn как >= (по умолчанию >)
-    ///   P1_CDC_PSK_HEX / P1_CDC_PSK_BASE64 / P1_CDC_PSK — PSK ключ для tcp+psk
     CdcShip {
         /// Путь к исходной БД (producer).
         #[arg(long)]
@@ -233,6 +243,86 @@ pub enum Cmd {
         /// Отправлять кадры с lsn > N (или >= N при ENV P1_SHIP_SINCE_INCLUSIVE=1)
         #[arg(long)]
         since_lsn: Option<u64>,
+    },
+
+    // -------------------- NEW: Snapshots (2.2) --------------------
+    /// Snapshot: create persisted snapshot (.snapstore/ + manifest)
+    ///
+    /// Пример:
+    ///   quiverdb snapshot-create --path ./db --message "baseline" --label prod --label v2
+    SnapshotCreate {
+        #[arg(long)]
+        path: PathBuf,
+        /// Optional message to store in manifest
+        #[arg(long)]
+        message: Option<String>,
+        /// Labels (repeatable): --label tag1 --label tag2
+        #[arg(long = "label")]
+        label: Vec<String>,
+        /// Optional parent snapshot id
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Snapshot: list manifests (ids)
+    ///
+    /// Пример:
+    ///   quiverdb snapshot-list --path ./db
+    ///   quiverdb snapshot-list --path ./db --json
+    SnapshotList {
+        #[arg(long)]
+        path: PathBuf,
+        /// JSON output (array of strings)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Snapshot: inspect manifest by id
+    ///
+    /// Пример:
+    ///   quiverdb snapshot-inspect --path ./db --id <snapshot_id>
+    ///   quiverdb snapshot-inspect --path ./db --id <id> --json
+    SnapshotInspect {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        id: String,
+        /// JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Snapshot: restore DB from persisted snapshot (SnapStore + manifest v2)
+    ///
+    /// Примеры:
+    ///   quiverdb snapshot-restore --path ./dst --id <snapshot_id>
+    ///   quiverdb snapshot-restore --path ./dst --src ./source_db --id <snapshot_id> --verify
+    SnapshotRestore {
+        /// Куда восстановить БД
+        #[arg(long)]
+        path: PathBuf,
+        /// Откуда брать SnapStore (.snapstore/{objects,manifests}). По умолчанию совпадает с --path.
+        #[arg(long)]
+        src: Option<PathBuf>,
+        /// Идентификатор снапшота
+        #[arg(long)]
+        id: String,
+        /// Включить проверку размеров страниц (равны page_size из манифеста)
+        #[arg(long, default_value_t = false)]
+        verify: bool,
+    },
+
+    /// NEW: Snapshot: delete persisted snapshot by id (dec-ref objects + remove manifest)
+    ///
+    /// Пример:
+    ///   quiverdb snapshot-delete --path ./db --id <snapshot_id>
+    SnapshotDelete {
+        /// Корень БД, где находится SnapStore (учитывает P1_SNAPSTORE_DIR).
+        #[arg(long)]
+        path: PathBuf,
+        /// Идентификатор снапшота, который нужно удалить.
+        #[arg(long)]
+        id: String,
     },
 }
 

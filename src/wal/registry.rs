@@ -5,13 +5,17 @@
 //!   коалесцируют fsync (group-commit).
 //! - Реестр мапит путь WAL-файла -> Arc<WalInner> c общим состоянием (flush/condvar).
 //!
+//! Новое:
+//! - stream_id (u64) — уникальный идентификатор потока WAL, записывается в header файла WAL (reserved).
+//!   Нужен для предотвращения смешивания разных источников на стороне apply.
+//!   Поведение:
+//!   * Если файл пуст/мал — генерируем stream_id и пишем header (P2WAL001 + stream_id).
+//!   * Если header есть и stream_id==0 (старый формат) — генерируем stream_id и переписываем header.
+//!   * Если header валидный и stream_id!=0 — используем его.
+//!
 //! Публичный API (для использования из writer.rs):
 //! - get_or_create_wal_inner(root) -> Arc<WalInner>
 //! - set_group_coalesce_ms(root, ms) — установить окно коалессации fsync.
-//!
-//! Примечание:
-//! - Здесь не реализуются сами операции записи рекордов (BEGIN/IMAGE/...).
-//!   Это остаётся в writer.rs, который оперирует WalInner::file/flush/cv.
 
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
@@ -21,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::{
-    wal_path, write_wal_file_header,
+    generate_stream_id, wal_header_read_stream_id, wal_path, write_wal_file_header_with_stream_id,
     WAL_HDR_SIZE, WAL_MAGIC,
 };
 
@@ -50,26 +54,52 @@ pub struct WalInner {
 
     // NEW: Сумма байт, записанных в WAL с момента последнего fsync (заголовки + payload).
     pub bytes_since_last_fsync: AtomicU64,
+
+    // NEW: Уникальный идентификатор WAL‑потока (записан в header).
+    pub stream_id: u64,
 }
 
 impl WalInner {
     fn new(mut file: std::fs::File) -> Result<Self> {
-        // Убедимся, что валидный заголовок присутствует
+        // Убедимся, что валидный заголовок присутствует и получить/установить stream_id.
         let len = file.metadata()?.len();
-        if len < WAL_HDR_SIZE as u64 {
-            write_wal_file_header(&mut file)?;
+
+        let stream_id = if len < WAL_HDR_SIZE as u64 {
+            // Новый/пустой файл → генерируем stream_id и пишем header
+            let sid = generate_stream_id();
+            write_wal_file_header_with_stream_id(&mut file, sid)?;
             file.sync_all().ok();
+            sid
         } else {
+            // Проверим magic и прочитаем stream_id
             let mut magic = [0u8; 8];
             file.seek(SeekFrom::Start(0))?;
             Read::read_exact(&mut file, &mut magic)?;
             if &magic != WAL_MAGIC {
+                // Повреждённая магия — перепишем файл и создадим новый stream_id
                 file.set_len(0)?;
-                write_wal_file_header(&mut file)?;
+                let sid = generate_stream_id();
+                write_wal_file_header_with_stream_id(&mut file, sid)?;
                 file.sync_all().ok();
+                sid
+            } else {
+                // Валидный header — прочитаем stream_id
+                let sid = wal_header_read_stream_id(&mut file)?;
+                if sid == 0 {
+                    // Старый header без stream_id — сгенерировать и переписать
+                    let new_sid = generate_stream_id();
+                    write_wal_file_header_with_stream_id(&mut file, new_sid)?;
+                    file.sync_all().ok();
+                    new_sid
+                } else {
+                    sid
+                }
             }
-        }
+        };
+
+        // Позиционируемся в конец файла для дальнейшей записи
         file.seek(SeekFrom::End(0))?;
+
         Ok(Self {
             file: Mutex::new(file),
             flush: Mutex::new(FlushState {
@@ -80,13 +110,19 @@ impl WalInner {
             cv: Condvar::new(),
             coalesce_ms: AtomicU64::new(0),
             pages_since_last_fsync: AtomicU64::new(0),
-            bytes_since_last_fsync: AtomicU64::new(0), // NEW
+            bytes_since_last_fsync: AtomicU64::new(0),
+            stream_id,
         })
     }
 
     /// Установить окно коалессации fsync в миллисекундах (0 — выключить коалессацию).
     pub fn set_coalesce_ms(&self, ms: u64) {
         self.coalesce_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Получить stream_id WAL.
+    pub fn get_stream_id(&self) -> u64 {
+        self.stream_id
     }
 }
 
@@ -96,7 +132,9 @@ struct WalRegistry {
 
 impl WalRegistry {
     fn new() -> Self {
-        Self { map: std::collections::HashMap::new() }
+        Self {
+            map: std::collections::HashMap::new(),
+        }
     }
 
     fn get_or_create(&mut self, path: PathBuf) -> Result<Arc<WalInner>> {
@@ -110,7 +148,7 @@ impl WalRegistry {
             .write(true)
             .open(&path)
             .with_context(|| format!("open wal {}", path.display()))?;
-        // Внутри WalInner::new проверим/запишем заголовок и позиционируемся в конец
+        // Внутри WalInner::new проверим/запишем заголовок, установим stream_id и позиционируемся в конец
         let inner = Arc::new(WalInner::new(f)?);
         self.map.insert(path, inner.clone());
         Ok(inner)

@@ -11,10 +11,12 @@
 //!
 //! В этом модуле (mod.rs) лежат:
 //! - публичные константы формата (импортируются снаружи как crate::wal::*),
-//! - общие утилиты (crc32c_of_parts, write_wal_file_header, wal_path),
+//! - общие утилиты (crc32c_of_parts, write_wal_file_header, wal_path, stream_id генерация/чтение),
 //! - re-export публичных типов/функций из подмодулей.
 
 use anyhow::Result;
+use byteorder::{ByteOrder, LittleEndian};
+use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -22,7 +24,10 @@ use std::path::{Path, PathBuf};
 
 pub const WAL_FILE: &str = "wal-000001.log";
 pub const WAL_MAGIC: &[u8; 8] = b"P2WAL001";
-pub const WAL_HDR_SIZE: usize = 16; // magic8 + reserved u32 + reserved u32
+pub const WAL_HDR_SIZE: usize = 16; // magic8 + reserved u64(stream_id)
+
+// Offsets внутри заголовка файла
+pub const WAL_HDR_OFF_STREAM_ID: usize = 8; // 8 байт после MAGIC (LE u64)
 
 // Record header (v2): 28 bytes (включая поле CRC на смещении 24..28)
 pub const WAL_REC_HDR_SIZE: usize = 28;
@@ -60,14 +65,51 @@ pub fn crc32c_of_parts(head_without_crc: &[u8], payload: &[u8]) -> u32 {
     crc32c::crc32c_append(c, payload)
 }
 
-/// Записать заголовок файла WAL (P2WAL001).
-/// Публично: используется CLI (cdc-ship) для инициализации sink-файла.
-pub fn write_wal_file_header(f: &mut std::fs::File) -> Result<()> {
+/// Генерировать случайный stream_id (u64, LE при записи в заголовок).
+/// Идempotent в рамках процесса — генерируйте и сохраняйте отдельно (см. wal/state.rs).
+pub fn generate_stream_id() -> u64 {
+    use rand::RngCore;
+    let mut buf = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    LittleEndian::read_u64(&buf)
+}
+
+/// Записать заголовок файла WAL (P2WAL001) с заданным stream_id.
+///
+/// Формат 16 байт:
+/// - [0..8)  = MAGIC "P2WAL001"
+/// - [8..16) = stream_id LE u64 (0 допускается как "не установлен", но нежелателен)
+pub fn write_wal_file_header_with_stream_id(f: &mut File, stream_id: u64) -> Result<()> {
     f.seek(SeekFrom::Start(0))?;
     f.write_all(WAL_MAGIC)?;
-    f.write_all(&[0u8; 4])?; // reserved
-    f.write_all(&[0u8; 4])?; // reserved
+    let mut sid = [0u8; 8];
+    LittleEndian::write_u64(&mut sid, stream_id);
+    f.write_all(&sid)?;
     Ok(())
+}
+
+/// Старый helper (совместимость): записать заголовок WAL без stream_id.
+/// Теперь потоково вызывает write_wal_file_header_with_stream_id(..., 0).
+/// В ближайших изменениях запись корректного stream_id будет обеспечена уровнем wal/registry.
+pub fn write_wal_file_header(f: &mut File) -> Result<()> {
+    write_wal_file_header_with_stream_id(f, 0)
+}
+
+/// Прочитать stream_id из заголовка WAL. Возвращает 0, если в файле нули.
+/// Ошибка при неправильной магии или слишком коротком файле.
+pub fn wal_header_read_stream_id(f: &mut File) -> Result<u64> {
+    if f.metadata()?.len() < WAL_HDR_SIZE as u64 {
+        anyhow::bail!("wal too small (< header)");
+    }
+    let mut hdr = [0u8; WAL_HDR_SIZE];
+    f.seek(SeekFrom::Start(0))?;
+    std::io::Read::read_exact(f, &mut hdr)?;
+    if &hdr[..8] != WAL_MAGIC {
+        anyhow::bail!("bad WAL magic");
+    }
+    Ok(LittleEndian::read_u64(
+        &hdr[WAL_HDR_OFF_STREAM_ID..WAL_HDR_OFF_STREAM_ID + 8],
+    ))
 }
 
 /// Построить путь к WAL-файлу для корня БД.
@@ -88,8 +130,8 @@ pub mod encode;
 pub mod reader;
 
 // Основные подсистемы WAL
-pub mod writer;
 pub mod replay;
+pub mod writer;
 
 // NEW: CDC transport helpers (framing + HMAC-PSK)
 pub mod net;
@@ -97,5 +139,5 @@ pub mod net;
 // NEW: персистентное состояние (last_heads_lsn и пр.)
 pub mod state;
 
-pub use writer::{Wal, WalGroupCfg};
 pub use replay::wal_replay_if_any;
+pub use writer::{Wal, WalGroupCfg};

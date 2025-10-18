@@ -4,22 +4,21 @@ use anyhow::{anyhow, Result};
 use byteorder::{ByteOrder, LittleEndian};
 
 use crate::page::common::{
-    PAGE_MAGIC, PAGE_VERSION_V3, PAGE_TYPE_OVERFLOW3, TRAILER_LEN,
-    OFF_MAGIC, OFF_VERSION, OFF_TYPE, OFF_PAGE_ID,
-    OVF_HDR_MIN,
-    OVF_OFF_CHUNK_LEN, OVF_OFF_RESERVED, OVF_OFF_NEXT_PID, OVF_OFF_LSN, OVF_OFF_CODEC_ID,
+    OFF_MAGIC, OFF_PAGE_ID, OFF_TYPE, OFF_VERSION, OVF_HDR_MIN, OVF_OFF_CHUNK_LEN,
+    OVF_OFF_CODEC_ID, OVF_OFF_LSN, OVF_OFF_NEXT_PID, OVF_OFF_RESERVED, PAGE_MAGIC,
+    PAGE_TYPE_OVERFLOW3, PAGE_VERSION_V3, TRAILER_LEN,
 };
 
 /// Заголовок OVERFLOW3 страницы (v3).
 #[derive(Debug, Clone)]
 pub struct OvfHeaderV3 {
-    pub version: u16,      // == 3
-    pub page_type: u16,    // == PAGE_TYPE_OVERFLOW3
+    pub version: u16,   // == 3
+    pub page_type: u16, // == PAGE_TYPE_OVERFLOW3
     pub page_id: u64,
-    pub chunk_len: u32,    // байт payload на этой странице (сжатая длина, если codec!=0)
+    pub chunk_len: u32, // байт payload на этой странице (сжатая длина, если codec!=0)
     pub next_page_id: u64, // u64::MAX — конец цепочки
     pub lsn: u64,
-    pub codec_id: u16,     // 0=none, 1=zstd, 2=lz4 (резерв)
+    pub codec_id: u16, // 0=none, 1=zstd, 2=lz4 (резерв)
 }
 
 /// Инициализировать пустую OVERFLOW3 страницу.
@@ -96,10 +95,19 @@ pub fn ovf_header_write_v3(page: &mut [u8], h: &OvfHeaderV3) -> Result<()> {
     LittleEndian::write_u16(&mut page[OFF_TYPE..OFF_TYPE + 2], h.page_type);
     LittleEndian::write_u64(&mut page[OFF_PAGE_ID..OFF_PAGE_ID + 8], h.page_id);
 
-    LittleEndian::write_u32(&mut page[OVF_OFF_CHUNK_LEN..OVF_OFF_CHUNK_LEN + 4], h.chunk_len);
+    LittleEndian::write_u32(
+        &mut page[OVF_OFF_CHUNK_LEN..OVF_OFF_CHUNK_LEN + 4],
+        h.chunk_len,
+    );
     LittleEndian::write_u32(&mut page[OVF_OFF_RESERVED..OVF_OFF_RESERVED + 4], 0); // всегда 0
-    LittleEndian::write_u64(&mut page[OVF_OFF_NEXT_PID..OVF_OFF_NEXT_PID + 8], h.next_page_id);
+    LittleEndian::write_u64(
+        &mut page[OVF_OFF_NEXT_PID..OVF_OFF_NEXT_PID + 8],
+        h.next_page_id,
+    );
     LittleEndian::write_u64(&mut page[OVF_OFF_LSN..OVF_OFF_LSN + 8], h.lsn);
-    LittleEndian::write_u16(&mut page[OVF_OFF_CODEC_ID..OVF_OFF_CODEC_ID + 2], h.codec_id);
+    LittleEndian::write_u16(
+        &mut page[OVF_OFF_CODEC_ID..OVF_OFF_CODEC_ID + 2],
+        h.codec_id,
+    );
     Ok(())
 }

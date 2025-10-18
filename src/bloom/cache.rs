@@ -283,7 +283,11 @@ pub fn bloom_cache_get(path: &Path, bucket: u32, last_lsn: u64) -> Option<Vec<u8
         return None;
     }
     let db_id = db_id_for_path(path);
-    let key = BloomCacheKey { db_id, bucket, last_lsn };
+    let key = BloomCacheKey {
+        db_id,
+        bucket,
+        last_lsn,
+    };
     cg.get(&key)
 }
 
@@ -295,7 +299,11 @@ pub fn bloom_cache_put(path: &Path, bucket: u32, last_lsn: u64, bits: Vec<u8>) {
             return;
         }
         let db_id = db_id_for_path(path);
-        let key = BloomCacheKey { db_id, bucket, last_lsn };
+        let key = BloomCacheKey {
+            db_id,
+            bucket,
+            last_lsn,
+        };
         cg.put(key, bits);
     }
 }

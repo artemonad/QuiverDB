@@ -3,8 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use rand::RngCore;
+use QuiverDB::crypto::{EnvKmsProvider, KeyJournal, KeyRing, KmsProvider};
 use QuiverDB::db::Db;
-use QuiverDB::crypto::{KeyRing, EnvKmsProvider, KmsProvider, KeyJournal};
 
 fn unique_root(prefix: &str) -> PathBuf {
     let pid = std::process::id();

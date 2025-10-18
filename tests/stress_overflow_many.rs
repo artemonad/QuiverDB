@@ -3,9 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use QuiverDB::db::Db;
-use QuiverDB::meta::{
-    init_meta_v4, HASH_KIND_XX64_SEED0, CODEC_NONE, CKSUM_CRC32C, CODEC_ZSTD,
-};
+use QuiverDB::meta::{init_meta_v4, CKSUM_CRC32C, CODEC_NONE, CODEC_ZSTD, HASH_KIND_XX64_SEED0};
 
 fn unique_root(prefix: &str) -> PathBuf {
     let pid = std::process::id();
@@ -28,7 +26,13 @@ fn stress_overflow_many_values() -> Result<()> {
     let buckets = 64;
 
     // init meta (без zstd)
-    init_meta_v4(&root, page_size, HASH_KIND_XX64_SEED0, CODEC_NONE, CKSUM_CRC32C)?;
+    init_meta_v4(
+        &root,
+        page_size,
+        HASH_KIND_XX64_SEED0,
+        CODEC_NONE,
+        CKSUM_CRC32C,
+    )?;
     QuiverDB::Directory::create(&root, buckets)?;
 
     let n_items = 512usize;
@@ -68,7 +72,13 @@ fn stress_overflow_many_values() -> Result<()> {
     // 3) Повтор для zstd (кодек по умолчанию = zstd)
     let root2 = unique_root("ovf-many-zstd");
     fs::create_dir_all(&root2)?;
-    init_meta_v4(&root2, page_size, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32C)?;
+    init_meta_v4(
+        &root2,
+        page_size,
+        HASH_KIND_XX64_SEED0,
+        CODEC_ZSTD,
+        CKSUM_CRC32C,
+    )?;
     QuiverDB::Directory::create(&root2, buckets)?;
 
     {

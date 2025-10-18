@@ -4,7 +4,7 @@ use rand::RngCore;
 use std::path::PathBuf;
 
 use QuiverDB::crypto::{EnvKeyProvider, KeyJournal, KeyProvider}; // <- добавлен KeyProvider
-use QuiverDB::crypto::{EnvKmsProvider, KmsProvider, KeyRing};
+use QuiverDB::crypto::{EnvKmsProvider, KeyRing, KmsProvider};
 use QuiverDB::db::Db;
 
 /// CLI: tde rotate — включить TDE и записать новую KID-эпоху.
@@ -30,7 +30,8 @@ use QuiverDB::db::Db;
 ///   P1_TDE_KID — KID для EnvKeyProvider (по умолчанию "default")
 pub fn exec_rotate(path: PathBuf, requested_kid: String) -> Result<()> {
     // Откроем writer
-    let mut db = Db::open(&path).with_context(|| format!("open writer DB at {}", path.display()))?;
+    let mut db =
+        Db::open(&path).with_context(|| format!("open writer DB at {}", path.display()))?;
 
     // with-KMS путь
     match EnvKmsProvider::from_env() {

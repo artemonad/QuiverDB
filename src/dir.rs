@@ -123,7 +123,10 @@ impl Directory {
 
         let path = Self::shard_path_static(root, 0);
         if path.exists() {
-            return Err(anyhow!("directory shard already exists at {}", path.display()));
+            return Err(anyhow!(
+                "directory shard already exists at {}",
+                path.display()
+            ));
         }
 
         let mut f = OpenOptions::new()

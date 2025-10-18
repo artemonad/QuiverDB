@@ -3,20 +3,15 @@ use byteorder::{ByteOrder, LittleEndian};
 use std::collections::HashMap;
 
 use crate::dir::NO_PAGE;
-use crate::page::{
-    kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3,
-    KV_HDR_MIN, TRAILER_LEN,
-};
 use crate::page::kv::kv_for_each_record; // packed-aware обход “новые → старые”
-use crate::page::kv_pack::{KvPagePacker, KvPackItem};
+use crate::page::kv_pack::{KvPackItem, KvPagePacker};
+use crate::page::{kv_header_read_v3, KV_HDR_MIN, PAGE_MAGIC, PAGE_TYPE_KV_RH3, TRAILER_LEN};
 use crate::util::now_secs;
 // Bloom side-car для delta-update после компактации
 use crate::bloom::BloomSidecar;
 // NEW: метрики компактации
 use crate::metrics::{
-    record_compaction_keys_selected,
-    record_compaction_keys_deleted,
-    record_compaction_pages_packed,
+    record_compaction_keys_deleted, record_compaction_keys_selected, record_compaction_pages_packed,
 };
 
 use super::core::Db;
@@ -50,7 +45,10 @@ impl Db {
     /// - После коммита выполняется Bloom delta‑update по валидным ключам и выставляется fresh last_lsn.
     /// - NEW: метрики компактации (выбранные/удалённые ключи и упакованные страницы).
     pub fn compact_bucket(&mut self, bucket: u32) -> Result<CompactBucketReport> {
-        let mut rep = CompactBucketReport { bucket, ..Default::default() };
+        let mut rep = CompactBucketReport {
+            bucket,
+            ..Default::default()
+        };
 
         let head = self.dir.head(bucket)?;
         if head == NO_PAGE {
@@ -178,7 +176,7 @@ impl Db {
                           pages_acc: &mut Vec<(u64, Vec<u8>)>,
                           cur_head: &mut u64,
                           db: &mut Db|
-                          -> Result<()> {
+         -> Result<()> {
             if packer.is_empty() {
                 return Ok(());
             }

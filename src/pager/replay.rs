@@ -3,12 +3,11 @@
 use anyhow::Result;
 use byteorder::{ByteOrder, LittleEndian};
 
-use crate::wal::wal_replay_if_any;
 use crate::page::{
-    PAGE_MAGIC, OFF_TYPE, KV_OFF_LSN, OVF_OFF_LSN,
-    PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3,
-    KV_HDR_MIN,
+    KV_HDR_MIN, KV_OFF_LSN, OFF_TYPE, OVF_OFF_LSN, PAGE_MAGIC, PAGE_TYPE_KV_RH3,
+    PAGE_TYPE_OVERFLOW3,
 };
+use crate::wal::wal_replay_if_any;
 
 use super::core::Pager;
 
@@ -79,8 +78,12 @@ fn v3_page_lsn(buf: &[u8]) -> Option<u64> {
     }
     let ptype = LittleEndian::read_u16(&buf[OFF_TYPE..OFF_TYPE + 2]);
     match ptype {
-        t if t == PAGE_TYPE_KV_RH3 => Some(LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8])),
-        t if t == PAGE_TYPE_OVERFLOW3 => Some(LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8])),
+        t if t == PAGE_TYPE_KV_RH3 => {
+            Some(LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8]))
+        }
+        t if t == PAGE_TYPE_OVERFLOW3 => {
+            Some(LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8]))
+        }
         _ => None,
     }
 }

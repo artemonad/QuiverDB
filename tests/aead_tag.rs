@@ -2,13 +2,18 @@ use anyhow::Result;
 use byteorder::{ByteOrder, LittleEndian};
 
 use QuiverDB::page::{
-    kv_init_v3, kv_header_read_v3, kv_header_write_v3,
-    page_update_trailer_aead_with, page_verify_trailer_aead_with,
-    KV_HDR_MIN, TRAILER_LEN,
+    kv_header_read_v3, kv_header_write_v3, kv_init_v3, page_update_trailer_aead_with,
+    page_verify_trailer_aead_with, KV_HDR_MIN, TRAILER_LEN,
 };
 
 /// Простой writer одной KV‑записи: [klen u16][vlen u32][expires u32][vflags u8][key][value].
-fn write_single_record_kv(page: &mut [u8], key: &[u8], value: &[u8], expires_at_sec: u32, vflags: u8) -> Result<()> {
+fn write_single_record_kv(
+    page: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    expires_at_sec: u32,
+    vflags: u8,
+) -> Result<()> {
     if page.len() < KV_HDR_MIN + TRAILER_LEN {
         anyhow::bail!("page too small for KV record");
     }

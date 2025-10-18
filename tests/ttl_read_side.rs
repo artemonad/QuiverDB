@@ -6,9 +6,11 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use QuiverDB::db::Db;
 use QuiverDB::dir::Directory;
-use QuiverDB::meta::{init_meta_v4, HASH_KIND_XX64_SEED0, CODEC_NONE, CKSUM_CRC32C};
+use QuiverDB::meta::{init_meta_v4, CKSUM_CRC32C, CODEC_NONE, HASH_KIND_XX64_SEED0};
+use QuiverDB::page::{
+    kv_header_read_v3, kv_header_write_v3, kv_init_v3, page_update_checksum, KV_HDR_MIN,
+};
 use QuiverDB::pager::Pager;
-use QuiverDB::page::{kv_init_v3, kv_header_read_v3, kv_header_write_v3, page_update_checksum, KV_HDR_MIN};
 
 #[test]
 fn ttl_read_side_skips_expired_and_returns_older_valid() -> Result<()> {
@@ -18,7 +20,13 @@ fn ttl_read_side_skips_expired_and_returns_older_valid() -> Result<()> {
     // meta v4 + dir v2
     let page_size = 64 * 1024;
     let buckets = 128;
-    init_meta_v4(&root, page_size, HASH_KIND_XX64_SEED0, CODEC_NONE, CKSUM_CRC32C)?;
+    init_meta_v4(
+        &root,
+        page_size,
+        HASH_KIND_XX64_SEED0,
+        CODEC_NONE,
+        CKSUM_CRC32C,
+    )?;
     Directory::create(&root, buckets)?;
 
     let mut pager = Pager::open(&root)?;
@@ -69,7 +77,13 @@ fn ttl_read_side_skips_expired_and_returns_older_valid() -> Result<()> {
     Ok(())
 }
 
-fn write_single_record_kv(page: &mut [u8], key: &[u8], value: &[u8], expires_at_sec: u32, vflags: u8) -> Result<()> {
+fn write_single_record_kv(
+    page: &mut [u8],
+    key: &[u8],
+    value: &[u8],
+    expires_at_sec: u32,
+    vflags: u8,
+) -> Result<()> {
     if page.len() < KV_HDR_MIN + 16 {
         anyhow::bail!("page too small for KV record");
     }

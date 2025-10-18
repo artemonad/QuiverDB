@@ -57,8 +57,8 @@ struct GlobalCache {
     // Был ли кэш явно сконфигурирован приложением (через API), а не через ENV
     configured: bool,
     // Счётчики (для метрик)
-    evictions_total: u64,       // только реальные вытеснения алгоритмом
-    invalidations_total: u64,   // явные инвалидации по записи
+    evictions_total: u64,     // только реальные вытеснения алгоритмом
+    invalidations_total: u64, // явные инвалидации по записи
 }
 
 impl GlobalCache {
@@ -146,13 +146,7 @@ impl GlobalCache {
         let mut buf = vec![0u8; src.len()];
         buf.copy_from_slice(src);
         self.q.push_back(key);
-        self.map.insert(
-            key,
-            CacheEntry {
-                buf,
-                refbit: true,
-            },
-        );
+        self.map.insert(key, CacheEntry { buf, refbit: true });
     }
 
     fn evict_one(&mut self) -> bool {

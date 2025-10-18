@@ -26,8 +26,8 @@ use std::slice;
 
 use libc::{c_char, c_int, c_uchar, c_uint, size_t};
 
-use anyhow::Result;
-use crate::Db; // re-export из lib.rs
+use crate::Db;
+use anyhow::Result; // re-export из lib.rs
 
 // ---------- Opaque handle ----------
 
@@ -61,7 +61,9 @@ unsafe fn cstr_to_path(c: *const c_char) -> Result<std::path::PathBuf, String> {
     if c.is_null() {
         return Err("null path".into());
     }
-    let s = CStr::from_ptr(c).to_str().map_err(|_| "path is not valid UTF-8")?;
+    let s = CStr::from_ptr(c)
+        .to_str()
+        .map_err(|_| "path is not valid UTF-8")?;
     Ok(std::path::PathBuf::from(s))
 }
 
@@ -88,9 +90,13 @@ unsafe fn set_err(out_err: *mut *mut c_char, msg: &str) {
 }
 
 #[inline]
-fn ret_ok() -> c_int { 0 }
+fn ret_ok() -> c_int {
+    0
+}
 #[inline]
-fn ret_err() -> c_int { -1 }
+fn ret_err() -> c_int {
+    -1
+}
 
 // ---------- API ----------
 
@@ -109,7 +115,10 @@ pub unsafe extern "C" fn qdb_init(
             }
             ret_ok()
         }
-        Err(e) => { set_err(out_err, &e); ret_err() }
+        Err(e) => {
+            set_err(out_err, &e);
+            ret_err()
+        }
     }
 }
 
@@ -127,10 +136,19 @@ pub unsafe extern "C" fn qdb_open_writer(
 
     match cstr_to_path(path) {
         Ok(p) => match Db::open(&p) {
-            Ok(db) => { *out_db = QdbDb::from_box(Box::new(db)); ret_ok() }
-            Err(e) => { set_err(out_err, &format!("{:#}", e)); ret_err() }
+            Ok(db) => {
+                *out_db = QdbDb::from_box(Box::new(db));
+                ret_ok()
+            }
+            Err(e) => {
+                set_err(out_err, &format!("{:#}", e));
+                ret_err()
+            }
         },
-        Err(e) => { set_err(out_err, &e); ret_err() }
+        Err(e) => {
+            set_err(out_err, &e);
+            ret_err()
+        }
     }
 }
 
@@ -148,10 +166,19 @@ pub unsafe extern "C" fn qdb_open_reader(
 
     match cstr_to_path(path) {
         Ok(p) => match Db::open_ro(&p) {
-            Ok(db) => { *out_db = QdbDb::from_box(Box::new(db)); ret_ok() }
-            Err(e) => { set_err(out_err, &format!("{:#}", e)); ret_err() }
+            Ok(db) => {
+                *out_db = QdbDb::from_box(Box::new(db));
+                ret_ok()
+            }
+            Err(e) => {
+                set_err(out_err, &format!("{:#}", e));
+                ret_err()
+            }
         },
-        Err(e) => { set_err(out_err, &e); ret_err() }
+        Err(e) => {
+            set_err(out_err, &e);
+            ret_err()
+        }
     }
 }
 
@@ -181,18 +208,32 @@ pub unsafe extern "C" fn qdb_put(
         set_err(out_err, "db is null");
         return ret_err();
     }
-    let db_ref = (&*db).as_mut_db().ok_or_else(|| "invalid db handle".to_string());
+    let db_ref = (&*db)
+        .as_mut_db()
+        .ok_or_else(|| "invalid db handle".to_string());
     let (key, val) = match (bytes_from(key_ptr, key_len), bytes_from(val_ptr, val_len)) {
         (Ok(k), Ok(v)) => (k, v),
-        (Err(e), _) => { set_err(out_err, &e); return ret_err(); }
-        (_, Err(e)) => { set_err(out_err, &e); return ret_err(); }
+        (Err(e), _) => {
+            set_err(out_err, &e);
+            return ret_err();
+        }
+        (_, Err(e)) => {
+            set_err(out_err, &e);
+            return ret_err();
+        }
     };
     match db_ref {
         Ok(d) => match d.put(key, val) {
             Ok(_) => ret_ok(),
-            Err(e) => { set_err(out_err, &format!("{:#}", e)); ret_err() }
+            Err(e) => {
+                set_err(out_err, &format!("{:#}", e));
+                ret_err()
+            }
         },
-        Err(e) => { set_err(out_err, &e); ret_err() }
+        Err(e) => {
+            set_err(out_err, &e);
+            ret_err()
+        }
     }
 }
 
@@ -214,17 +255,31 @@ pub unsafe extern "C" fn qdb_del(
     }
     *out_existed = 0;
 
-    let db_ref = (&*db).as_mut_db().ok_or_else(|| "invalid db handle".to_string());
+    let db_ref = (&*db)
+        .as_mut_db()
+        .ok_or_else(|| "invalid db handle".to_string());
     let key = match bytes_from(key_ptr, key_len) {
         Ok(k) => k,
-        Err(e) => { set_err(out_err, &e); return ret_err(); }
+        Err(e) => {
+            set_err(out_err, &e);
+            return ret_err();
+        }
     };
     match db_ref {
         Ok(d) => match d.del(key) {
-            Ok(ex) => { *out_existed = if ex { 1 } else { 0 }; ret_ok() }
-            Err(e) => { set_err(out_err, &format!("{:#}", e)); ret_err() }
+            Ok(ex) => {
+                *out_existed = if ex { 1 } else { 0 };
+                ret_ok()
+            }
+            Err(e) => {
+                set_err(out_err, &format!("{:#}", e));
+                ret_err()
+            }
         },
-        Err(e) => { set_err(out_err, &e); ret_err() }
+        Err(e) => {
+            set_err(out_err, &e);
+            ret_err()
+        }
     }
 }
 
@@ -246,17 +301,31 @@ pub unsafe extern "C" fn qdb_exists(
     }
     *out_present = 0;
 
-    let db_ref = (&*db).as_mut_db().ok_or_else(|| "invalid db handle".to_string());
+    let db_ref = (&*db)
+        .as_mut_db()
+        .ok_or_else(|| "invalid db handle".to_string());
     let key = match bytes_from(key_ptr, key_len) {
         Ok(k) => k,
-        Err(e) => { set_err(out_err, &e); return ret_err(); }
+        Err(e) => {
+            set_err(out_err, &e);
+            return ret_err();
+        }
     };
     match db_ref {
         Ok(d) => match d.exists(key) {
-            Ok(p) => { *out_present = if p { 1 } else { 0 }; ret_ok() }
-            Err(e) => { set_err(out_err, &format!("{:#}", e)); ret_err() }
+            Ok(p) => {
+                *out_present = if p { 1 } else { 0 };
+                ret_ok()
+            }
+            Err(e) => {
+                set_err(out_err, &format!("{:#}", e));
+                ret_err()
+            }
         },
-        Err(e) => { set_err(out_err, &e); ret_err() }
+        Err(e) => {
+            set_err(out_err, &e);
+            ret_err()
+        }
     }
 }
 
@@ -279,10 +348,15 @@ pub unsafe extern "C" fn qdb_get(
     (*out_buf).ptr = ptr::null_mut();
     (*out_buf).len = 0;
 
-    let db_ref = (&*db).as_mut_db().ok_or_else(|| "invalid db handle".to_string());
+    let db_ref = (&*db)
+        .as_mut_db()
+        .ok_or_else(|| "invalid db handle".to_string());
     let key = match bytes_from(key_ptr, key_len) {
         Ok(k) => k,
-        Err(e) => { set_err(out_err, &e); return ret_err(); }
+        Err(e) => {
+            set_err(out_err, &e);
+            return ret_err();
+        }
     };
 
     match db_ref {
@@ -309,9 +383,15 @@ pub unsafe extern "C" fn qdb_get(
                 (*out_buf).len = 0;
                 ret_ok()
             }
-            Err(e) => { set_err(out_err, &format!("{:#}", e)); ret_err() }
+            Err(e) => {
+                set_err(out_err, &format!("{:#}", e));
+                ret_err()
+            }
         },
-        Err(e) => { set_err(out_err, &e); ret_err() }
+        Err(e) => {
+            set_err(out_err, &e);
+            ret_err()
+        }
     }
 }
 

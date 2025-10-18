@@ -86,7 +86,10 @@ impl KeyRing {
         if ver != VERSION {
             return Err(anyhow!("unsupported keyring version {}", ver));
         }
-        Ok(Self { root: root.to_path_buf(), path })
+        Ok(Self {
+            root: root.to_path_buf(),
+            path,
+        })
     }
 
     /// Открыть или создать keyring с валидным заголовком.

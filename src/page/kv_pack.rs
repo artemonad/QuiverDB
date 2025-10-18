@@ -20,10 +20,10 @@
 use anyhow::{anyhow, Result};
 use byteorder::{ByteOrder, LittleEndian};
 
-use super::kv::{kv_init_v3, kv_header_read_v3, kv_header_write_v3};
+use super::kv::{kv_header_read_v3, kv_header_write_v3, kv_init_v3};
 // NEW: fingerprint ключа для слота
-use super::kv::record::kv_fp8;
 use super::common::{KV_HDR_MIN, KV_SLOT_SIZE, TRAILER_LEN};
+use super::kv::record::kv_fp8;
 
 /// Одна KV запись для упаковки.
 #[derive(Debug, Clone)]
@@ -95,7 +95,12 @@ impl KvPagePacker {
 
     /// Собрать готовую страницу KV_RH3 (v3) и очистить пакер.
     /// - Не потребляет self: после генерации страницы пакер очищается (items.clear/data_bytes=0).
-    pub fn finalize_into_page(&mut self, page_id: u64, next_page_id: u64, codec_id: u16) -> Result<Vec<u8>> {
+    pub fn finalize_into_page(
+        &mut self,
+        page_id: u64,
+        next_page_id: u64,
+        codec_id: u16,
+    ) -> Result<Vec<u8>> {
         if self.items.is_empty() {
             return Err(anyhow!("KvPagePacker::finalize_into_page: no items"));
         }

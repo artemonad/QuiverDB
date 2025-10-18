@@ -3,6 +3,52 @@
 All notable changes to this project are documented in this file.  
 Dates use ISO format (YYYY-MM-DD).
 
+## [2.2.0] – 2025-10-18
+
+Added
+- SnapStore dir override (P1_SNAPSTORE_DIR)
+  - SnapStore may live outside DB root. Absolute path is used as-is; relative is resolved against DB root.
+  - Manifests now stored in <snapstore_dir>/manifests (manifest.rs uses the same resolver).
+- Snapshot delete
+  - API: SnapshotManager::delete_persisted(root, id)
+  - CLI: quiverdb snapshot-delete --path <db_root> --id <snapshot_id>
+  - Behavior: dec-ref all referenced objects (objects removed when refcount reaches 0), then remove manifest.
+
+Changed/Improved
+- CDC (apply)
+  - PSK streams now require HELLO (WAL header + stream_id) by default; fallback without HELLO only with P1_CDC_ALLOW_NO_HELLO=1 (warn).
+  - Strict monotonic seq: P1_CDC_SEQ_STRICT=1 → seq regression is an error (non-strict: warn+skip).
+  - HEADS_UPDATE payload validation: invalid len (len%12!=0) → error with P1_CDC_HEADS_STRICT=1, otherwise warn+skip.
+  - PSK stream source anti-mix unified with file path via verify_and_store_stream_id.
+- Status JSON
+  - JSON branch rewritten with serde_json::json! (no manual string concatenation/escaping).
+- WAL PSK/TLS diagnostics
+  - More context in error messages for framing/mac/CA/PFX/SNI parsing.
+- Build/tooling
+  - Added recursion limit attribute in bin/quiverdb to support deep json! trees in status output.
+
+Removed
+- Unused dependency crc32fast (CRC32C already handled by crc32c crate).
+
+Fixed/Cleanups
+- Tests: cleaned unused imports/vars in CDC stream-id tests.
+- Dead code: removed unused Db::read_overflow_chain helper.
+- Minor warnings suppressed/cleaned across codebase.
+
+Compatibility
+- On-disk and wire formats unchanged:
+  - Meta v4, Page v3 (KV_RH3/OVERFLOW3), Directory v2, WAL v2.
+
+Upgrade notes
+- No migrations required.
+- New env toggles:
+  - P1_SNAPSTORE_DIR — SnapStore location (absolute or relative to DB root).
+  - P1_CDC_SEQ_STRICT — strict seq monotonicity.
+  - P1_CDC_HEADS_STRICT — strict HEADS_UPDATE payload validation.
+  - P1_CDC_ALLOW_NO_HELLO — allow PSK apply without initial HELLO (not recommended; dev only).
+
+---
+
 ## [2.1.0] – 2025-10-16
 
 Security
@@ -75,6 +121,9 @@ Upgrade notes
 - No data migrations required.
 - If using TDE, verify epoch journal is present for epoch‑aware fallback.
 - Consider setting P1_SEG_WRITE_BUF_MB and P1_PREALLOC_PAGES for heavy batch workloads; enable P1_PAGE_CACHE_OVF to speed up big_get.
+
+---
+
 ## [2.0.0] – 2025-10-13
 
 2.0 (GA). New on‑disk/wire formats, streamlined write/read path, and production‑ready compaction.
@@ -141,15 +190,6 @@ Upgrade notes
   - P1_READ_BEYOND_ALLOC_STRICT=1  (forbid reads past logical allocation)
   - P1_ZERO_CHECKSUM_STRICT=1      (forbid zero CRC trailers in CRC mode)
   - P1_TDE_STRICT=1                (forbid CRC fallback when AEAD tag fails)
-
-Docs
-- docs/format.md: v3 pages (KV_RH3/OVERFLOW3), v4 meta, v2 directory, v2 WAL (HEADS_UPDATE=6).
-- docs/api.md: batch, scans, TTL/tombstone semantics; compaction (single‑scan + packing).
-- docs/cdc.md: P2WAL001 with HEADS_UPDATE and LSN gating.
-
-Perf highlights
-- Small KV compaction now packs multiple records per page → shorter chains, fewer page reads.
-- get(not‑found) is faster when Bloom is fresh; consider regular bloom rebuilds or delta‑updates after heavy maintenance.
 
 ---
 

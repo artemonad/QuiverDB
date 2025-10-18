@@ -16,6 +16,7 @@
 //! - NEW: Lazy compaction — срабатывания и переписанные страницы
 //! - NEW: WAL threshold flush — счётчики пороговых fsync вне явного батча
 //! - NEW: Compaction totals — итоговые счётчики выбранных/удалённых ключей и упакованных страниц
+//! - NEW: Value cache (OVERFLOW) — live‑статистика и счётчики попаданий/промахов
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -169,6 +170,13 @@ pub struct MetricsSnapshot {
     pub compaction_keys_selected: u64,
     pub compaction_keys_deleted: u64,
     pub compaction_pages_packed: u64,
+
+    // NEW: Value cache (OVERFLOW) — live‑статистика кэша
+    pub value_cache_cap_bytes: u64,
+    pub value_cache_used_bytes: u64,
+    pub value_cache_entries: u64,
+    pub value_cache_hits: u64,
+    pub value_cache_misses: u64,
 }
 
 impl MetricsSnapshot {
@@ -224,7 +232,6 @@ pub fn record_wal_truncation() {
 
 // NEW: gauges — обновляются на каждом кадре и после fsync
 pub fn record_wal_pending_lsn(lsn: u64) {
-    // max(old, lsn)
     let mut cur = WAL_PENDING_MAX_LSN.load(Ordering::Relaxed);
     while lsn > cur {
         match WAL_PENDING_MAX_LSN.compare_exchange_weak(
@@ -240,15 +247,10 @@ pub fn record_wal_pending_lsn(lsn: u64) {
 }
 
 pub fn record_wal_flushed_lsn(lsn: u64) {
-    // max(old, lsn) — на случай нестрогого порядка
     let mut cur = WAL_FLUSHED_LSN.load(Ordering::Relaxed);
     while lsn > cur {
-        match WAL_FLUSHED_LSN.compare_exchange_weak(
-            cur,
-            lsn,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match WAL_FLUSHED_LSN.compare_exchange_weak(cur, lsn, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(v) => cur = v,
         }
@@ -303,7 +305,9 @@ pub fn record_snapshot_begin() {
 
 pub fn record_snapshot_end() {
     SNAPSHOTS_ACTIVE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)))
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        })
         .ok();
 }
 
@@ -379,6 +383,10 @@ pub fn record_compaction_pages_packed(n: u64) {
 
 // ----- Snapshot / Reset -----
 pub fn snapshot() -> MetricsSnapshot {
+    // live‑показатели из внешних модулей
+    let (vc_cap, vc_used, vc_entries) = crate::pager::value_cache::value_cache_stats();
+    let (vc_hits, vc_misses) = crate::pager::value_cache::value_cache_counters();
+
     MetricsSnapshot {
         wal_appends_total: WAL_APPENDS_TOTAL.load(Ordering::Relaxed),
         wal_bytes_written: WAL_BYTES_WRITTEN.load(Ordering::Relaxed),
@@ -446,6 +454,13 @@ pub fn snapshot() -> MetricsSnapshot {
         compaction_keys_selected: COMPACTION_KEYS_SELECTED.load(Ordering::Relaxed),
         compaction_keys_deleted: COMPACTION_KEYS_DELETED.load(Ordering::Relaxed),
         compaction_pages_packed: COMPACTION_PAGES_PACKED.load(Ordering::Relaxed),
+
+        // NEW: value cache live fields (берём из модуля кэша)
+        value_cache_cap_bytes: vc_cap as u64,
+        value_cache_used_bytes: vc_used as u64,
+        value_cache_entries: vc_entries as u64,
+        value_cache_hits: vc_hits,
+        value_cache_misses: vc_misses,
     }
 }
 
@@ -513,4 +528,7 @@ pub fn reset() {
     COMPACTION_KEYS_SELECTED.store(0, Ordering::Relaxed);
     COMPACTION_KEYS_DELETED.store(0, Ordering::Relaxed);
     COMPACTION_PAGES_PACKED.store(0, Ordering::Relaxed);
+
+    // Примечание: value cache counters/stats живут в модуле кэша; reset их не трогает.
+    // Это согласуется с поведением Bloom cache (live‑значения).
 }

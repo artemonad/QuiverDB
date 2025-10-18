@@ -1,7 +1,7 @@
 //! wal/net — защищённый CDC транспорт (фрейминг + HMAC‑PSK) и TLS‑клиент.
 //!
 //! Назначение:
-//! - PSK‑фрейминг: HMAC‑SHA256 поверх payload + seq для целостности/аутентичности.
+//! - PSK‑фрейминг: HMAC‑SHA256 поверх MAGIC||seq||len||payload для целостности/аутентичности.
 //! - TLS/mTLS клиент (native-tls): защищённый транспорт поверх TCP, совместимый с PSK‑фреймингом.
 //!
 //! Формат фрейма (LE):
@@ -9,7 +9,7 @@
 //!
 //! ENV (PSK):
 //!   P1_CDC_PSK_HEX / P1_CDC_PSK_BASE64 / P1_CDC_PSK
-//!   — добавлено: минимальная длина PSK = 16 байт
+//!   — минимальная длина PSK = 16 байт
 //!
 //! ENV (TLS):
 //!   P1_TLS_DOMAIN               — переопределить SNI/hostname (по умолчанию host из "host:port")
@@ -17,7 +17,7 @@
 //!   P1_TLS_CLIENT_PFX          — путь к PFX/PKCS#12 (mTLS; опц.)
 //!   P1_TLS_CLIENT_PFX_PASSWORD — пароль к PFX (mTLS; опц.)
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use byteorder::{ByteOrder, LittleEndian};
 use hmac::{Hmac, Mac};
@@ -35,20 +35,22 @@ const HDR_LEN: usize = 4 + 8 + 32; // len u32 + seq u64 + mac[32]
 pub fn load_psk_from_env() -> Result<Vec<u8>> {
     // HEX имеет приоритет, затем BASE64, затем raw
     if let Ok(hex) = std::env::var("P1_CDC_PSK_HEX") {
-        let bytes = decode_hex(hex.trim())?;
-        validate_psk_len(&bytes)?;
+        let s = hex.trim();
+        let bytes = decode_hex(s).map_err(|e| anyhow!("P1_CDC_PSK_HEX decode: {}", e))?;
+        validate_psk_len(&bytes).context("P1_CDC_PSK_HEX too short (<16)")?;
         return Ok(bytes);
     }
     if let Ok(b64) = std::env::var("P1_CDC_PSK_BASE64") {
+        let s = b64.trim();
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim().as_bytes())
+            .decode(s.as_bytes())
             .map_err(|e| anyhow!("P1_CDC_PSK_BASE64 decode: {}", e))?;
-        validate_psk_len(&bytes)?;
+        validate_psk_len(&bytes).context("P1_CDC_PSK_BASE64 too short (<16)")?;
         return Ok(bytes);
     }
     if let Ok(raw) = std::env::var("P1_CDC_PSK") {
-        let bytes = raw.into_bytes();
-        validate_psk_len(&bytes)?;
+        let bytes = raw.trim().as_bytes().to_vec();
+        validate_psk_len(&bytes).context("P1_CDC_PSK too short (<16)")?;
         return Ok(bytes);
     }
     Err(anyhow!(
@@ -71,18 +73,28 @@ fn validate_psk_len(psk: &[u8]) -> Result<()> {
 
 pub fn write_framed_psk<W: Write>(w: &mut W, seq: u64, payload: &[u8], psk: &[u8]) -> Result<()> {
     if payload.len() > u32::MAX as usize {
-        return Err(anyhow!("payload too large: {}", payload.len()));
+        return Err(anyhow!(
+            "payload too large for PSK frame: {} bytes (max {})",
+            payload.len(),
+            u32::MAX
+        ));
     }
+    let len_u32 = payload.len() as u32;
+
     let mut hdr = vec![0u8; HDR_LEN];
-    LittleEndian::write_u32(&mut hdr[0..4], payload.len() as u32);
+    LittleEndian::write_u32(&mut hdr[0..4], len_u32);
     LittleEndian::write_u64(&mut hdr[4..12], seq);
 
-    let mac = compute_mac(psk, seq, payload)?;
+    // MAC = HMAC(MAGIC || seq_le || len_le || payload)
+    let mac = compute_mac(psk, seq, len_u32, payload)
+        .with_context(|| format!("compute HMAC for seq={}, len={}", seq, len_u32))?;
     hdr[12..12 + 32].copy_from_slice(&mac);
 
-    w.write_all(&hdr)?;
+    w.write_all(&hdr)
+        .with_context(|| "write PSK frame header")?;
     if !payload.is_empty() {
-        w.write_all(payload)?;
+        w.write_all(payload)
+            .with_context(|| format!("write PSK frame payload ({} bytes)", payload.len()))?;
     }
     Ok(())
 }
@@ -96,13 +108,17 @@ pub fn read_next_framed_psk<R: Read>(
     match read_exact_or_eof(r, &mut hdr) {
         Ok(true) => {}
         Ok(false) => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.context("read PSK frame header")),
     }
 
     let len = LittleEndian::read_u32(&hdr[0..4]) as usize;
     let seq = LittleEndian::read_u64(&hdr[4..12]);
     if len > max_len {
-        return Err(anyhow!("framed payload too large: {} (max {})", len, max_len));
+        return Err(anyhow!(
+            "framed payload too large: {} (max_len={})",
+            len,
+            max_len
+        ));
     }
     let mac_stored = &hdr[12..12 + 32];
 
@@ -110,26 +126,38 @@ pub fn read_next_framed_psk<R: Read>(
     if len > 0 {
         match read_exact_or_eof(r, &mut payload) {
             Ok(true) => {}
-            Ok(false) => return Ok(None),
-            Err(e) => return Err(e),
+            Ok(false) => return Ok(None), // частичный хвост — трактуем как EOF
+            Err(e) => {
+                return Err(e.context(format!("read PSK frame payload (seq={}, len={})", seq, len)))
+            }
         }
     }
 
-    let mac_calc = compute_mac(psk, seq, &payload)?;
+    // MAC = HMAC(MAGIC || seq_le || len_le || payload)
+    let mac_calc = compute_mac(psk, seq, len as u32, &payload)
+        .with_context(|| format!("compute HMAC for incoming frame (seq={}, len={})", seq, len))?;
     if !constant_time_eq(mac_stored, &mac_calc) {
-        return Err(anyhow!("CDC PSK MAC verify failed (seq={})", seq));
+        return Err(anyhow!(
+            "CDC PSK MAC verify failed (seq={}, len={})",
+            seq,
+            len
+        ));
     }
 
     Ok(Some((seq, payload)))
 }
 
-fn compute_mac(psk: &[u8], seq: u64, payload: &[u8]) -> Result<[u8; 32]> {
+fn compute_mac(psk: &[u8], seq: u64, len_u32: u32, payload: &[u8]) -> Result<[u8; 32]> {
     let mut mac = HmacSha256::new_from_slice(psk).map_err(|e| anyhow!("psk: {}", e))?;
     mac.update(MAGIC);
 
     let mut seq_le = [0u8; 8];
     LittleEndian::write_u64(&mut seq_le, seq);
     mac.update(&seq_le);
+
+    let mut len_le = [0u8; 4];
+    LittleEndian::write_u32(&mut len_le, len_u32);
+    mac.update(&len_le);
 
     mac.update(payload);
     let tag = mac.finalize().into_bytes();
@@ -154,6 +182,9 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool> {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty hex string"));
+    }
     if s.len() % 2 != 0 {
         return Err(anyhow!("hex string must have even length"));
     }
@@ -185,7 +216,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ----------------------------- TLS client (native-tls) -----------------------------
 
-use native_tls::{TlsConnector, Certificate as NtCertificate, Identity as NtIdentity, TlsStream};
+use native_tls::{Certificate as NtCertificate, Identity as NtIdentity, TlsConnector, TlsStream};
 
 /// Поток ввода/вывода: TCP или TLS.
 pub enum IoStream {
@@ -221,17 +252,19 @@ impl Write for IoStream {
 /// - Если заданы P1_TLS_CLIENT_PFX/P1_TLS_CLIENT_PFX_PASSWORD — включаем mTLS (PKCS#12).
 /// - SNI берём из P1_TLS_DOMAIN или host из addr.
 pub fn open_tls_psk_stream(addr: &str) -> Result<IoStream> {
-    let domain = tls_domain_for_addr(addr)?;
+    let domain =
+        tls_domain_for_addr(addr).with_context(|| format!("derive SNI from addr '{}'", addr))?;
     let tcp = TcpStream::connect(addr).map_err(|e| anyhow!("connect({}): {}", addr, e))?;
 
     let mut builder = TlsConnector::builder();
 
     // Кастомные CA (PEM). Поддерживаем "CERTIFICATE" и "TRUSTED CERTIFICATE".
     if let Ok(ca_path) = std::env::var("P1_TLS_CA_FILE") {
-        let ca_pem = std::fs::read(&ca_path)
-            .map_err(|e| anyhow!("read CA file {}: {}", ca_path, e))?;
+        let ca_pem =
+            std::fs::read(&ca_path).map_err(|e| anyhow!("read CA file {}: {}", ca_path, e))?;
 
-        let certs_der = parse_pem_certs(&ca_pem)?;
+        let certs_der =
+            parse_pem_certs(&ca_pem).with_context(|| format!("parse PEM CA file {}", ca_path))?;
         if certs_der.is_empty() {
             return Err(anyhow!(
                 "no certificates found in CA file {} (expect BEGIN CERTIFICATE blocks)",
@@ -250,15 +283,16 @@ pub fn open_tls_psk_stream(addr: &str) -> Result<IoStream> {
         std::env::var("P1_TLS_CLIENT_PFX"),
         std::env::var("P1_TLS_CLIENT_PFX_PASSWORD"),
     ) {
-        let pfx_der = std::fs::read(&pfx_path)
-            .map_err(|e| anyhow!("read PFX {}: {}", pfx_path, e))?;
+        let pfx_der =
+            std::fs::read(&pfx_path).map_err(|e| anyhow!("read PFX {}: {}", pfx_path, e))?;
         let id = NtIdentity::from_pkcs12(&pfx_der, &pfx_pwd)
             .map_err(|e| anyhow!("load PFX {}: {}", pfx_path, e))?;
         builder.identity(id);
     }
 
     let connector = builder.build().map_err(|e| anyhow!("tls build: {}", e))?;
-    let tls = connector.connect(&domain, tcp)
+    let tls = connector
+        .connect(&domain, tcp)
         .map_err(|e| anyhow!("tls connect (SNI={}): {}", domain, e))?;
     Ok(IoStream::Tls(tls))
 }
@@ -274,7 +308,9 @@ fn parse_pem_certs(pem_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     fn extract_all(s: &str, begin_tag: &str, end_tag: &str, out: &mut Vec<Vec<u8>>) -> Result<()> {
         let mut search_from = 0usize;
         loop {
-            let Some(beg) = s[search_from..].find(begin_tag) else { break; };
+            let Some(beg) = s[search_from..].find(begin_tag) else {
+                break;
+            };
             let start = search_from + beg + begin_tag.len();
             let Some(end_rel) = s[start..].find(end_tag) else {
                 return Err(anyhow!("PEM block '{}' has no matching END", begin_tag));
@@ -285,6 +321,9 @@ fn parse_pem_certs(pem_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
                 .chars()
                 .filter(|c| !c.is_whitespace())
                 .collect::<String>();
+            if body.is_empty() {
+                return Err(anyhow!("empty PEM body for block '{}'", begin_tag));
+            }
             let der = base64::engine::general_purpose::STANDARD
                 .decode(body.as_bytes())
                 .map_err(|e| anyhow!("PEM base64 decode: {}", e))?;
@@ -313,8 +352,9 @@ fn parse_pem_certs(pem_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 /// Парсер host/SNI из "host:port" и "[ipv6]:port".
 fn tls_domain_for_addr(addr: &str) -> Result<String> {
     if let Ok(sni) = std::env::var("P1_TLS_DOMAIN") {
-        if !sni.trim().is_empty() {
-            return Ok(sni.trim().to_string());
+        let s = sni.trim();
+        if !s.is_empty() {
+            return Ok(s.to_string());
         }
     }
     if addr.starts_with('[') {
@@ -324,7 +364,11 @@ fn tls_domain_for_addr(addr: &str) -> Result<String> {
         return Err(anyhow!("invalid IPv6 literal in addr: {}", addr));
     }
     if let Some(idx) = addr.rfind(':') {
-        return Ok(addr[..idx].to_string());
+        let host = &addr[..idx];
+        if host.is_empty() {
+            return Err(anyhow!("empty host in addr '{}'", addr));
+        }
+        return Ok(host.to_string());
     }
     Ok(addr.to_string())
 }

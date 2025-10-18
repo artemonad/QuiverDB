@@ -3,13 +3,12 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use QuiverDB::wal::{
-    write_wal_file_header,
-    WAL_HDR_SIZE, WAL_MAGIC,
-    WAL_REC_BEGIN, WAL_REC_TRUNCATE,
-};
 use QuiverDB::wal::encode::write_record;
-use QuiverDB::wal::reader::read_next_record;
+use QuiverDB::wal::{
+    write_wal_file_header, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_BEGIN, WAL_REC_TRUNCATE,
+};
+// NEW: stateful reader вместо deprecated read_next_record
+use QuiverDB::wal::reader::WalStreamReader;
 
 fn unique_file(prefix: &str) -> PathBuf {
     let pid = std::process::id();
@@ -54,14 +53,22 @@ fn wal_reader_skips_midstream_header_after_truncate() -> Result<()> {
     let mut pos = WAL_HDR_SIZE as u64;
     let mut seen_types: Vec<u8> = Vec::new();
     let mut seen_lsns: Vec<u64> = Vec::new();
-    while let Some((rec, next)) = read_next_record(&mut f, pos, len)? {
+
+    // NEW: stateful reader
+    let mut r = WalStreamReader::new();
+
+    while let Some((rec, next)) = r.read_next(&mut f, pos, len)? {
         seen_types.push(rec.rec_type);
         seen_lsns.push(rec.lsn);
         pos = next;
     }
 
     // Ожидаем три записи и корректные LSN у BEGIN кадров
-    assert_eq!(seen_types.len(), 3, "should see 3 records (BEGIN, TRUNCATE, BEGIN)");
+    assert_eq!(
+        seen_types.len(),
+        3,
+        "should see 3 records (BEGIN, TRUNCATE, BEGIN)"
+    );
     assert_eq!(seen_types[0], WAL_REC_BEGIN);
     assert_eq!(seen_types[1], WAL_REC_TRUNCATE);
     assert_eq!(seen_types[2], WAL_REC_BEGIN);
@@ -103,13 +110,16 @@ fn wal_reader_mid_header_without_truncate_errors() -> Result<()> {
     let len = fs::metadata(&path)?.len();
 
     let mut pos = WAL_HDR_SIZE as u64;
-    let (_rec1, next1) = read_next_record(&mut f, pos, len)?
+    let mut r = WalStreamReader::new();
+
+    let (_rec1, next1) = r
+        .read_next(&mut f, pos, len)?
         .expect("must read first record (BEGIN #1)");
     pos = next1;
 
     // Следующая позиция — как раз mid-header, но без флага TRUNCATE ранее
     // Ожидаем ошибку CRC (reader не должен "проглатывать" заголовок).
-    let err = read_next_record(&mut f, pos, len).unwrap_err();
+    let err = r.read_next(&mut f, pos, len).unwrap_err();
     let msg = format!("{:#}", err).to_ascii_lowercase();
     assert!(
         msg.contains("crc mismatch") || msg.contains("wal crc mismatch"),

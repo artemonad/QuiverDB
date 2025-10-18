@@ -1,17 +1,22 @@
-use anyhow::{Result};
+use anyhow::Result;
 use std::path::PathBuf;
 
 use QuiverDB::db::Db;
 use QuiverDB::dir::Directory;
 use QuiverDB::meta::read_meta;
 // Bloom side-car status + cache counters (через реэкспорт)
-use QuiverDB::bloom::{BloomSidecar, bloom_cache_stats, bloom_cache_counters};
+use QuiverDB::bloom::{bloom_cache_counters, bloom_cache_stats, BloomSidecar};
 // Page cache diagnostics
-use QuiverDB::pager::cache::{page_cache_len, page_cache_evictions_total, page_cache_invalidations_total};
+use QuiverDB::pager::cache::{
+    page_cache_evictions_total, page_cache_invalidations_total, page_cache_len,
+};
 // metrics snapshot
 use QuiverDB::metrics;
 // Key journal (TDE epochs)
 use QuiverDB::crypto::KeyJournal;
+
+// serde_json для безопасного JSON-вывода
+use serde_json::json;
 
 /// New: JSON-aware status (when json=true prints one JSON object).
 pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
@@ -84,158 +89,112 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
         let pc_ev = page_cache_evictions_total();
         let pc_inv = page_cache_invalidations_total();
 
-        print!("{{");
-        // meta
-        print!("\"meta\":{{");
-        print!("\"version\":{},", m.version);
-        print!("\"page_size\":{},", m.page_size);
-        print!("\"flags\":{},", m.flags);
-        print!("\"hash_kind\":{},", m.hash_kind);
-        print!("\"checksum_kind\":{},", m.checksum_kind);
-        print!("\"codec_default\":{},", m.codec_default);
-        print!("\"next_page_id\":{},", m.next_page_id);
-        print!("\"last_lsn\":{},", m.last_lsn);
-        print!("\"clean_shutdown\":{}", m.clean_shutdown);
-        print!("}},"); // meta
+        // Сформируем JSON объект
+        let tde_epochs_json = tde_epochs
+            .iter()
+            .map(|(since, kid)| json!({"since_lsn": since, "kid": kid}))
+            .collect::<Vec<_>>();
 
-        // tde
-        print!("\"tde\":{{");
-        print!("\"enabled\":{}", tde_enabled);
-        print!(",\"mode\":\"{}\"", tde_mode);
-        print!(",\"key_loaded\":{}", tde_key_loaded);
-        print!(",\"kid\":");
-        match tde_kid {
-            Some(ref s) => print!("\"{}\"", escape_json(s)),
-            None => print!("null"),
-        }
-        // epochs JSON
-        print!(",\"epochs\":[");
-        for (i, (since, kid)) in tde_epochs.iter().enumerate() {
-            if i > 0 {
-                print!(",");
+        let status = json!({
+            "meta": {
+                "version": m.version,
+                "page_size": m.page_size,
+                "flags": m.flags,
+                "hash_kind": m.hash_kind,
+                "checksum_kind": m.checksum_kind,
+                "codec_default": m.codec_default,
+                "next_page_id": m.next_page_id,
+                "last_lsn": m.last_lsn,
+                "clean_shutdown": m.clean_shutdown
+            },
+            "tde": {
+                "enabled": tde_enabled,
+                "mode": tde_mode,
+                "key_loaded": tde_key_loaded,
+                "kid": tde_kid,
+                "epochs": tde_epochs_json
+            },
+            "acceleration": {
+                "mem_keydir": mem_keydir_present
+            },
+            "bloom": {
+                "present": bloom_present,
+                "buckets": bloom_buckets,
+                "fresh": bloom_fresh,
+                "bytes_per_bucket": bloom_bpb,
+                "k_hashes": bloom_k,
+                "last_lsn": bloom_last_lsn,
+                "cache_cap": bloom_cache_cap,
+                "cache_entries": bloom_cache_entries,
+                "cache_hits": bloom_cache_hits,
+                "cache_misses": bloom_cache_misses,
+                "reason": bloom_reason,
+                "expected_buckets": dir.bucket_count,
+                "expected_last_lsn": db.pager.meta.last_lsn
+            },
+            "directory": {
+                "buckets": dir.bucket_count,
+                "used_buckets": used_buckets
+            },
+            "metrics": {
+                "wal_appends_total": ms.wal_appends_total,
+                "wal_bytes_written": ms.wal_bytes_written,
+                "wal_fsync_calls": ms.wal_fsync_calls,
+                "wal_avg_batch_pages": ms.avg_wal_batch_pages(),
+                "wal_truncations": ms.wal_truncations,
+                "wal_pending_max_lsn": ms.wal_pending_max_lsn,
+                "wal_flushed_lsn": ms.wal_flushed_lsn,
+
+                "page_cache_hits": ms.page_cache_hits,
+                "page_cache_misses": ms.page_cache_misses,
+                "page_cache_hit_ratio": ms.cache_hit_ratio(),
+                "page_cache_len": pc_len,
+                "page_cache_evictions_total": pc_ev,
+                "page_cache_invalidations_total": pc_inv,
+
+                "keydir_hits": ms.keydir_hits,
+                "keydir_misses": ms.keydir_misses,
+                "keydir_hit_ratio": ms.keydir_hit_ratio(),
+
+                "rh_page_compactions": ms.rh_page_compactions,
+
+                "overflow_chains_created": ms.overflow_chains_created,
+                "overflow_chains_freed": ms.overflow_chains_freed,
+
+                "sweep_orphan_runs": ms.sweep_orphan_runs,
+
+                "snapshots_active": ms.snapshots_active,
+                "snapshot_freeze_frames": ms.snapshot_freeze_frames,
+                "snapshot_freeze_bytes": ms.snapshot_freeze_bytes,
+                "backup_pages_emitted": ms.backup_pages_emitted,
+                "backup_bytes_emitted": ms.backup_bytes_emitted,
+                "restore_pages_written": ms.restore_pages_written,
+                "restore_bytes_written": ms.restore_bytes_written,
+
+                "snapshot_fallback_scans": ms.snapshot_fallback_scans,
+
+                "ttl_skipped": ms.ttl_skipped,
+
+                "bloom_tests": ms.bloom_tests,
+                "bloom_negative": ms.bloom_negative,
+                "bloom_positive": ms.bloom_positive,
+                "bloom_skipped_stale": ms.bloom_skipped_stale,
+
+                "pack_pages": ms.pack_pages,
+                "pack_records": ms.pack_records,
+                "pack_pages_single": ms.pack_pages_single,
+                "pack_avg_records_per_page": ms.avg_pack_records_per_page(),
+
+                "bloom_updates_total": ms.bloom_updates_total,
+                "bloom_update_bytes": ms.bloom_update_bytes,
+
+                "lazy_compact_runs": ms.lazy_compact_runs,
+                "lazy_compact_pages_written": ms.lazy_compact_pages_written
             }
-            print!("{{\"since_lsn\":{},\"kid\":\"{}\"}}", since, escape_json(kid));
-        }
-        print!("]");
-        print!("}},"); // tde
+        });
 
-        // acceleration
-        print!("\"acceleration\":{{");
-        print!("\"mem_keydir\":{}", mem_keydir_present);
-        print!("}},"); // acceleration
-
-        // bloom
-        print!("\"bloom\":{{");
-        print!("\"present\":{}", bloom_present);
-        if let Some(b) = bloom_buckets {
-            print!(",\"buckets\":{}", b);
-        } else {
-            print!(",\"buckets\":null");
-        }
-        if let Some(f) = bloom_fresh {
-            print!(",\"fresh\":{}", f);
-        } else {
-            print!(",\"fresh\":null");
-        }
-        if let Some(bpb) = bloom_bpb {
-            print!(",\"bytes_per_bucket\":{}", bpb);
-        } else {
-            print!(",\"bytes_per_bucket\":null");
-        }
-        if let Some(k) = bloom_k {
-            print!(",\"k_hashes\":{}", k);
-        } else {
-            print!(",\"k_hashes\":null");
-        }
-        if let Some(lsn) = bloom_last_lsn {
-            print!(",\"last_lsn\":{}", lsn);
-        } else {
-            print!(",\"last_lsn\":null");
-        }
-        // cache stats (глобальные)
-        print!(",\"cache_cap\":{}", bloom_cache_cap);
-        print!(",\"cache_entries\":{}", bloom_cache_entries);
-        // new: bloom cache counters
-        print!(",\"cache_hits\":{}", bloom_cache_hits);
-        print!(",\"cache_misses\":{}", bloom_cache_misses);
-
-        // NEW: stale reason and expectations
-        print!(",\"reason\":\"{}\"", bloom_reason);
-        print!(",\"expected_buckets\":{}", dir.bucket_count);
-        print!(",\"expected_last_lsn\":{}", db.pager.meta.last_lsn);
-
-        print!("}},"); // bloom
-
-        // directory summary
-        print!("\"directory\":{{");
-        print!("\"buckets\":{},", dir.bucket_count);
-        print!("\"used_buckets\":{}", used_buckets);
-        print!("}},"); // directory
-
-        // metrics snapshot (включая packing и bloom delta-update)
-        print!("\"metrics\":{{");
-        print!("\"wal_appends_total\":{},", ms.wal_appends_total);
-        print!("\"wal_bytes_written\":{},", ms.wal_bytes_written);
-        print!("\"wal_fsync_calls\":{},", ms.wal_fsync_calls);
-        print!("\"wal_avg_batch_pages\":{:.2},", ms.avg_wal_batch_pages());
-        print!("\"wal_truncations\":{},", ms.wal_truncations);
-        print!("\"wal_pending_max_lsn\":{},", ms.wal_pending_max_lsn);
-        print!("\"wal_flushed_lsn\":{},", ms.wal_flushed_lsn);
-
-        print!("\"page_cache_hits\":{},", ms.page_cache_hits);
-        print!("\"page_cache_misses\":{},", ms.page_cache_misses);
-        print!("\"page_cache_hit_ratio\":{:.2},", ms.cache_hit_ratio());
-        // NEW: page cache diagnostics
-        print!("\"page_cache_len\":{},", pc_len);
-        print!("\"page_cache_evictions_total\":{},", pc_ev);
-        print!("\"page_cache_invalidations_total\":{},", pc_inv);
-
-        // NEW: keydir fast-path
-        print!("\"keydir_hits\":{},", ms.keydir_hits);
-        print!("\"keydir_misses\":{},", ms.keydir_misses);
-        print!("\"keydir_hit_ratio\":{:.2},", ms.keydir_hit_ratio());
-
-        print!("\"rh_page_compactions\":{},", ms.rh_page_compactions);
-
-        print!("\"overflow_chains_created\":{},", ms.overflow_chains_created);
-        print!("\"overflow_chains_freed\":{},", ms.overflow_chains_freed);
-
-        print!("\"sweep_orphan_runs\":{},", ms.sweep_orphan_runs);
-
-        print!("\"snapshots_active\":{},", ms.snapshots_active);
-        print!("\"snapshot_freeze_frames\":{},", ms.snapshot_freeze_frames);
-        print!("\"snapshot_freeze_bytes\":{},", ms.snapshot_freeze_bytes);
-        print!("\"backup_pages_emitted\":{},", ms.backup_pages_emitted);
-        print!("\"backup_bytes_emitted\":{},", ms.backup_bytes_emitted);
-        print!("\"restore_pages_written\":{},", ms.restore_pages_written);
-        print!("\"restore_bytes_written\":{},", ms.restore_bytes_written);
-
-        print!("\"snapshot_fallback_scans\":{},", ms.snapshot_fallback_scans);
-
-        print!("\"ttl_skipped\":{},", ms.ttl_skipped);
-
-        print!("\"bloom_tests\":{},", ms.bloom_tests);
-        print!("\"bloom_negative\":{},", ms.bloom_negative);
-        print!("\"bloom_positive\":{},", ms.bloom_positive);
-        print!("\"bloom_skipped_stale\":{},", ms.bloom_skipped_stale);
-
-        // packing metrics
-        print!("\"pack_pages\":{},", ms.pack_pages);
-        print!("\"pack_records\":{},", ms.pack_records);
-        print!("\"pack_pages_single\":{},", ms.pack_pages_single);
-        print!("\"pack_avg_records_per_page\":{:.3},", ms.avg_pack_records_per_page());
-
-        // NEW: bloom delta-update metrics
-        print!("\"bloom_updates_total\":{},", ms.bloom_updates_total);
-        print!("\"bloom_update_bytes\":{},", ms.bloom_update_bytes);
-
-        // NEW: lazy compact metrics
-        print!("\"lazy_compact_runs\":{},", ms.lazy_compact_runs);
-        print!("\"lazy_compact_pages_written\":{}", ms.lazy_compact_pages_written);
-
-        print!("}}"); // metrics
-
-        println!("}}");
+        // Печатаем pretty JSON
+        println!("{}", serde_json::to_string_pretty(&status).unwrap());
         return Ok(());
     }
 
@@ -271,7 +230,11 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
     println!("Acceleration:");
     println!(
         "  mem_keydir     = {}",
-        if mem_keydir_present { "present" } else { "absent" }
+        if mem_keydir_present {
+            "present"
+        } else {
+            "absent"
+        }
     );
 
     // Bloom side-car
@@ -310,21 +273,36 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
     println!("  wal_appends_total       = {}", ms.wal_appends_total);
     println!("  wal_bytes_written       = {}", ms.wal_bytes_written);
     println!("  wal_fsync_calls         = {}", ms.wal_fsync_calls);
-    println!("  wal_avg_batch_pages     = {:.2}", ms.avg_wal_batch_pages());
+    println!(
+        "  wal_avg_batch_pages     = {:.2}",
+        ms.avg_wal_batch_pages()
+    );
     println!("  wal_truncations         = {}", ms.wal_truncations);
     println!("  wal_pending_max_lsn     = {}", ms.wal_pending_max_lsn);
     println!("  wal_flushed_lsn         = {}", ms.wal_flushed_lsn);
 
     println!("  page_cache_hits         = {}", ms.page_cache_hits);
     println!("  page_cache_misses       = {}", ms.page_cache_misses);
-    println!("  page_cache_hit_ratio    = {:.2}%", ms.cache_hit_ratio() * 100.0);
+    println!(
+        "  page_cache_hit_ratio    = {:.2}%",
+        ms.cache_hit_ratio() * 100.0
+    );
     println!("  page_cache_len          = {}", page_cache_len());
-    println!("  page_cache_evictions    = {}", page_cache_evictions_total());
-    println!("  page_cache_invalidations= {}", page_cache_invalidations_total());
+    println!(
+        "  page_cache_evictions    = {}",
+        page_cache_evictions_total()
+    );
+    println!(
+        "  page_cache_invalidations= {}",
+        page_cache_invalidations_total()
+    );
 
     println!("  keydir_hits             = {}", ms.keydir_hits);
     println!("  keydir_misses           = {}", ms.keydir_misses);
-    println!("  keydir_hit_ratio        = {:.2}%", ms.keydir_hit_ratio() * 100.0);
+    println!(
+        "  keydir_hit_ratio        = {:.2}%",
+        ms.keydir_hit_ratio() * 100.0
+    );
 
     println!("  rh_page_compactions     = {}", ms.rh_page_compactions);
 
@@ -351,27 +329,18 @@ pub fn exec_with_json(path: PathBuf, json: bool) -> Result<()> {
     println!("  pack_pages              = {}", ms.pack_pages);
     println!("  pack_records            = {}", ms.pack_records);
     println!("  pack_pages_single       = {}", ms.pack_pages_single);
-    println!("  pack_avg_records/page   = {:.2}", ms.avg_pack_records_per_page());
+    println!(
+        "  pack_avg_records/page   = {:.2}",
+        ms.avg_pack_records_per_page()
+    );
 
     println!("  lazy_compact_runs       = {}", ms.lazy_compact_runs);
-    println!("  lazy_compact_pages_written = {}", ms.lazy_compact_pages_written);
+    println!(
+        "  lazy_compact_pages_written = {}",
+        ms.lazy_compact_pages_written
+    );
 
     // Keep original stats printer (text or JSON via P1_DBSTATS_JSON)
     db.print_stats()?;
     Ok(())
-}
-
-// ---------- helpers ----------
-
-fn escape_json(s: &str) -> String {
-    // простая экранизация: заменим \ и " (достаточно для наших целей)
-    let mut out = String::with_capacity(s.len() + 8);
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\"' => out.push_str("\\\""),
-            c => out.push(c),
-        }
-    }
-    out
 }

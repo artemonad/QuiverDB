@@ -6,12 +6,12 @@ use std::path::PathBuf;
 
 use QuiverDB::{dir::Directory, meta::read_meta, metrics};
 // Bloom side-car + cache (только верхнеуровневые реэкспорты)
-use QuiverDB::bloom::{bloom_cache_stats, bloom_cache_counters};
+use QuiverDB::bloom::{bloom_cache_counters, bloom_cache_stats};
 // Page cache diagnostics
 use QuiverDB::pager::cache::{
     page_cache_evictions_total,
-    page_cache_invalidations_total,  // NEW
-    page_cache_len
+    page_cache_invalidations_total, // NEW
+    page_cache_len,
 };
 
 #[derive(Parser, Debug)]
@@ -37,8 +37,8 @@ fn main() {
 fn run() -> Result<()> {
     let opt = Opt::parse();
 
-    let server = Server::http(&opt.addr)
-        .map_err(|e| anyhow!("bind http at {}: {}", opt.addr, e))?;
+    let server =
+        Server::http(&opt.addr).map_err(|e| anyhow!("bind http at {}: {}", opt.addr, e))?;
     println!("quiverdb_metrics listening on {}", opt.addr);
 
     loop {
@@ -91,11 +91,17 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
     // --- WAL core ---
     out.push_str("# HELP quiverdb_wal_appends_total Total WAL appends.\n");
     out.push_str("# TYPE quiverdb_wal_appends_total counter\n");
-    out.push_str(&format!("quiverdb_wal_appends_total {}\n", m.wal_appends_total));
+    out.push_str(&format!(
+        "quiverdb_wal_appends_total {}\n",
+        m.wal_appends_total
+    ));
 
     out.push_str("# HELP quiverdb_wal_bytes_written Total WAL bytes written.\n");
     out.push_str("# TYPE quiverdb_wal_bytes_written counter\n");
-    out.push_str(&format!("quiverdb_wal_bytes_written {}\n", m.wal_bytes_written));
+    out.push_str(&format!(
+        "quiverdb_wal_bytes_written {}\n",
+        m.wal_bytes_written
+    ));
 
     out.push_str("# HELP quiverdb_wal_fsync_calls WAL fsync calls.\n");
     out.push_str("# TYPE quiverdb_wal_fsync_calls counter\n");
@@ -103,15 +109,23 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
 
     out.push_str("# HELP quiverdb_wal_fsync_batch_pages Average pages per WAL fsync.\n");
     out.push_str("# TYPE quiverdb_wal_fsync_batch_pages gauge\n");
-    out.push_str(&format!("quiverdb_wal_fsync_batch_pages {:.2}\n", m.avg_wal_batch_pages()));
+    out.push_str(&format!(
+        "quiverdb_wal_fsync_batch_pages {:.2}\n",
+        m.avg_wal_batch_pages()
+    ));
 
     out.push_str("# HELP quiverdb_wal_truncations WAL file truncations.\n");
     out.push_str("# TYPE quiverdb_wal_truncations counter\n");
     out.push_str(&format!("quiverdb_wal_truncations {}\n", m.wal_truncations));
 
-    out.push_str("# HELP quiverdb_wal_pending_max_lsn Max LSN of PAGE_IMAGE written but not yet fsynced.\n");
+    out.push_str(
+        "# HELP quiverdb_wal_pending_max_lsn Max LSN of PAGE_IMAGE written but not yet fsynced.\n",
+    );
     out.push_str("# TYPE quiverdb_wal_pending_max_lsn gauge\n");
-    out.push_str(&format!("quiverdb_wal_pending_max_lsn {}\n", m.wal_pending_max_lsn));
+    out.push_str(&format!(
+        "quiverdb_wal_pending_max_lsn {}\n",
+        m.wal_pending_max_lsn
+    ));
 
     out.push_str("# HELP quiverdb_wal_flushed_lsn Last LSN durably fsynced in WAL.\n");
     out.push_str("# TYPE quiverdb_wal_flushed_lsn gauge\n");
@@ -120,15 +134,24 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
     // --- WAL threshold flush (new) ---
     out.push_str("# HELP quiverdb_wal_threshold_flushes_total Threshold-based WAL fsyncs (outside explicit batches).\n");
     out.push_str("# TYPE quiverdb_wal_threshold_flushes_total counter\n");
-    out.push_str(&format!("quiverdb_wal_threshold_flushes_total {}\n", m.wal_threshold_flushes));
+    out.push_str(&format!(
+        "quiverdb_wal_threshold_flushes_total {}\n",
+        m.wal_threshold_flushes
+    ));
 
     out.push_str("# HELP quiverdb_wal_threshold_flush_pages_total Pages accumulated when threshold fsync triggered.\n");
     out.push_str("# TYPE quiverdb_wal_threshold_flush_pages_total counter\n");
-    out.push_str(&format!("quiverdb_wal_threshold_flush_pages_total {}\n", m.wal_threshold_flush_pages));
+    out.push_str(&format!(
+        "quiverdb_wal_threshold_flush_pages_total {}\n",
+        m.wal_threshold_flush_pages
+    ));
 
     out.push_str("# HELP quiverdb_wal_threshold_flush_bytes_total Bytes accumulated when threshold fsync triggered.\n");
     out.push_str("# TYPE quiverdb_wal_threshold_flush_bytes_total counter\n");
-    out.push_str(&format!("quiverdb_wal_threshold_flush_bytes_total {}\n", m.wal_threshold_flush_bytes));
+    out.push_str(&format!(
+        "quiverdb_wal_threshold_flush_bytes_total {}\n",
+        m.wal_threshold_flush_bytes
+    ));
 
     // --- Page cache ---
     out.push_str("# HELP quiverdb_page_cache_hits Page cache hits.\n");
@@ -137,11 +160,17 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
 
     out.push_str("# HELP quiverdb_page_cache_misses Page cache misses.\n");
     out.push_str("# TYPE quiverdb_page_cache_misses counter\n");
-    out.push_str(&format!("quiverdb_page_cache_misses {}\n", m.page_cache_misses));
+    out.push_str(&format!(
+        "quiverdb_page_cache_misses {}\n",
+        m.page_cache_misses
+    ));
 
     out.push_str("# HELP quiverdb_page_cache_hit_ratio Page cache hit ratio (percent).\n");
     out.push_str("# TYPE quiverdb_page_cache_hit_ratio gauge\n");
-    out.push_str(&format!("quiverdb_page_cache_hit_ratio {:.2}\n", m.cache_hit_ratio() * 100.0));
+    out.push_str(&format!(
+        "quiverdb_page_cache_hit_ratio {:.2}\n",
+        m.cache_hit_ratio() * 100.0
+    ));
 
     let pc_len = page_cache_len() as u64;
     let pc_ev = page_cache_evictions_total();
@@ -158,7 +187,10 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
     // NEW: invalidations metric
     out.push_str("# HELP quiverdb_page_cache_invalidations_total Explicit invalidations of page cache entries since start (or last reconfigure/clear).\n");
     out.push_str("# TYPE quiverdb_page_cache_invalidations_total counter\n");
-    out.push_str(&format!("quiverdb_page_cache_invalidations_total {}\n", pc_inv));
+    out.push_str(&format!(
+        "quiverdb_page_cache_invalidations_total {}\n",
+        pc_inv
+    ));
 
     // --- Keydir fast-path ---
     out.push_str("# HELP quiverdb_keydir_hits In-memory keydir fast-path hits.\n");
@@ -171,59 +203,98 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
 
     out.push_str("# HELP quiverdb_keydir_hit_ratio In-memory keydir hit ratio (percent).\n");
     out.push_str("# TYPE quiverdb_keydir_hit_ratio gauge\n");
-    out.push_str(&format!("quiverdb_keydir_hit_ratio {:.2}\n", m.keydir_hit_ratio() * 100.0));
+    out.push_str(&format!(
+        "quiverdb_keydir_hit_ratio {:.2}\n",
+        m.keydir_hit_ratio() * 100.0
+    ));
 
     // --- Robin Hood ---
     out.push_str("# HELP quiverdb_rh_page_compactions Robin Hood in-page compactions.\n");
     out.push_str("# TYPE quiverdb_rh_page_compactions counter\n");
-    out.push_str(&format!("quiverdb_rh_page_compactions {}\n", m.rh_page_compactions));
+    out.push_str(&format!(
+        "quiverdb_rh_page_compactions {}\n",
+        m.rh_page_compactions
+    ));
 
     // --- Overflow ---
     out.push_str("# HELP quiverdb_overflow_chains_created Overflow chains created.\n");
     out.push_str("# TYPE quiverdb_overflow_chains_created counter\n");
-    out.push_str(&format!("quiverdb_overflow_chains_created {}\n", m.overflow_chains_created));
+    out.push_str(&format!(
+        "quiverdb_overflow_chains_created {}\n",
+        m.overflow_chains_created
+    ));
 
     out.push_str("# HELP quiverdb_overflow_chains_freed Overflow chains freed.\n");
     out.push_str("# TYPE quiverdb_overflow_chains_freed counter\n");
-    out.push_str(&format!("quiverdb_overflow_chains_freed {}\n", m.overflow_chains_freed));
+    out.push_str(&format!(
+        "quiverdb_overflow_chains_freed {}\n",
+        m.overflow_chains_freed
+    ));
 
     // --- Maintenance ---
     out.push_str("# HELP quiverdb_sweep_orphan_runs Orphan sweep runs.\n");
     out.push_str("# TYPE quiverdb_sweep_orphan_runs counter\n");
-    out.push_str(&format!("quiverdb_sweep_orphan_runs {}\n", m.sweep_orphan_runs));
+    out.push_str(&format!(
+        "quiverdb_sweep_orphan_runs {}\n",
+        m.sweep_orphan_runs
+    ));
 
     // --- Snapshots / Backup / Restore ---
     out.push_str("# HELP quiverdb_snapshots_active Active snapshots.\n");
     out.push_str("# TYPE quiverdb_snapshots_active gauge\n");
-    out.push_str(&format!("quiverdb_snapshots_active {}\n", m.snapshots_active));
+    out.push_str(&format!(
+        "quiverdb_snapshots_active {}\n",
+        m.snapshots_active
+    ));
 
     out.push_str("# HELP quiverdb_snapshot_freeze_frames Snapshot freeze frames.\n");
     out.push_str("# TYPE quiverdb_snapshot_freeze_frames counter\n");
-    out.push_str(&format!("quiverdb_snapshot_freeze_frames {}\n", m.snapshot_freeze_frames));
+    out.push_str(&format!(
+        "quiverdb_snapshot_freeze_frames {}\n",
+        m.snapshot_freeze_frames
+    ));
 
     out.push_str("# HELP quiverdb_snapshot_freeze_bytes Snapshot freeze bytes.\n");
     out.push_str("# TYPE quiverdb_snapshot_freeze_bytes counter\n");
-    out.push_str(&format!("quiverdb_snapshot_freeze_bytes {}\n", m.snapshot_freeze_bytes));
+    out.push_str(&format!(
+        "quiverdb_snapshot_freeze_bytes {}\n",
+        m.snapshot_freeze_bytes
+    ));
 
     out.push_str("# HELP quiverdb_backup_pages_emitted Backup pages emitted.\n");
     out.push_str("# TYPE quiverdb_backup_pages_emitted counter\n");
-    out.push_str(&format!("quiverdb_backup_pages_emitted {}\n", m.backup_pages_emitted));
+    out.push_str(&format!(
+        "quiverdb_backup_pages_emitted {}\n",
+        m.backup_pages_emitted
+    ));
 
     out.push_str("# HELP quiverdb_backup_bytes_emitted Backup bytes emitted.\n");
     out.push_str("# TYPE quiverdb_backup_bytes_emitted counter\n");
-    out.push_str(&format!("quiverdb_backup_bytes_emitted {}\n", m.backup_bytes_emitted));
+    out.push_str(&format!(
+        "quiverdb_backup_bytes_emitted {}\n",
+        m.backup_bytes_emitted
+    ));
 
     out.push_str("# HELP quiverdb_restore_pages_written Restore pages written.\n");
     out.push_str("# TYPE quiverdb_restore_pages_written counter\n");
-    out.push_str(&format!("quiverdb_restore_pages_written {}\n", m.restore_pages_written));
+    out.push_str(&format!(
+        "quiverdb_restore_pages_written {}\n",
+        m.restore_pages_written
+    ));
 
     out.push_str("# HELP quiverdb_restore_bytes_written Restore bytes written.\n");
     out.push_str("# TYPE quiverdb_restore_bytes_written counter\n");
-    out.push_str(&format!("quiverdb_restore_bytes_written {}\n", m.restore_bytes_written));
+    out.push_str(&format!(
+        "quiverdb_restore_bytes_written {}\n",
+        m.restore_bytes_written
+    ));
 
     out.push_str("# HELP quiverdb_snapshot_fallback_scans Snapshot fallback scans.\n");
     out.push_str("# TYPE quiverdb_snapshot_fallback_scans counter\n");
-    out.push_str(&format!("quiverdb_snapshot_fallback_scans {}\n", m.snapshot_fallback_scans));
+    out.push_str(&format!(
+        "quiverdb_snapshot_fallback_scans {}\n",
+        m.snapshot_fallback_scans
+    ));
 
     // --- TTL ---
     out.push_str("# HELP quiverdb_ttl_skipped TTL-based skipped reads.\n");
@@ -243,9 +314,14 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
     out.push_str("# TYPE quiverdb_bloom_positive counter\n");
     out.push_str(&format!("quiverdb_bloom_positive {}\n", m.bloom_positive));
 
-    out.push_str("# HELP quiverdb_bloom_skipped_stale Bloom skipped due to staleness or incompatibility.\n");
+    out.push_str(
+        "# HELP quiverdb_bloom_skipped_stale Bloom skipped due to staleness or incompatibility.\n",
+    );
     out.push_str("# TYPE quiverdb_bloom_skipped_stale counter\n");
-    out.push_str(&format!("quiverdb_bloom_skipped_stale {}\n", m.bloom_skipped_stale));
+    out.push_str(&format!(
+        "quiverdb_bloom_skipped_stale {}\n",
+        m.bloom_skipped_stale
+    ));
 
     let (bc_cap, bc_len) = bloom_cache_stats();
     let (bc_hits, bc_miss) = bloom_cache_counters();
@@ -254,7 +330,9 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
     out.push_str("# TYPE quiverdb_bloom_cache_capacity gauge\n");
     out.push_str(&format!("quiverdb_bloom_cache_capacity {}\n", bc_cap));
 
-    out.push_str("# HELP quiverdb_bloom_cache_len Bloom cache entries currently stored (buckets cached).\n");
+    out.push_str(
+        "# HELP quiverdb_bloom_cache_len Bloom cache entries currently stored (buckets cached).\n",
+    );
     out.push_str("# TYPE quiverdb_bloom_cache_len gauge\n");
     out.push_str(&format!("quiverdb_bloom_cache_len {}\n", bc_len));
 
@@ -269,11 +347,17 @@ fn build_metrics(path: &Option<PathBuf>) -> Result<String> {
     // --- Lazy compaction ---
     out.push_str("# HELP quiverdb_lazy_compact_runs Lazy compaction runs.\n");
     out.push_str("# TYPE quiverdb_lazy_compact_runs counter\n");
-    out.push_str(&format!("quiverdb_lazy_compact_runs {}\n", m.lazy_compact_runs));
+    out.push_str(&format!(
+        "quiverdb_lazy_compact_runs {}\n",
+        m.lazy_compact_runs
+    ));
 
     out.push_str("# HELP quiverdb_lazy_compact_pages_written Pages written by lazy compaction.\n");
     out.push_str("# TYPE quiverdb_lazy_compact_pages_written counter\n");
-    out.push_str(&format!("quiverdb_lazy_compact_pages_written {}\n", m.lazy_compact_pages_written));
+    out.push_str(&format!(
+        "quiverdb_lazy_compact_pages_written {}\n",
+        m.lazy_compact_pages_written
+    ));
 
     // --- Optional DB info from --path ---
     if let Some(root) = path {

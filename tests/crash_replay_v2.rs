@@ -3,9 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use QuiverDB::db::Db;
-use QuiverDB::meta::{set_clean_shutdown};
-use QuiverDB::pager::{Pager, DATA_SEG_EXT, DATA_SEG_PREFIX};
+use QuiverDB::meta::set_clean_shutdown;
 use QuiverDB::page::kv_init_v3;
+use QuiverDB::pager::{Pager, DATA_SEG_EXT, DATA_SEG_PREFIX};
 use QuiverDB::wal::{WAL_FILE, WAL_HDR_SIZE};
 
 #[test]
@@ -53,7 +53,10 @@ fn crash_and_replay_restores_data_and_truncates_wal() -> Result<()> {
 
     // WAL должен быть усечён до заголовка
     let wal_len = fs::metadata(root.join(WAL_FILE))?.len();
-    assert_eq!(wal_len, WAL_HDR_SIZE as u64, "WAL must be truncated to header after replay");
+    assert_eq!(
+        wal_len, WAL_HDR_SIZE as u64,
+        "WAL must be truncated to header after replay"
+    );
 
     Ok(())
 }

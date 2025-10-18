@@ -6,9 +6,9 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use QuiverDB::db::Db;
 use QuiverDB::dir::Directory;
-use QuiverDB::meta::{init_meta_v4, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32C};
-use QuiverDB::pager::Pager;
+use QuiverDB::meta::{init_meta_v4, CKSUM_CRC32C, CODEC_ZSTD, HASH_KIND_XX64_SEED0};
 use QuiverDB::page::{kv_header_read_v3, ovf_header_read_v3, KV_HDR_MIN};
+use QuiverDB::pager::Pager;
 
 #[test]
 fn overflow_zstd_roundtrip() -> Result<()> {
@@ -17,7 +17,13 @@ fn overflow_zstd_roundtrip() -> Result<()> {
 
     let page_size = 64 * 1024;
     let buckets = 128;
-    init_meta_v4(&root, page_size, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32C)?;
+    init_meta_v4(
+        &root,
+        page_size,
+        HASH_KIND_XX64_SEED0,
+        CODEC_ZSTD,
+        CKSUM_CRC32C,
+    )?;
     Directory::create(&root, buckets)?;
 
     let big_len = page_size as usize * 2 + page_size as usize / 2;

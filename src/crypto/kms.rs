@@ -21,11 +21,11 @@
 //!   P1_KMS_KEK_HEX / P1_KMS_KEK_BASE64 — 32‑байтовый KEK
 //!   P1_KMS_KEK_KID — KID KEK’а (по умолчанию "kek-default")
 
-use anyhow::{anyhow, Result};
 use aes_gcm::{
     aead::{generic_array::GenericArray, AeadInPlace, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
+use anyhow::{anyhow, Result};
 use base64::Engine;
 use byteorder::{ByteOrder, LittleEndian};
 use rand::rngs::OsRng;

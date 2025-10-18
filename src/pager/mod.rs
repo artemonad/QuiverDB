@@ -7,6 +7,7 @@
 //! - commit.rs — commit_page/commit_pages_batch (WAL v2 + запись в сегменты).
 //! - replay.rs — wal_replay_with_pager обёртка вокруг WAL v2 реплея.
 //! - cache.rs  — процессный кэш страниц (second-chance).
+//! - value_cache.rs — глобальный LRU‑кэш распакованных OVERFLOW‑значений (новое).
 //!
 //! Публичные константы экспортируются отсюда, чтобы внешний код мог их использовать
 //! (например, тесты ссылались на DATA_SEG_PREFIX/EXT).
@@ -20,13 +21,15 @@ pub const DATA_SEG_PREFIX: &str = "data-";
 pub const DATA_SEG_EXT: &str = "p2seg";
 
 // Подмодули (реализация)
-pub mod core;
-pub mod io;
 pub mod alloc;
 pub mod commit;
+pub mod core;
+pub mod io;
 pub mod replay;
 // ВАЖНО: делаем модуль cache публичным, чтобы внешние бинари могли импортировать его API
 pub mod cache;
+// NEW: кэш распакованных OVERFLOW‑значений (LRU по байтам)
+pub mod value_cache;
 
 // Re-exports для внешнего API
 pub use core::Pager;

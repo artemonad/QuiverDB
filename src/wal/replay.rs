@@ -1,9 +1,13 @@
 //! wal/replay — универсальный реплей WAL v2 (P2WAL001) с LSN‑гейтингом в вызывающем слое.
 //!
 //! Обновления:
-//! - Чтение кадров WAL выполняется через wal::reader::read_next_record()
+//! - Переход на stateful WalStreamReader (src/wal/reader.rs) вместо глобальной функции.
+//!   Это убирает утечку состояния mid‑header между потоками/стримами и повышает безопасность.
+//!
+//! Поведение неизменно:
+//! - Чтение кадров WAL выполняется через WalStreamReader::read_next()
 //!   (проверка CRC/partial tails — внутри reader).
-//! - HEADS_UPDATE теперь гейтится по LSN: применяется только если wal_lsn > last_heads_lsn,
+//! - HEADS_UPDATE гейтится по LSN: применяется только если wal_lsn > last_heads_lsn,
 //!   маркер хранится в <root>/.heads_lsn.bin (см. wal::state).
 //! - Этот модуль содержит только wal_replay_if_any(..).
 //!   Метод Pager::wal_replay_with_pager находится в src/pager/replay.rs.
@@ -15,12 +19,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::{
-    wal_path, write_wal_file_header,
-    WAL_HDR_SIZE, WAL_MAGIC,
-    WAL_REC_BEGIN, WAL_REC_COMMIT, WAL_REC_PAGE_DELTA, WAL_REC_PAGE_IMAGE,
-    WAL_REC_TRUNCATE, WAL_REC_HEADS_UPDATE,
+    wal_path, write_wal_file_header, WAL_HDR_SIZE, WAL_MAGIC, WAL_REC_BEGIN, WAL_REC_COMMIT,
+    WAL_REC_HEADS_UPDATE, WAL_REC_PAGE_DELTA, WAL_REC_PAGE_IMAGE, WAL_REC_TRUNCATE,
 };
-use super::reader::read_next_record;
+// NEW: stateful stream reader
+use super::reader::WalStreamReader;
 // NEW: персистентное состояние для LSN-гейтинга HEADS_UPDATE
 use super::state::{load_last_heads_lsn, store_last_heads_lsn};
 
@@ -86,7 +89,10 @@ where
     // NEW: персистентный LSN-гейтинг для HEADS_UPDATE
     let mut last_heads_lsn = load_last_heads_lsn(root).unwrap_or(0);
 
-    while let Some((rec, next_pos)) = read_next_record(&mut f, pos, len)? {
+    // NEW: stateful reader
+    let mut reader = WalStreamReader::new();
+
+    while let Some((rec, next_pos)) = reader.read_next(&mut f, pos, len)? {
         // Учёт max LSN
         if rec.lsn > max_lsn {
             max_lsn = rec.lsn;

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use QuiverDB::bloom::{bloom_cache_stats, bloom_cache_counters};
 use QuiverDB::bloom::cache::{bloom_cache_get, bloom_cache_put};
+use QuiverDB::bloom::{bloom_cache_counters, bloom_cache_stats};
 
 fn unique_path(prefix: &str) -> PathBuf {
     let pid = std::process::id();
@@ -57,7 +57,10 @@ fn bloom_cache_o1_lru_basic() -> Result<()> {
     // Старые (0..3) вероятно вытеснились; хотя точный порядок зависим от get() между put().
     // Проверим, что новые (4..7) присутствуют:
     for b in 4..8u32 {
-        assert!(bloom_cache_get(&path, b, last_lsn).is_some(), "new bucket must be cached");
+        assert!(
+            bloom_cache_get(&path, b, last_lsn).is_some(),
+            "new bucket must be cached"
+        );
     }
 
     Ok(())

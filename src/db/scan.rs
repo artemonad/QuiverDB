@@ -20,17 +20,15 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dir::NO_PAGE;
 use crate::metrics::record_ttl_skipped;
-use crate::page::{
-    kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3, KV_HDR_MIN,
-};
+use crate::page::{kv_header_read_v3, KV_HDR_MIN, PAGE_MAGIC, PAGE_TYPE_KV_RH3};
 // NEW: packed-aware точечный поиск (подмодуль kv)
 use crate::page::kv::kv_find_record_by_key;
 // Для безопасной ручной итерации по слотам
-use crate::page::common::{TRAILER_LEN, KV_SLOT_SIZE, KV_EMPTY_OFF};
+use crate::page::common::{KV_EMPTY_OFF, KV_SLOT_SIZE, TRAILER_LEN};
 // Общий ридер OVERFLOW-цепочек
 use crate::page::ovf::chain as page_ovf_chain;
 // Централизованные утилиты
-use crate::util::{now_secs, decode_ovf_placeholder_v3};
+use crate::util::{decode_ovf_placeholder_v3, now_secs};
 
 use super::core::Db;
 
@@ -83,7 +81,9 @@ impl Db {
                     if pid == NO_PAGE {
                         return;
                     }
-                    if let Ok(Some(v)) = self.value_from_pid_or_fallback_with_buf(k, pid, now, &mut page_buf) {
+                    if let Ok(Some(v)) =
+                        self.value_from_pid_or_fallback_with_buf(k, pid, now, &mut page_buf)
+                    {
                         cb(k, &v);
                     }
                 });
@@ -93,7 +93,9 @@ impl Db {
                     if pid == NO_PAGE {
                         return;
                     }
-                    if let Ok(Some(v)) = self.value_from_pid_or_fallback_with_buf(k, pid, now, &mut page_buf) {
+                    if let Ok(Some(v)) =
+                        self.value_from_pid_or_fallback_with_buf(k, pid, now, &mut page_buf)
+                    {
                         cb(k, &v);
                     }
                 });
@@ -322,11 +324,8 @@ fn read_record_at_checked<'a>(
 }
 
 /// Обойти все записи на странице в порядке "новые → старые" (reverse слоты).
-fn for_each_records_newest_first<'a, F>(
-    page: &'a [u8],
-    data_end: usize,
-    mut f: F,
-) where
+fn for_each_records_newest_first<'a, F>(page: &'a [u8], data_end: usize, mut f: F)
+where
     F: FnMut(&'a [u8], &'a [u8], u32, u8),
 {
     // Валидация базовой геометрии

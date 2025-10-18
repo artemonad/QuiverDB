@@ -33,8 +33,8 @@ use std::sync::OnceLock;
 
 use crate::page::{
     kv_header_read_v3, kv_header_write_v3, ovf_header_read_v3, ovf_header_write_v3,
-    page_update_checksum, page_update_trailer_aead_with,
-    PAGE_MAGIC, PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3, OFF_TYPE, KV_OFF_LSN, OVF_OFF_LSN, TRAILER_LEN,
+    page_update_checksum, page_update_trailer_aead_with, KV_OFF_LSN, OFF_TYPE, OVF_OFF_LSN,
+    PAGE_MAGIC, PAGE_TYPE_KV_RH3, PAGE_TYPE_OVERFLOW3, TRAILER_LEN,
 };
 use crate::wal::Wal;
 
@@ -266,7 +266,10 @@ fn set_v3_page_lsn_mut(page: &mut [u8], lsn: u64) -> Result<()> {
             ovf_header_write_v3(page, &h)?;
         }
         other => {
-            return Err(anyhow!("set_v3_page_lsn_mut: unsupported page type {}", other));
+            return Err(anyhow!(
+                "set_v3_page_lsn_mut: unsupported page type {}",
+                other
+            ));
         }
     }
     Ok(())
@@ -282,8 +285,12 @@ fn v3_page_lsn(buf: &[u8]) -> Option<u64> {
     }
     let ptype = LittleEndian::read_u16(&buf[OFF_TYPE..OFF_TYPE + 2]);
     match ptype {
-        t if t == PAGE_TYPE_KV_RH3 => Some(LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8])),
-        t if t == PAGE_TYPE_OVERFLOW3 => Some(LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8])),
+        t if t == PAGE_TYPE_KV_RH3 => {
+            Some(LittleEndian::read_u64(&buf[KV_OFF_LSN..KV_OFF_LSN + 8]))
+        }
+        t if t == PAGE_TYPE_OVERFLOW3 => {
+            Some(LittleEndian::read_u64(&buf[OVF_OFF_LSN..OVF_OFF_LSN + 8]))
+        }
         _ => None,
     }
 }

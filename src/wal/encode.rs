@@ -14,22 +14,31 @@ use byteorder::{ByteOrder, LittleEndian};
 use std::io::Write;
 
 use super::{
-    WAL_REC_HDR_SIZE,
-    WAL_REC_OFF_TYPE, WAL_REC_OFF_FLAGS, WAL_REC_OFF_RESERVED,
-    WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_OFF_LEN, WAL_REC_OFF_CRC32,
-    crc32c_of_parts,
+    crc32c_of_parts, WAL_REC_HDR_SIZE, WAL_REC_OFF_CRC32, WAL_REC_OFF_FLAGS, WAL_REC_OFF_LEN,
+    WAL_REC_OFF_LSN, WAL_REC_OFF_PAGE_ID, WAL_REC_OFF_RESERVED, WAL_REC_OFF_TYPE,
 };
 
 /// Построить заголовок WAL с заполненным CRC32C.
 /// CRC считается по header[0..WAL_REC_OFF_CRC32] + payload.
-pub fn build_hdr_with_crc(rec_type: u8, lsn: u64, page_id: u64, payload: &[u8]) -> [u8; WAL_REC_HDR_SIZE] {
+pub fn build_hdr_with_crc(
+    rec_type: u8,
+    lsn: u64,
+    page_id: u64,
+    payload: &[u8],
+) -> [u8; WAL_REC_HDR_SIZE] {
     let mut hdr = [0u8; WAL_REC_HDR_SIZE];
     hdr[WAL_REC_OFF_TYPE] = rec_type;
     hdr[WAL_REC_OFF_FLAGS] = 0;
     LittleEndian::write_u16(&mut hdr[WAL_REC_OFF_RESERVED..WAL_REC_OFF_RESERVED + 2], 0);
     LittleEndian::write_u64(&mut hdr[WAL_REC_OFF_LSN..WAL_REC_OFF_LSN + 8], lsn);
-    LittleEndian::write_u64(&mut hdr[WAL_REC_OFF_PAGE_ID..WAL_REC_OFF_PAGE_ID + 8], page_id);
-    LittleEndian::write_u32(&mut hdr[WAL_REC_OFF_LEN..WAL_REC_OFF_LEN + 4], payload.len() as u32);
+    LittleEndian::write_u64(
+        &mut hdr[WAL_REC_OFF_PAGE_ID..WAL_REC_OFF_PAGE_ID + 8],
+        page_id,
+    );
+    LittleEndian::write_u32(
+        &mut hdr[WAL_REC_OFF_LEN..WAL_REC_OFF_LEN + 4],
+        payload.len() as u32,
+    );
 
     let crc = crc32c_of_parts(&hdr[..WAL_REC_OFF_CRC32], payload);
     LittleEndian::write_u32(&mut hdr[WAL_REC_OFF_CRC32..WAL_REC_OFF_CRC32 + 4], crc);
@@ -42,7 +51,13 @@ pub fn build_hdr_with_crc(rec_type: u8, lsn: u64, page_id: u64, payload: &[u8]) 
 /// - Пишет заголовок и payload (если payload не пустой).
 /// - Не делает seek(End) — ответственность за позицию лежит на вызывающем коде.
 /// - Возвращает ошибку при длине payload > u32::MAX (поле len — u32).
-pub fn write_record<W: Write>(writer: &mut W, rec_type: u8, lsn: u64, page_id: u64, payload: &[u8]) -> Result<()> {
+pub fn write_record<W: Write>(
+    writer: &mut W,
+    rec_type: u8,
+    lsn: u64,
+    page_id: u64,
+    payload: &[u8],
+) -> Result<()> {
     // Защита от некорректной длины (формат len — u32)
     if payload.len() > u32::MAX as usize {
         return Err(anyhow!(

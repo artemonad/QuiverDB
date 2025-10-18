@@ -2,30 +2,27 @@ use anyhow::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::metrics::{
     record_wal_append,
-    record_wal_fsync,
-    record_wal_truncation,
-    record_wal_pending_lsn,
     record_wal_flushed_lsn,
+    record_wal_fsync,
+    record_wal_pending_lsn,
     // NEW: threshold flush metric
     record_wal_threshold_flush,
+    record_wal_truncation,
 };
 
 use super::{
-    WAL_HDR_SIZE,
-    WAL_REC_HDR_SIZE,
-    WAL_REC_BEGIN, WAL_REC_COMMIT, WAL_REC_PAGE_IMAGE, WAL_REC_TRUNCATE,
-    WAL_REC_HEADS_UPDATE,
-    WAL_ROTATE_SIZE,
+    WAL_HDR_SIZE, WAL_REC_BEGIN, WAL_REC_COMMIT, WAL_REC_HDR_SIZE, WAL_REC_HEADS_UPDATE,
+    WAL_REC_PAGE_IMAGE, WAL_REC_TRUNCATE, WAL_ROTATE_SIZE,
 };
 
-use super::registry::{get_or_create_wal_inner, set_group_coalesce_ms, WalInner};
 use super::encode;
+use super::registry::{get_or_create_wal_inner, set_group_coalesce_ms, WalInner};
 
 #[derive(Debug, Clone, Copy)]
 pub struct WalGroupCfg {
@@ -41,7 +38,10 @@ pub struct Wal {
 impl Wal {
     pub fn open_for_append(root: &Path) -> Result<Self> {
         let inner = get_or_create_wal_inner(root)?;
-        Ok(Self { inner, in_batch: false })
+        Ok(Self {
+            inner,
+            in_batch: false,
+        })
     }
 
     pub fn set_group_config(root: &Path, cfg: WalGroupCfg) -> Result<()> {
@@ -61,13 +61,7 @@ impl Wal {
     }
 
     #[inline]
-    fn write_record(
-        &mut self,
-        rec_type: u8,
-        lsn: u64,
-        page_id: u64,
-        payload: &[u8],
-    ) -> Result<()> {
+    fn write_record(&mut self, rec_type: u8, lsn: u64, page_id: u64, payload: &[u8]) -> Result<()> {
         // MutexGuard<File> -> &mut File для impl Write + Seek
         let mut guard = self.inner.file.lock().unwrap();
         encode::write_record(&mut *guard, rec_type, lsn, page_id, payload)
@@ -77,7 +71,9 @@ impl Wal {
         self.write_record(WAL_REC_PAGE_IMAGE, lsn, page_id, page)?;
         // учёт метрик/счётчиков
         record_wal_append(WAL_REC_HDR_SIZE + page.len());
-        self.inner.pages_since_last_fsync.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .pages_since_last_fsync
+            .fetch_add(1, Ordering::Relaxed);
         self.inner
             .bytes_since_last_fsync
             .fetch_add((WAL_REC_HDR_SIZE + page.len()) as u64, Ordering::Relaxed);
@@ -213,14 +209,8 @@ impl Wal {
             f.sync_all()?;
         }
 
-        let pages_this_fsync = self
-            .inner
-            .pages_since_last_fsync
-            .swap(0, Ordering::Relaxed);
-        let _ = self
-            .inner
-            .bytes_since_last_fsync
-            .swap(0, Ordering::Relaxed);
+        let pages_this_fsync = self.inner.pages_since_last_fsync.swap(0, Ordering::Relaxed);
+        let _ = self.inner.bytes_since_last_fsync.swap(0, Ordering::Relaxed);
 
         let mut st3 = self.inner.flush.lock().unwrap();
         let prev_flushed = st3.flushed_lsn;

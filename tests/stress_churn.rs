@@ -54,7 +54,11 @@ fn stress_churn_put_del_compact() -> Result<()> {
             db.batch(|b| {
                 for k in chunk {
                     // Перемешаем размеры
-                    let vlen = if (rng.rand_u64() & 1) == 0 { value_len_small } else { value_len_big };
+                    let vlen = if (rng.rand_u64() & 1) == 0 {
+                        value_len_small
+                    } else {
+                        value_len_big
+                    };
                     let val = vec![0xAB; vlen];
                     b.put(k, &val)?;
                     model.insert(k.clone(), Some(val));
@@ -80,7 +84,11 @@ fn stress_churn_put_del_compact() -> Result<()> {
                         }
                         1 => {
                             // overwrite
-                            let vlen = if (rng.rand_u64() & 1) == 0 { value_len_small } else { value_len_big };
+                            let vlen = if (rng.rand_u64() & 1) == 0 {
+                                value_len_small
+                            } else {
+                                value_len_big
+                            };
                             let val = vec![0xCD; vlen];
                             b.put(k, &val)?;
                             model.insert(k.clone(), Some(val));
@@ -103,7 +111,12 @@ fn stress_churn_put_del_compact() -> Result<()> {
             match model.get(k).and_then(|x| x.clone()) {
                 Some(expected) => {
                     let g = got.expect("must exist by model");
-                    assert_eq!(g, expected, "value mismatch for key {}", String::from_utf8_lossy(k));
+                    assert_eq!(
+                        g,
+                        expected,
+                        "value mismatch for key {}",
+                        String::from_utf8_lossy(k)
+                    );
                 }
                 None => {
                     assert!(got.is_none(), "must be None by model");
@@ -116,7 +129,10 @@ fn stress_churn_put_del_compact() -> Result<()> {
     {
         let mut db = Db::open(&root)?;
         let sum = db.compact_all()?;
-        assert!(sum.pages_written_sum > 0, "compaction should write some pages");
+        assert!(
+            sum.pages_written_sum > 0,
+            "compaction should write some pages"
+        );
     }
     {
         let db = Db::open_ro(&root)?;
@@ -125,7 +141,12 @@ fn stress_churn_put_del_compact() -> Result<()> {
             match model.get(k).and_then(|x| x.clone()) {
                 Some(expected) => {
                     let g = got.expect("must exist after compaction");
-                    assert_eq!(g, expected, "value mismatch after compaction for key {}", String::from_utf8_lossy(k));
+                    assert_eq!(
+                        g,
+                        expected,
+                        "value mismatch after compaction for key {}",
+                        String::from_utf8_lossy(k)
+                    );
                 }
                 None => {
                     assert!(got.is_none(), "must be None after compaction");

@@ -7,17 +7,17 @@ use std::sync::Arc;
 
 use crate::config::QuiverConfig;
 use crate::dir::{Directory, NO_PAGE};
+use crate::meta::set_clean_shutdown;
 use crate::pager::Pager;
 use crate::wal::{Wal, WalGroupCfg};
-use crate::meta::set_clean_shutdown;
 
 // программная конфигурация процессного page cache
 use crate::pager::io::page_cache_configure;
 
-use super::core::{open_lock_file, Db, LOCK_FILE, MemKeyLoc};
+use super::core::{open_lock_file, Db, MemKeyLoc, LOCK_FILE};
 
-use byteorder::{ByteOrder, LittleEndian};
 use crate::page::{kv_header_read_v3, PAGE_MAGIC, PAGE_TYPE_KV_RH3};
+use byteorder::{ByteOrder, LittleEndian};
 // packed-aware helpers (с оффсетами)
 use crate::page::kv::kv_for_each_record_with_off;
 // Bloom sidecar
@@ -45,7 +45,12 @@ impl Db {
             page_cache_configure(pager.meta.page_size as usize, cfg.page_cache_pages);
         }
 
-        let _ = Wal::set_group_config(root, WalGroupCfg { coalesce_ms: cfg.wal_coalesce_ms });
+        let _ = Wal::set_group_config(
+            root,
+            WalGroupCfg {
+                coalesce_ms: cfg.wal_coalesce_ms,
+            },
+        );
 
         let dir = Directory::open(root)?;
         Ok(Self {
@@ -174,7 +179,14 @@ impl Db {
                     let is_tomb = (vflags & 0x1) == 1;
                     if is_tomb {
                         // Tombstone: фиксируем отрицательный ускоритель и отмечаем ключ решённым
-                        self.mem_keydir_insert_loc(bucket, k, MemKeyLoc { pid: NO_PAGE, off: 0 });
+                        self.mem_keydir_insert_loc(
+                            bucket,
+                            k,
+                            MemKeyLoc {
+                                pid: NO_PAGE,
+                                off: 0,
+                            },
+                        );
                         decided.insert(k.to_vec());
                         return;
                     }
@@ -183,7 +195,14 @@ impl Db {
                     if ttl_ok {
                         // Present: записываем (pid, off) страницы с валидной записью
                         let off_u32 = (off_usize as u64).min(u32::MAX as u64) as u32;
-                        self.mem_keydir_insert_loc(bucket, k, MemKeyLoc { pid: cur_pid, off: off_u32 });
+                        self.mem_keydir_insert_loc(
+                            bucket,
+                            k,
+                            MemKeyLoc {
+                                pid: cur_pid,
+                                off: off_u32,
+                            },
+                        );
                         decided.insert(k.to_vec());
                     }
                 });

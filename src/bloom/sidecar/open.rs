@@ -19,13 +19,10 @@ use std::sync::Mutex;
 use crate::db::core::Db;
 
 use super::{
-    BloomMeta, BloomSidecar,
-    MAGIC, VERSION_V1, VERSION_V2,
-    HDR_SIZE_V1_USIZE, HDR_SIZE_V1_U64,
-    HDR_SIZE_V2_USIZE, HDR_SIZE_V2_U64,
-    OFF_MAGIC, OFF_VERSION, OFF_BUCKETS, OFF_BYTES_PER_BUCKET, OFF_K_HASHES,
-    OFF_SEED1, OFF_SEED2, OFF_LAST_LSN,
-    bloom_mmap_enabled, read_body_from_path,
+    bloom_mmap_enabled, read_body_from_path, BloomMeta, BloomSidecar, HDR_SIZE_V1_U64,
+    HDR_SIZE_V1_USIZE, HDR_SIZE_V2_U64, HDR_SIZE_V2_USIZE, MAGIC, OFF_BUCKETS,
+    OFF_BYTES_PER_BUCKET, OFF_K_HASHES, OFF_LAST_LSN, OFF_MAGIC, OFF_SEED1, OFF_SEED2, OFF_VERSION,
+    VERSION_V1, VERSION_V2,
 };
 
 impl BloomSidecar {
@@ -77,7 +74,8 @@ impl BloomSidecar {
         f.read_exact(&mut hdr)?;
 
         let buckets = LittleEndian::read_u32(&hdr[OFF_BUCKETS..OFF_BUCKETS + 4]);
-        let bytes_per_bucket = LittleEndian::read_u32(&hdr[OFF_BYTES_PER_BUCKET..OFF_BYTES_PER_BUCKET + 4]);
+        let bytes_per_bucket =
+            LittleEndian::read_u32(&hdr[OFF_BYTES_PER_BUCKET..OFF_BYTES_PER_BUCKET + 4]);
         let k_hashes = LittleEndian::read_u32(&hdr[OFF_K_HASHES..OFF_K_HASHES + 4]);
         let seed1 = LittleEndian::read_u64(&hdr[OFF_SEED1..OFF_SEED1 + 8]);
         let seed2 = LittleEndian::read_u64(&hdr[OFF_SEED2..OFF_SEED2 + 8]);
@@ -152,7 +150,10 @@ impl BloomSidecar {
         }
         let path = root.join("bloom.bin");
         if path.exists() {
-            return Err(anyhow!("bloom sidecar already exists at {}", path.display()));
+            return Err(anyhow!(
+                "bloom sidecar already exists at {}",
+                path.display()
+            ));
         }
 
         let mut f = OpenOptions::new()
@@ -167,7 +168,10 @@ impl BloomSidecar {
         hdr[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(MAGIC);
         LittleEndian::write_u32(&mut hdr[OFF_VERSION..OFF_VERSION + 4], VERSION_V2);
         LittleEndian::write_u32(&mut hdr[OFF_BUCKETS..OFF_BUCKETS + 4], meta.buckets);
-        LittleEndian::write_u32(&mut hdr[OFF_BYTES_PER_BUCKET..OFF_BYTES_PER_BUCKET + 4], meta.bytes_per_bucket);
+        LittleEndian::write_u32(
+            &mut hdr[OFF_BYTES_PER_BUCKET..OFF_BYTES_PER_BUCKET + 4],
+            meta.bytes_per_bucket,
+        );
         LittleEndian::write_u32(&mut hdr[OFF_K_HASHES..OFF_K_HASHES + 4], meta.k_hashes);
         LittleEndian::write_u64(&mut hdr[OFF_SEED1..OFF_SEED1 + 8], meta.seed1);
         LittleEndian::write_u64(&mut hdr[OFF_SEED2..OFF_SEED2 + 8], meta.seed2);

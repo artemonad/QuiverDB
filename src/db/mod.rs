@@ -12,18 +12,21 @@
 //! - compaction.rs  — онлайн-компактация цепочек (bucket/all)
 //! - vacuum.rs      — вакуум: compaction_all + sweep_orphan_overflow
 //! - read_page.rs   — общие хелперы per‑page чтения (newest→oldest, TTL/tombstone/placeholder)
+//! - multi.rs       — векторные операции get_many/exists_many (новое)
 
-pub mod core;
-pub mod open;
-pub mod kv;
-pub mod exists;
 pub mod batch;
-pub mod scan;
-pub mod maintenance;
-pub mod doctor;
 pub mod compaction;
+pub mod core;
+pub mod doctor;
+pub mod exists;
+pub mod kv;
+pub mod maintenance;
+pub mod open;
+pub mod scan;
 pub mod vacuum;
 // NEW: общие хелперы per‑page чтения (используются get/exists)
 pub mod read_page;
+// NEW: векторные операции (get_many/exists_many)
+pub mod multi;
 
 pub use core::Db;

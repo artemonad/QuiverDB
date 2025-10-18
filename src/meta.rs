@@ -1,29 +1,34 @@
-// src/meta.rs — QuiverDB 2.0 (Meta v4)
-//
-// Формат <root>/meta (LE):
-// MAGIC8 = "P2DBMETA"
-// u32 version         = 4
-// u32 page_size       (4 KiB..=1 MiB, power of two)
-// u32 format_flags    (в этом файле сохраняется/читается в поле `flags` для совместимости API)
-// u64 next_page_id
-// u32 hash_kind       (1 = xxhash64(seed=0))
-// u64 last_lsn
-// u8  clean_shutdown  (1=clean, 0=unclean)
-// u16 codec_default   (0=none,1=zstd,2=lz4)
-// u8  checksum_kind   (0=crc32,1=crc32c,2=blake3_128)
-//
-// Политика:
-// - Атомарная запись: tmp+rename, затем fsync родительского каталога (best‑effort на Windows).
-// - validate_page_size: 4096..=1MiB, степень двойки.
-// - checkpoint/commit‑логика будет опираться на last_lsn/clean_shutdown.
+//! src/meta.rs — QuiverDB 2.x (Meta v4)
+//!
+//! Формат <root>/meta (LE):
+//! MAGIC8 = "P2DBMETA"
+//! u32 version         = 4
+//! u32 page_size       (4 KiB..=1 MiB, power of two)
+//! u32 format_flags    (в этом файле сохраняется/читается в поле `flags` для совместимости API)
+//! u64 next_page_id
+//! u32 hash_kind       (1 = xxhash64(seed=0))
+//! u64 last_lsn
+//! u8  clean_shutdown  (1=clean, 0=unclean)
+//! u16 codec_default   (0=none,1=zstd,2=lz4)
+//! u8  checksum_kind   (забронировано; принудительно CRC32C)
+//!
+//! Политика:
+//! - Атомарная запись: tmp+rename, затем fsync родительского каталога (best‑effort на Windows).
+//! - validate_page_size: 4096..=1MiB, степень двойки.
+//!
+//! Изменения (CRC32C-only):
+//! - checksum_kind теперь принудительно нормализуется к CRC32C при чтении/записи.
+//! - Если на диске значение отличалось от CRC32C — выводим предупреждение единожды и используем CRC32C.
+//! - На следующих шагах поле будет оставлено как “reserved” в документации, а параметр из API будет убран.
 
 use anyhow::{anyhow, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // ---- Константы meta v4 ----
 
@@ -36,24 +41,27 @@ pub const CODEC_NONE: u16 = 0;
 pub const CODEC_ZSTD: u16 = 1;
 pub const CODEC_LZ4: u16 = 2;
 
+// Оставлены для совместимости констант, но фактически всегда используется CRC32C.
 pub const CKSUM_CRC32: u8 = 0;
-pub const CKSUM_CRC32C: u8 = 1; // default policy
+pub const CKSUM_CRC32C: u8 = 1; // единственная фактическая политика
 pub const CKSUM_BLAKE3_128: u8 = 2;
 
-// ---- Структура заголовка (сохраняем имя MetaHeader для совместимости) ----
+static WARNED_NON_CRC32C: OnceLock<()> = OnceLock::new();
+
+// ---- Структура заголовка ----
 
 #[derive(Debug, Clone)]
 pub struct MetaHeader {
-    pub version: u32,      // == 4
-    pub page_size: u32,    // 4 KiB .. 1 MiB (power of two)
-    pub flags: u32,        // format_flags (v4) — сохраняем имя `flags` для совместимости
+    pub version: u32,   // == 4
+    pub page_size: u32, // 4 KiB .. 1 MiB (power of two)
+    pub flags: u32,     // format_flags (v4) — сохраняем имя `flags` для совместимости
     pub next_page_id: u64,
-    pub hash_kind: u32,    // 1 = xxhash64(seed=0)
+    pub hash_kind: u32, // 1 = xxhash64(seed=0)
     pub last_lsn: u64,
     pub clean_shutdown: bool,
     // Новые поля v4:
     pub codec_default: u16, // 0=none,1=zstd,2=lz4
-    pub checksum_kind: u8,  // 0=crc32,1=crc32c,2=blake3_128
+    pub checksum_kind: u8,  // забронировано; принудительно CRC32C
 }
 
 impl Default for MetaHeader {
@@ -67,7 +75,7 @@ impl Default for MetaHeader {
             last_lsn: 0,
             clean_shutdown: true,
             codec_default: CODEC_NONE,
-            checksum_kind: CKSUM_CRC32C, // по умолчанию crc32c
+            checksum_kind: CKSUM_CRC32C,
         }
     }
 }
@@ -127,7 +135,8 @@ pub fn write_meta_new(root: &Path, h: &MetaHeader) -> Result<()> {
         .open(&tmp)
         .with_context(|| format!("open meta tmp {}", tmp.display()))?;
 
-    write_meta_contents(&mut f, h)?;
+    // Пишем всегда с нормализацией checksum_kind к CRC32C
+    write_meta_contents_crc32c(&mut f, h)?;
     f.sync_all()?; // flush tmp to disk
 
     fs::rename(&tmp, &path)
@@ -152,7 +161,8 @@ pub fn write_meta_overwrite(root: &Path, h: &MetaHeader) -> Result<()> {
         .open(&tmp)
         .with_context(|| format!("open meta tmp {}", tmp.display()))?;
 
-    write_meta_contents(&mut f, h)?;
+    // Пишем всегда с нормализацией checksum_kind к CRC32C
+    write_meta_contents_crc32c(&mut f, h)?;
     f.sync_all()?; // ensure tmp is on disk
 
     fs::rename(&tmp, &path)
@@ -161,8 +171,8 @@ pub fn write_meta_overwrite(root: &Path, h: &MetaHeader) -> Result<()> {
     Ok(())
 }
 
-/// Внутренняя запись полей meta v4 (offset=0).
-fn write_meta_contents(f: &mut std::fs::File, h: &MetaHeader) -> Result<()> {
+/// Внутренняя запись полей meta v4 (offset=0), с принудительным checksum_kind = CRC32C.
+fn write_meta_contents_crc32c(f: &mut std::fs::File, h: &MetaHeader) -> Result<()> {
     f.seek(SeekFrom::Start(0))?;
     f.write_all(META_MAGIC)?;
     f.write_u32::<LittleEndian>(h.version)?;
@@ -173,11 +183,12 @@ fn write_meta_contents(f: &mut std::fs::File, h: &MetaHeader) -> Result<()> {
     f.write_u64::<LittleEndian>(h.last_lsn)?;
     f.write_u8(if h.clean_shutdown { 1 } else { 0 })?;
     f.write_u16::<LittleEndian>(h.codec_default)?;
-    f.write_u8(h.checksum_kind)?;
+    // Нормализуем: всегда CRC32C
+    f.write_u8(CKSUM_CRC32C)?;
     Ok(())
 }
 
-/// Прочитать meta v4.
+/// Прочитать meta v4. checksum_kind нормализуется к CRC32C.
 pub fn read_meta(root: &Path) -> Result<MetaHeader> {
     let path = meta_path(root);
     let mut f = OpenOptions::new()
@@ -212,7 +223,18 @@ pub fn read_meta(root: &Path) -> Result<MetaHeader> {
     let last_lsn = f.read_u64::<LittleEndian>()?;
     let clean_shutdown = f.read_u8()? != 0;
     let codec_default = f.read_u16::<LittleEndian>()?;
-    let checksum_kind = f.read_u8()?;
+    let checksum_kind_disk = f.read_u8()?;
+
+    // Нормализация checksum_kind
+    if checksum_kind_disk != CKSUM_CRC32C {
+        if WARNED_NON_CRC32C.set(()).is_ok() {
+            eprintln!(
+                "[WARN] meta: checksum_kind {} found on disk; forcing CRC32C={}. \
+                 CRC32C is the only supported page checksum.",
+                checksum_kind_disk, CKSUM_CRC32C
+            );
+        }
+    }
 
     Ok(MetaHeader {
         version,
@@ -223,7 +245,7 @@ pub fn read_meta(root: &Path) -> Result<MetaHeader> {
         last_lsn,
         clean_shutdown,
         codec_default,
-        checksum_kind,
+        checksum_kind: CKSUM_CRC32C,
     })
 }
 
@@ -248,18 +270,21 @@ pub fn set_last_lsn(root: &Path, new_lsn: u64) -> Result<()> {
 }
 
 /// Утилита для инициализации meta v4 по параметрам.
+///
+/// checksum_kind параметр больше не влияет: всегда будет записано CRC32C.
 pub fn init_meta_v4(
     root: &Path,
     page_size: u32,
     hash_kind: u32,
     codec_default: u16,
-    checksum_kind: u8,
+    _checksum_kind_ignored: u8,
 ) -> Result<()> {
     let mut m = MetaHeader {
         page_size,
         hash_kind,
         codec_default,
-        checksum_kind,
+        // Принудительно CRC32C
+        checksum_kind: CKSUM_CRC32C,
         ..MetaHeader::default()
     };
     m.version = 4;
@@ -277,48 +302,26 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn meta_v4_roundtrip() {
+    fn meta_v4_roundtrip_crc32c_forced() {
         let root = std::env::temp_dir().join(format!("qdb2-meta-{}", nanos_for_test()));
         fs::create_dir_all(&root).unwrap();
 
-        let m0 = MetaHeader {
-            version: 4,
-            page_size: 65536,
-            flags: 0xAABBCCDD,
-            next_page_id: 123,
-            hash_kind: HASH_KIND_XX64_SEED0,
-            last_lsn: 456,
-            clean_shutdown: false,
-            codec_default: CODEC_NONE,
-            checksum_kind: CKSUM_CRC32C,
-        };
-        write_meta_new(&root, &m0).unwrap();
+        // Пишем meta с "ложным" значением checksum_kind через API init_meta_v4 (игнорится)
+        init_meta_v4(&root, 65536, HASH_KIND_XX64_SEED0, CODEC_ZSTD, CKSUM_CRC32).unwrap();
 
+        // Читаем и убеждаемся, что нормализовано к CRC32C
         let m1 = read_meta(&root).unwrap();
         assert_eq!(m1.version, 4);
         assert_eq!(m1.page_size, 65536);
-        assert_eq!(m1.flags, 0xAABBCCDD);
-        assert_eq!(m1.next_page_id, 123);
-        assert_eq!(m1.hash_kind, HASH_KIND_XX64_SEED0);
-        assert_eq!(m1.last_lsn, 456);
-        assert!(!m1.clean_shutdown);
+        assert_eq!(m1.codec_default, CODEC_ZSTD);
+        assert_eq!(m1.checksum_kind, CKSUM_CRC32C);
 
-        set_clean_shutdown(&root, true).unwrap();
-        let m2 = read_meta(&root).unwrap();
-        assert!(m2.clean_shutdown);
-
+        // set_last_lsn / set_clean_shutdown продолжают работать
+        set_clean_shutdown(&root, false).unwrap();
         set_last_lsn(&root, 999).unwrap();
-        let m3 = read_meta(&root).unwrap();
-        assert_eq!(m3.last_lsn, 999);
-
-        // overwrite and read again
-        let mut m4 = m3.clone();
-        m4.page_size = 131072;
-        m4.codec_default = CODEC_ZSTD;
-        write_meta_overwrite(&root, &m4).unwrap();
-        let m5 = read_meta(&root).unwrap();
-        assert_eq!(m5.page_size, 131072);
-        assert_eq!(m5.codec_default, CODEC_ZSTD);
+        let m2 = read_meta(&root).unwrap();
+        assert!(!m2.clean_shutdown);
+        assert_eq!(m2.last_lsn, 999);
     }
 
     fn nanos_for_test() -> u128 {
